@@ -12,3 +12,6 @@ audio_thread_priority.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
+
+[build-dependencies]
+cc = "1.1"

@@ -4,8 +4,9 @@ use rsrelay_audio::{
     start_capture_stream, start_playback_stream, CaptureStreamHandle, PlaybackStreamHandle,
 };
 use rsrelay_net::{
-    AudioReceiverWorker, AudioSenderWorker, DiscoveryService, ReceiverConfig, ReceiverSnapshot,
-    SenderConfig, SenderSnapshot,
+    AudioReceiverWorker, AudioSenderWorker, ControlClient, ControlServer,
+    ControlTelemetrySnapshot, DiscoveryService, ReceiverConfig, ReceiverSnapshot, SenderConfig,
+    SenderSnapshot,
 };
 
 use crate::config::{ReceiverSessionConfig, SenderSessionConfig};
@@ -17,12 +18,15 @@ pub struct SenderSessionStatus {
     pub sample_rate: u32,
     pub peak_level: f32,
     pub net: SenderSnapshot,
+    pub control: ControlTelemetrySnapshot,
 }
 
-/// High-level sender session managing audio capture, lock-free SPSC ring buffer, and UDP encoding worker.
+/// High-level sender session managing audio capture, lock-free SPSC ring buffer,
+/// UDP encoding worker, and TCP control/RTT telemetry client.
 pub struct SenderSession {
     capture: CaptureStreamHandle,
     worker: AudioSenderWorker,
+    control_client: Option<ControlClient>,
 }
 
 impl SenderSession {
@@ -51,7 +55,18 @@ impl SenderSession {
 
         let worker = AudioSenderWorker::spawn(sender_cfg, consumer)?;
 
-        Ok(Self { capture, worker })
+        // Companion TCP control port is `audio_udp_port - 1` (e.g. UDP 49153 -> TCP 49152)
+        let ctrl_addr = std::net::SocketAddr::new(
+            cfg.target_addr.ip(),
+            cfg.target_addr.port().wrapping_sub(1),
+        );
+        let control_client = ControlClient::spawn(ctrl_addr).ok();
+
+        Ok(Self {
+            capture,
+            worker,
+            control_client,
+        })
     }
 
     pub fn status(&self) -> SenderSessionStatus {
@@ -60,6 +75,11 @@ impl SenderSession {
             sample_rate: self.capture.sample_rate,
             peak_level: self.capture.peak_level(),
             net: self.worker.snapshot(),
+            control: self
+                .control_client
+                .as_ref()
+                .map(|c| c.snapshot())
+                .unwrap_or_default(),
         }
     }
 }
@@ -76,10 +96,11 @@ pub struct ReceiverSessionStatus {
 }
 
 /// High-level receiver session managing UDP jitter buffer, Opus FEC/PLC, PI clock-drift ASRC,
-/// lock-free ring buffer, real-time speaker playback, and optional mDNS advertisement.
+/// lock-free ring buffer, real-time speaker playback, TCP control server, and optional mDNS advertisement.
 pub struct ReceiverSession {
     playback: PlaybackStreamHandle,
     worker: AudioReceiverWorker,
+    _control_server: Option<ControlServer>,
     _mdns: Option<DiscoveryService>,
 }
 
@@ -103,6 +124,13 @@ impl ReceiverSession {
 
         let worker = AudioReceiverWorker::spawn(rx_cfg, producer)?;
 
+        let ctrl_bind = std::net::SocketAddr::new(
+            cfg.bind_addr.ip(),
+            cfg.bind_addr.port().wrapping_sub(1),
+        );
+        let control_server =
+            ControlServer::spawn(ctrl_bind, cfg.bind_addr.port(), worker.metrics_arc()).ok();
+
         let mdns = if cfg.advertise_mdns {
             match DiscoveryService::new() {
                 Ok(mut svc) => {
@@ -123,6 +151,7 @@ impl ReceiverSession {
         Ok(Self {
             playback,
             worker,
+            _control_server: control_server,
             _mdns: mdns,
         })
     }

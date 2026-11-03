@@ -40,7 +40,12 @@ rsrelay/
 
 ## Quick Start
 
-### 1. List Local Audio Devices
+### 1. Launch Native Desktop GUI & System Tray
+```bash
+cargo run --release -p rsrelay-gui
+```
+
+### 2. List Local Audio Devices (CLI)
 ```bash
 cargo run --release -p rsrelay-cli -- devices
 ```

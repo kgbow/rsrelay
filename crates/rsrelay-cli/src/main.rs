@@ -224,11 +224,17 @@ fn main() -> anyhow::Result<()> {
                 thread::sleep(Duration::from_millis(250));
                 let st = session.status();
                 let vu = render_vu_bar(st.peak_level, 16);
+                let rtt_str = if st.control.connected {
+                    format!("{:.2}ms", (st.control.rtt_us as f64) / 1000.0)
+                } else {
+                    "N/A".to_string()
+                };
                 print!(
-                    "\r[TX] VU: [{vu}] {:>5.1}% | Sent: {:>8} pkts ({:>7.1} KB) | Silence Heartbeats: {:>6}   ",
+                    "\r[TX] VU: [{vu}] {:>5.1}% | Sent: {:>8} pkts ({:>7.1} KB) | RTT: {:>7} | Silence: {:>5}   ",
                     st.peak_level * 100.0,
                     st.net.packets_sent,
                     (st.net.bytes_sent as f64) / 1024.0,
+                    rtt_str,
                     st.net.silence_heartbeats_sent
                 );
                 let _ = std::io::stdout().flush();
@@ -324,11 +330,12 @@ fn main() -> anyhow::Result<()> {
                 let tx_st = tx.status();
                 let rx_st = rx.status();
                 println!(
-                    "  [{sec}s/{duration_secs}s] TX Sent: {} pkts ({:.1} KB) | RX Recv: {} pkts, Lost: {}, Buffer: {:.1} ms, ASRC Ratio: {:.5}x",
+                    "  [{sec}s/{duration_secs}s] TX Sent: {} pkts ({:.1} KB) | RX Recv: {} pkts, Lost: {}, RTT: {:.2} ms, Buffer: {:.1} ms, ASRC Ratio: {:.5}x",
                     tx_st.net.packets_sent,
                     (tx_st.net.bytes_sent as f64) / 1024.0,
                     rx_st.net.packets_received,
                     rx_st.net.packets_lost,
+                    (tx_st.control.rtt_us as f64) / 1000.0,
                     rx_st.net.buffer_level_ms,
                     rx_st.net.resample_ratio
                 );

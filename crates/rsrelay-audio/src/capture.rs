@@ -17,6 +17,8 @@ use crate::windows_loopback::SilentKeepaliveStream;
 /// Dropping this handle stops the underlying OS audio stream or synthetic generator thread.
 pub struct CaptureStreamHandle {
     _cpal_stream: Option<cpal::Stream>,
+    #[cfg(target_os = "macos")]
+    _sck_stream: Option<crate::macos_sck::MacosSckStream>,
     _keepalive: Option<SilentKeepaliveStream>,
     stop_flag: Arc<AtomicBool>,
     tone_thread: Option<JoinHandle<()>>,
@@ -107,6 +109,8 @@ pub fn start_capture_stream(
 
         return Ok(CaptureStreamHandle {
             _cpal_stream: None,
+            #[cfg(target_os = "macos")]
+            _sck_stream: None,
             _keepalive: None,
             stop_flag,
             tone_thread: Some(handle),
@@ -115,6 +119,44 @@ pub fn start_capture_stream(
             channels,
             peak_bits,
         });
+    }
+
+    // On macOS 13+, prefer native driverless ScreenCaptureKit for SystemLoopback when no explicit device filter is set
+    #[cfg(target_os = "macos")]
+    if source == CaptureSource::SystemLoopback && device_name_filter.is_none() {
+        if crate::macos_sck::has_screen_capture_permission() {
+            match crate::macos_sck::MacosSckStream::start(
+                48_000,
+                target_channels,
+                producer,
+                Arc::clone(&peak_bits),
+            ) {
+                Ok(sck_stream) => {
+                    tracing::info!("Started native macOS ScreenCaptureKit driverless system audio loopback (48000 Hz)");
+                    return Ok(CaptureStreamHandle {
+                        _cpal_stream: None,
+                        _sck_stream: Some(sck_stream),
+                        _keepalive: None,
+                        stop_flag,
+                        tone_thread: None,
+                        device_name: "macOS ScreenCaptureKit System Audio".to_string(),
+                        sample_rate: 48_000,
+                        channels: target_channels,
+                        peak_bits,
+                    });
+                }
+                Err(recovered_producer) => {
+                    tracing::warn!(
+                        "ScreenCaptureKit stream start failed; falling back to CoreAudio loopback/input"
+                    );
+                    producer = recovered_producer;
+                }
+            }
+        } else {
+            tracing::info!(
+                "macOS Screen/Audio Capture TCC permission not yet granted; falling back to CoreAudio input (grant permission in System Settings > Privacy & Security > Screen & System Audio Recording)"
+            );
+        }
     }
 
     let host = cpal::default_host();
@@ -176,6 +218,8 @@ pub fn start_capture_stream(
 
     Ok(CaptureStreamHandle {
         _cpal_stream: Some(stream),
+        #[cfg(target_os = "macos")]
+        _sck_stream: None,
         _keepalive: keepalive,
         stop_flag,
         tone_thread: None,

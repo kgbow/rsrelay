@@ -247,6 +247,10 @@ impl AudioReceiverWorker {
         })
     }
 
+    pub fn metrics_arc(&self) -> Arc<ReceiverMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
     pub fn snapshot(&self) -> ReceiverSnapshot {
         ReceiverSnapshot {
             packets_received: self.metrics.packets_received.load(Ordering::Relaxed),
