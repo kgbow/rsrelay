@@ -1,0 +1,2 @@
+[env]
+PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/opus/lib/pkgconfig:/usr/local/opt/opus/lib/pkgconfig", force = false }
