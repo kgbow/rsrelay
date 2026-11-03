@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsrelay-proto",
+    "crates/rsrelay-dsp",
+    "crates/rsrelay-audio",
+    "crates/rsrelay-net",
+    "crates/rsrelay-core",
+    "crates/rsrelay-cli",
+    "crates/rsrelay-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["rsrelay contributors"]
+repository = "https://github.com/kgbow/rsrelay"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Internal workspace crates
+rsrelay-proto = { path = "crates/rsrelay-proto" }
+rsrelay-dsp = { path = "crates/rsrelay-dsp" }
+rsrelay-audio = { path = "crates/rsrelay-audio" }
+rsrelay-net = { path = "crates/rsrelay-net" }
+rsrelay-core = { path = "crates/rsrelay-core" }
+
+# Core audio & lock-free real-time primitives
+cpal = "0.15"
+rtrb = "0.3"
+rubato = "0.16"
+opus = "0.3"
+audio_thread_priority = "0.32"
+
+# Async runtime & networking
+tokio = { version = "1.40", features = ["net", "rt-multi-thread", "time", "sync", "io-util", "macros", "signal"] }
+mdns-sd = "0.11"
+socket2 = { version = "0.5", features = ["all"] }
+
+# Serialization & error handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+
+# CLI, logging & utilities
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+hostname = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev.package.rubato]
+opt-level = 3
+
+[profile.dev.package.opus]
+opt-level = 3

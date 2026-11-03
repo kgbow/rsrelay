@@ -1,0 +1,12 @@
+[package]
+name = "rsrelay-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rsrelay-proto.workspace = true
+opus.workspace = true
+rubato.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

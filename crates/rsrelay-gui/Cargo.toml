@@ -1,0 +1,15 @@
+[package]
+name = "rsrelay-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rsrelay-gui"
+path = "src/main.rs"
+
+[dependencies]
+rsrelay-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
