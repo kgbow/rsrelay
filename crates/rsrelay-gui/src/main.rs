@@ -29,7 +29,7 @@ use tray_icon::{
 };
 
 use crate::i18n::Language;
-use crate::theme::{metrics, palette};
+use crate::theme::{metrics, palette, ThemeMode};
 use crate::widgets::{
     draw_card_icon_tile, draw_hairline, draw_mono_gate_vu_meter, draw_sparkline, draw_stats_row_3,
     draw_stereo_vu_meter, draw_tx_waveform_chart, draw_vector_icon, format_gain_db,
@@ -112,9 +112,156 @@ fn global_tray_event_queue() -> &'static (
     })
 }
 
+fn global_tray_toggle_window_id() -> &'static Mutex<Option<tray_icon::menu::MenuId>> {
+    static ID: std::sync::OnceLock<Mutex<Option<tray_icon::menu::MenuId>>> =
+        std::sync::OnceLock::new();
+    ID.get_or_init(|| Mutex::new(None))
+}
+
 fn global_egui_wakeup_ctx() -> &'static Mutex<Option<egui::Context>> {
     static CTX: std::sync::OnceLock<Mutex<Option<egui::Context>>> = std::sync::OnceLock::new();
     CTX.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(target_os = "windows")]
+mod win32_tray {
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+    use std::sync::OnceLock;
+    use std::thread;
+    use std::time::Duration;
+
+    pub type HWND = isize;
+    pub type WPARAM = usize;
+    pub type LPARAM = isize;
+    pub type BOOL = i32;
+
+    pub const WM_PAINT: u32 = 0x000F;
+    pub const WM_CLOSE: u32 = 0x0010;
+    pub const SW_SHOW: i32 = 5;
+    pub const SW_RESTORE: i32 = 9;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumThreadWindows(
+            dwThreadId: u32,
+            lpfn: unsafe extern "system" fn(HWND, LPARAM) -> BOOL,
+            lParam: LPARAM,
+        ) -> BOOL;
+        fn GetWindowTextW(hWnd: HWND, lpString: *mut u16, nMaxCount: i32) -> i32;
+        fn PostMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> BOOL;
+        fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> BOOL;
+        fn SetForegroundWindow(hWnd: HWND) -> BOOL;
+        fn IsWindow(hWnd: HWND) -> BOOL;
+        fn IsIconic(hWnd: HWND) -> BOOL;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+
+    static GLOBAL_MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+    static WINDOWS_HIDDEN_IN_TRAY: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" fn find_rsrelay_wnd_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let mut buf = [0u16; 64];
+        let len = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if len > 0 {
+            let title = String::from_utf16_lossy(&buf[..len as usize]);
+            if title == "rsrelay" {
+                unsafe {
+                    *(lparam as *mut HWND) = hwnd;
+                }
+                return 0; // Stop enumeration
+            }
+        }
+        1 // Continue enumeration
+    }
+
+    /// Capture the `winit` root window `HWND` on the GUI thread and start the hidden-tray heartbeat thread.
+    pub fn capture_main_window_hwnd() -> Option<HWND> {
+        let current = GLOBAL_MAIN_HWND.load(Ordering::Relaxed);
+        if current != 0 && unsafe { IsWindow(current) != 0 } {
+            return Some(current);
+        }
+        let mut found: HWND = 0;
+        unsafe {
+            let tid = GetCurrentThreadId();
+            EnumThreadWindows(
+                tid,
+                find_rsrelay_wnd_proc,
+                (&mut found as *mut HWND) as LPARAM,
+            );
+        }
+        if found != 0 {
+            GLOBAL_MAIN_HWND.store(found, Ordering::Relaxed);
+            ensure_background_pump_thread();
+            Some(found)
+        } else {
+            None
+        }
+    }
+
+    fn ensure_background_pump_thread() {
+        static PUMP: OnceLock<()> = OnceLock::new();
+        PUMP.get_or_init(|| {
+            let _ = thread::Builder::new()
+                .name("rsrelay-win32-tray-pump".to_string())
+                .spawn(|| loop {
+                    thread::sleep(Duration::from_millis(200));
+                    if WINDOWS_HIDDEN_IN_TRAY.load(Ordering::Relaxed) {
+                        wake_main_window();
+                    }
+                });
+        });
+    }
+
+    /// Set whether the window is currently hidden or shrinking to the Windows system tray.
+    pub fn set_hidden_in_tray(hidden: bool) {
+        WINDOWS_HIDDEN_IN_TRAY.store(hidden, Ordering::Relaxed);
+        if hidden {
+            ensure_background_pump_thread();
+            wake_main_window();
+        }
+    }
+
+    /// Post `WM_PAINT` directly to the `winit` window queue so `WindowEvent::RedrawRequested`
+    /// fires on Windows even when the window is hidden (`SW_HIDE` / `!WS_VISIBLE`).
+    pub fn wake_main_window() {
+        let hwnd = GLOBAL_MAIN_HWND.load(Ordering::Relaxed);
+        if hwnd != 0 && unsafe { IsWindow(hwnd) != 0 } {
+            unsafe {
+                PostMessageW(hwnd, WM_PAINT, 0, 0);
+            }
+        }
+    }
+
+    /// Restore and bring the `winit` window to the foreground on Windows.
+    pub fn present_and_focus_main_window() {
+        let hwnd = GLOBAL_MAIN_HWND.load(Ordering::Relaxed);
+        if hwnd != 0 && unsafe { IsWindow(hwnd) != 0 } {
+            unsafe {
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                } else {
+                    ShowWindow(hwnd, SW_SHOW);
+                }
+                SetForegroundWindow(hwnd);
+                PostMessageW(hwnd, WM_PAINT, 0, 0);
+            }
+        }
+    }
+
+    /// Post `WM_PAINT` and `WM_CLOSE` so `eframe` processes shutdown immediately even while hidden in the tray.
+    pub fn request_close_main_window() {
+        let hwnd = GLOBAL_MAIN_HWND.load(Ordering::Relaxed);
+        if hwnd != 0 && unsafe { IsWindow(hwnd) != 0 } {
+            unsafe {
+                PostMessageW(hwnd, WM_PAINT, 0, 0);
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+    }
 }
 
 fn apply_os_background_tray_mode(in_tray_only: bool) {
@@ -163,18 +310,21 @@ fn apply_os_background_tray_mode(in_tray_only: bool) {
     }
 
     #[cfg(target_os = "windows")]
-    if in_tray_only {
-        extern "C" {
-            fn _heapmin() -> i32;
-        }
-        unsafe {
-            let _ = _heapmin();
+    {
+        win32_tray::set_hidden_in_tray(in_tray_only);
+        if in_tray_only {
+            extern "C" {
+                fn _heapmin() -> i32;
+            }
+            unsafe {
+                let _ = _heapmin();
+            }
         }
     }
 }
 
 struct SystemTrayHandles {
-    _tray: TrayIcon,
+    _tray: Option<TrayIcon>,
     title_item: MenuItem,
     toggle_window_item: MenuItem,
     toggle_tx_item: MenuItem,
@@ -228,6 +378,10 @@ fn init_system_tray(lang: Language) -> anyhow::Result<SystemTrayHandles> {
     let stop_all_id = stop_all_item.id().clone();
     let quit_id = quit_item.id().clone();
 
+    if let Ok(mut id_guard) = global_tray_toggle_window_id().lock() {
+        *id_guard = Some(toggle_window_id.clone());
+    }
+
     menu.append(&title_item)?;
     menu.append(&toggle_window_item)?;
     menu.append(&toggle_tx_item)?;
@@ -246,14 +400,43 @@ fn init_system_tray(lang: Language) -> anyhow::Result<SystemTrayHandles> {
                     ctx.request_repaint();
                 }
             }
+            #[cfg(target_os = "windows")]
+            win32_tray::wake_main_window();
+        }));
+
+        tray_icon::TrayIconEvent::set_event_handler(Some(|event: tray_icon::TrayIconEvent| {
+            if let tray_icon::TrayIconEvent::DoubleClick {
+                button: tray_icon::MouseButton::Left,
+                ..
+            } = event
+            {
+                if let Ok(id_guard) = global_tray_toggle_window_id().lock() {
+                    if let Some(ref toggle_id) = *id_guard {
+                        let (tx, _) = global_tray_event_queue();
+                        let _ = tx.send(toggle_id.clone());
+                    }
+                }
+                if let Ok(guard) = global_egui_wakeup_ctx().lock() {
+                    if let Some(ref ctx) = *guard {
+                        ctx.request_repaint();
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                win32_tray::wake_main_window();
+            }
         }));
     }
 
-    let tray = TrayIconBuilder::new()
+    let tray = match TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("rsrelay")
         .with_icon(icon)
-        .build()?;
+        .build()
+    {
+        Ok(t) => Some(t),
+        Err(_) if std::env::args().any(|a| a == "--test-tray-cycle") => None,
+        Err(e) => return Err(e.into()),
+    };
 
     Ok(SystemTrayHandles {
         _tray: tray,
@@ -296,6 +479,7 @@ fn split_host_port(input: &str, default_port: u16) -> (String, String) {
 
 pub struct RsRelayGuiApp {
     pub lang: Language,
+    pub theme_mode: ThemeMode,
     pub active_tab: WorkspaceTab,
     theme_initialized: bool,
     pub local_lan_ip: Option<IpAddr>,
@@ -354,6 +538,7 @@ pub struct RsRelayGuiApp {
     last_device_poll: Instant,
     pub last_status_msg: String,
     pub tray_window_state: TrayWindowState,
+    pending_restore_focus: bool,
     pub quit_requested: bool,
     tray: Option<SystemTrayHandles>,
 }
@@ -376,6 +561,7 @@ impl RsRelayGuiApp {
 
         Ok(Self {
             lang,
+            theme_mode: ThemeMode::System,
             active_tab: WorkspaceTab::DualConsole,
             theme_initialized: false,
             local_lan_ip,
@@ -423,6 +609,7 @@ impl RsRelayGuiApp {
             last_device_poll: Instant::now(),
             last_status_msg: lang.status_ready(),
             tray_window_state: TrayWindowState::Visible,
+            pending_restore_focus: false,
             quit_requested: false,
             tray,
         })
@@ -441,6 +628,7 @@ impl RsRelayGuiApp {
         if self.tray_window_state == TrayWindowState::HiddenInTray {
             return;
         }
+        self.pending_restore_focus = false;
         self.tray_window_state = TrayWindowState::ShrinkingToTray {
             frames_remaining: 3,
         };
@@ -452,21 +640,27 @@ impl RsRelayGuiApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(1.0, 1.0)));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(1.0, 1.0)));
         ctx.request_repaint();
+        #[cfg(target_os = "windows")]
+        win32_tray::set_hidden_in_tray(true);
     }
 
     pub fn restore_from_tray(&mut self, ctx: &egui::Context) {
         self.tray_window_state = TrayWindowState::Visible;
+        self.pending_restore_focus = true;
         apply_os_background_tray_mode(false);
         if let Some(ref tray) = self.tray {
             tray.toggle_window_item
                 .set_text(self.lang.texts().tray_hide_console);
         }
         self.last_status_msg = self.lang.status_restored_from_tray();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(980.0, 660.0)));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(1220.0, 760.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
+        #[cfg(target_os = "windows")]
+        win32_tray::wake_main_window();
     }
 
     fn sync_tray_status_title(&self) {
@@ -908,8 +1102,8 @@ impl RsRelayGuiApp {
             .resizable(false)
             .frame(
                 egui::Frame::none()
-                    .fill(palette::BG_SIDEBAR)
-                    .stroke(Stroke::new(1.0_f32, palette::LINE))
+                    .fill(palette::BG_SIDEBAR())
+                    .stroke(Stroke::new(1.0_f32, palette::LINE()))
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ctx, |ui| {
@@ -917,8 +1111,8 @@ impl RsRelayGuiApp {
                 egui::TopBottomPanel::bottom("sidebar_footer_panel")
                     .frame(
                         egui::Frame::none()
-                            .fill(palette::BG_SIDEBAR)
-                            .stroke(Stroke::new(1.0_f32, palette::LINE))
+                            .fill(palette::BG_SIDEBAR())
+                            .stroke(Stroke::new(1.0_f32, palette::LINE()))
                             .inner_margin(egui::Margin {
                                 left: 20.0,
                                 right: 20.0,
@@ -938,13 +1132,13 @@ impl RsRelayGuiApp {
                                 ui.label(
                                     RichText::new(t.sidebar_local_addr)
                                         .size(11.0)
-                                        .color(palette::TEXT_MUTED),
+                                        .color(palette::TEXT_MUTED()),
                                 );
                                 ui.label(
                                     RichText::new(&ip_str)
                                         .size(12.5)
                                         .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_PRIMARY),
+                                        .color(palette::TEXT_PRIMARY()),
                                 );
                             });
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -959,7 +1153,7 @@ impl RsRelayGuiApp {
                                         p.rect_filled(
                                             copy_rect,
                                             Rounding::same(6.0),
-                                            palette::BG_RAISED,
+                                            palette::BG_RAISED(),
                                         );
                                     }
                                     draw_vector_icon(
@@ -967,9 +1161,9 @@ impl RsRelayGuiApp {
                                         copy_rect.shrink(5.0),
                                         IconKind::Copy,
                                         if copy_resp.hovered() {
-                                            palette::TEXT_PRIMARY
+                                            palette::TEXT_PRIMARY()
                                         } else {
-                                            palette::TEXT_MUTED
+                                            palette::TEXT_MUTED()
                                         },
                                     );
                                 }
@@ -989,16 +1183,90 @@ impl RsRelayGuiApp {
                             ui.label(
                                 RichText::new(t.chk_auto_follow_hotplug)
                                     .size(12.5)
-                                    .color(palette::TEXT_SECONDARY),
+                                    .color(palette::TEXT_SECONDARY()),
                             );
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                                 pill_toggle(ui, &mut self.auto_follow_default_device);
                             });
                         });
 
-                        ui.add_space(12.0);
+                        ui.add_space(10.0);
 
-                        // 3. Language Segmented Control (`中文 | EN`) + Minimize to Tray Button
+                        // 3. Theme Mode 3-Way Segmented Control (`跟随系统 | 浅色 | 深色`)
+                        {
+                            let theme_seg_w = ui.available_width().max(150.0);
+                            let (t_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(theme_seg_w, 28.0),
+                                Sense::hover(),
+                            );
+                            if ui.is_rect_visible(t_rect) {
+                                let p = ui.painter();
+                                p.rect(
+                                    t_rect,
+                                    Rounding::same(8.0),
+                                    palette::BG_CANVAS(),
+                                    Stroke::new(1.0_f32, palette::LINE()),
+                                );
+                                let inner = t_rect.shrink(2.0);
+                                let item_w = inner.width() / 3.0;
+                                let modes = [
+                                    (ThemeMode::System, t.theme_system),
+                                    (ThemeMode::Light, t.theme_light),
+                                    (ThemeMode::Dark, t.theme_dark),
+                                ];
+                                for (i, (m_val, m_label)) in modes.iter().enumerate() {
+                                    let opt_rect = Rect::from_min_size(
+                                        Pos2::new(inner.min.x + (i as f32) * item_w, inner.min.y),
+                                        Vec2::new(item_w, inner.height()),
+                                    );
+                                    let opt_resp = ui.interact(
+                                        opt_rect,
+                                        ui.id().with(("theme_seg", i)),
+                                        Sense::click(),
+                                    );
+                                    if opt_resp.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    if opt_resp.clicked() && self.theme_mode != *m_val {
+                                        self.theme_mode = *m_val;
+                                        theme::sync_theme_mode(ctx, self.theme_mode);
+                                        let sys_theme = match *m_val {
+                                            ThemeMode::System => egui::SystemTheme::SystemDefault,
+                                            ThemeMode::Light => egui::SystemTheme::Light,
+                                            ThemeMode::Dark => egui::SystemTheme::Dark,
+                                        };
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(
+                                            sys_theme,
+                                        ));
+                                        self.last_status_msg = lang.status_theme_switched(m_label);
+                                    }
+                                    let selected = self.theme_mode == *m_val;
+                                    if selected {
+                                        p.rect(
+                                            opt_rect,
+                                            Rounding::same(6.0),
+                                            palette::BG_HOVER(),
+                                            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
+                                        );
+                                    }
+                                    p.text(
+                                        opt_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        *m_label,
+                                        FontId::new(11.5, FontFamily::Proportional),
+                                        if selected {
+                                            palette::TEXT_PRIMARY()
+                                        } else {
+                                            palette::TEXT_SECONDARY()
+                                        },
+                                    );
+                                }
+                            }
+                        }
+
+                        ui.add_space(8.0);
+
+                        // 4. Language Segmented Control (`中文 | EN`) + Minimize to Tray Button
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             let seg_w = (ui.available_width() - 40.0).max(110.0);
@@ -1009,8 +1277,8 @@ impl RsRelayGuiApp {
                                 p.rect(
                                     seg_rect,
                                     Rounding::same(8.0),
-                                    palette::BG_CANVAS,
-                                    Stroke::new(1.0_f32, palette::LINE),
+                                    palette::BG_CANVAS(),
+                                    Stroke::new(1.0_f32, palette::LINE()),
                                 );
                                 let inner = seg_rect.shrink(2.0);
                                 let half_w = inner.width() * 0.5;
@@ -1036,8 +1304,8 @@ impl RsRelayGuiApp {
                                         p.rect(
                                             opt_rect,
                                             Rounding::same(6.0),
-                                            palette::BG_HOVER,
-                                            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT),
+                                            palette::BG_HOVER(),
+                                            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
                                         );
                                     }
                                     p.text(
@@ -1046,9 +1314,9 @@ impl RsRelayGuiApp {
                                         *l_str,
                                         FontId::new(12.0, FontFamily::Proportional),
                                         if selected {
-                                            palette::TEXT_PRIMARY
+                                            palette::TEXT_PRIMARY()
                                         } else {
-                                            palette::TEXT_SECONDARY
+                                            palette::TEXT_SECONDARY()
                                         },
                                     );
                                 }
@@ -1066,20 +1334,20 @@ impl RsRelayGuiApp {
                                     tray_rect,
                                     Rounding::same(8.0),
                                     if tray_resp.hovered() {
-                                        palette::BG_RAISED
+                                        palette::BG_RAISED()
                                     } else {
                                         Color32::TRANSPARENT
                                     },
-                                    Stroke::new(1.0_f32, palette::LINE_STRONG),
+                                    Stroke::new(1.0_f32, palette::LINE_STRONG()),
                                 );
                                 draw_vector_icon(
                                     p,
                                     tray_rect.shrink(8.5),
                                     IconKind::MinimizeTray,
                                     if tray_resp.hovered() {
-                                        palette::TEXT_PRIMARY
+                                        palette::TEXT_PRIMARY()
                                     } else {
-                                        palette::TEXT_SECONDARY
+                                        palette::TEXT_SECONDARY()
                                     },
                                 );
                             }
@@ -1096,7 +1364,7 @@ impl RsRelayGuiApp {
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::none()
-                            .fill(palette::BG_SIDEBAR)
+                            .fill(palette::BG_SIDEBAR())
                             .inner_margin(egui::Margin {
                                 left: 14.0,
                                 right: 14.0,
@@ -1115,14 +1383,14 @@ impl RsRelayGuiApp {
                                 p.rect(
                                     mark_rect,
                                     Rounding::same(8.0),
-                                    Color32::from_rgb(32, 32, 36),
-                                    Stroke::new(1.0_f32, palette::LINE_STRONG),
+                                    palette::CHIP_IDLE_BG(),
+                                    Stroke::new(1.0_f32, palette::LINE_STRONG()),
                                 );
                                 draw_vector_icon(
                                     p,
                                     mark_rect.shrink(6.0),
                                     IconKind::BrandWaveform,
-                                    palette::ACCENT,
+                                    palette::ACCENT(),
                                 );
                             }
                             ui.add_space(2.0);
@@ -1131,14 +1399,14 @@ impl RsRelayGuiApp {
                                 ui.label(
                                     RichText::new("rsrelay")
                                         .size(15.0)
-                                        .color(palette::TEXT_PRIMARY)
+                                        .color(palette::TEXT_PRIMARY())
                                         .strong(),
                                 );
                                 ui.label(
                                     RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
                                         .size(11.0)
                                         .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_MUTED),
+                                        .color(palette::TEXT_MUTED()),
                                 );
                             });
                         });
@@ -1151,7 +1419,7 @@ impl RsRelayGuiApp {
                             ui.label(
                                 RichText::new(t.nav_section_mode)
                                     .size(11.0)
-                                    .color(palette::TEXT_MUTED),
+                                    .color(palette::TEXT_MUTED()),
                             );
                         });
                         ui.add_space(4.0);
@@ -1200,20 +1468,20 @@ impl RsRelayGuiApp {
                                     p.rect(
                                         nav_rect,
                                         Rounding::same(8.0),
-                                        palette::BG_RAISED,
-                                        Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT),
+                                        palette::BG_RAISED(),
+                                        Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
                                     );
                                 } else if nav_resp.hovered() {
                                     p.rect_filled(
                                         nav_rect,
                                         Rounding::same(8.0),
-                                        Color32::from_rgba_unmultiplied(255, 255, 255, 7),
+                                        palette::SIDEBAR_HOVER_BG(),
                                     );
                                 }
                                 let fg = if selected || nav_resp.hovered() {
-                                    palette::TEXT_PRIMARY
+                                    palette::TEXT_PRIMARY()
                                 } else {
-                                    palette::TEXT_SECONDARY
+                                    palette::TEXT_SECONDARY()
                                 };
                                 let icon_rect = Rect::from_center_size(
                                     Pos2::new(nav_rect.min.x + 18.0, nav_rect.center().y),
@@ -1230,8 +1498,8 @@ impl RsRelayGuiApp {
                                 if is_live {
                                     let dot_pos =
                                         Pos2::new(nav_rect.max.x - 13.0, nav_rect.center().y);
-                                    p.circle_filled(dot_pos, 6.0, palette::ACCENT_TINT);
-                                    p.circle_filled(dot_pos, 3.0, palette::ACCENT);
+                                    p.circle_filled(dot_pos, 6.0, palette::ACCENT_TINT());
+                                    p.circle_filled(dot_pos, 3.0, palette::ACCENT());
                                 }
                             }
                             ui.add_space(2.0);
@@ -1245,7 +1513,7 @@ impl RsRelayGuiApp {
                             ui.label(
                                 RichText::new(t.nav_section_nearby)
                                     .size(11.0)
-                                    .color(palette::TEXT_MUTED),
+                                    .color(palette::TEXT_MUTED()),
                             );
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                                 let (ref_rect, ref_resp) =
@@ -1259,15 +1527,15 @@ impl RsRelayGuiApp {
                                         p.rect_filled(
                                             ref_rect,
                                             Rounding::same(6.0),
-                                            palette::BG_RAISED,
+                                            palette::BG_RAISED(),
                                         );
                                     }
                                     let col = if self.scanning_lan.load(Ordering::Relaxed) {
-                                        palette::ACCENT
+                                        palette::ACCENT()
                                     } else if ref_resp.hovered() {
-                                        palette::TEXT_PRIMARY
+                                        palette::TEXT_PRIMARY()
                                     } else {
-                                        palette::TEXT_MUTED
+                                        palette::TEXT_MUTED()
                                     };
                                     draw_vector_icon(
                                         p,
@@ -1382,12 +1650,12 @@ impl RsRelayGuiApp {
         if ui.is_rect_visible(rect) {
             let p = ui.painter();
             if is_current {
-                p.rect_filled(rect, Rounding::same(8.0), palette::PEER_ACTIVE_BG);
+                p.rect_filled(rect, Rounding::same(8.0), palette::PEER_ACTIVE_BG());
             } else if resp.hovered() {
                 p.rect_filled(
                     rect,
                     Rounding::same(8.0),
-                    Color32::from_rgb(17, 17, 20),
+                    palette::SIDEBAR_HOVER_BG(),
                 );
             }
 
@@ -1395,28 +1663,28 @@ impl RsRelayGuiApp {
                 Pos2::new(rect.min.x + 23.0, rect.center().y),
                 Vec2::splat(26.0),
             );
-            p.rect_filled(os_rect, Rounding::same(7.0), palette::BG_RAISED);
-            draw_vector_icon(p, os_rect.shrink(6.0), icon, palette::TEXT_SECONDARY);
+            p.rect_filled(os_rect, Rounding::same(7.0), palette::BG_RAISED());
+            draw_vector_icon(p, os_rect.shrink(6.0), icon, palette::TEXT_SECONDARY());
 
             p.text(
                 Pos2::new(rect.min.x + 46.0, rect.center().y - 7.5),
                 egui::Align2::LEFT_CENTER,
                 name,
                 FontId::new(12.5, FontFamily::Proportional),
-                palette::TEXT_PRIMARY,
+                palette::TEXT_PRIMARY(),
             );
             p.text(
                 Pos2::new(rect.min.x + 46.0, rect.center().y + 8.5),
                 egui::Align2::LEFT_CENTER,
                 ip_str,
                 FontId::new(11.0, FontFamily::Monospace),
-                palette::TEXT_MUTED,
+                palette::TEXT_MUTED(),
             );
 
             let dot_col = if is_current {
-                palette::ACCENT
+                palette::ACCENT()
             } else {
-                palette::DOT_OFFLINE
+                palette::DOT_OFFLINE()
             };
             p.circle_filled(
                 Pos2::new(rect.max.x - 13.0, rect.center().y),
@@ -1444,13 +1712,13 @@ impl RsRelayGuiApp {
                 ui.label(
                     RichText::new(t.page_c_title)
                         .size(20.0)
-                        .color(palette::TEXT_PRIMARY)
+                        .color(palette::TEXT_PRIMARY())
                         .strong(),
                 );
                 ui.label(
                     RichText::new(t.page_c_subtitle)
                         .size(13.0)
-                        .color(palette::TEXT_SECONDARY),
+                        .color(palette::TEXT_SECONDARY()),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(Align::Max), |ui| {
@@ -1467,7 +1735,7 @@ impl RsRelayGuiApp {
             // LEFT CARD: 发送 (Transmitter)
             // =================================================================
             let tx_running = self.active_sender.is_some() || self.demo_mode;
-            theme::studio_card_frame(tx_running, palette::ACCENT).show(&mut columns[0], |ui| {
+            theme::studio_card_frame(tx_running, palette::ACCENT()).show(&mut columns[0], |ui| {
                 // 1. Card Header (`.ch`)
                 egui::Frame::none()
                     .inner_margin(egui::Margin {
@@ -1483,7 +1751,7 @@ impl RsRelayGuiApp {
                             ui.label(
                                 RichText::new(t.tx_card_title)
                                     .size(15.0)
-                                    .color(palette::TEXT_PRIMARY)
+                                    .color(palette::TEXT_PRIMARY())
                                     .strong(),
                             );
                             if tx_running {
@@ -1544,7 +1812,7 @@ impl RsRelayGuiApp {
                             ui.label(
                                 RichText::new(format!("{} · {peer_name}", t.hero_send_to))
                                     .size(11.5)
-                                    .color(palette::TEXT_MUTED),
+                                    .color(palette::TEXT_MUTED()),
                             );
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -1553,16 +1821,16 @@ impl RsRelayGuiApp {
                                         .size(29.0)
                                         .family(FontFamily::Monospace)
                                         .color(if tx_running {
-                                            palette::TEXT_PRIMARY
+                                            palette::TEXT_PRIMARY()
                                         } else {
-                                            palette::TEXT_SECONDARY
+                                            palette::TEXT_SECONDARY()
                                         }),
                                 );
                                 ui.label(
                                     RichText::new(&tx_port)
                                         .size(29.0)
                                         .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_MUTED),
+                                        .color(palette::TEXT_MUTED()),
                                 );
                             });
                             ui.horizontal_wrapped(|ui| {
@@ -1570,20 +1838,20 @@ impl RsRelayGuiApp {
                                 ui.label(
                                     RichText::new(source_label)
                                         .size(12.0)
-                                        .color(palette::TEXT_SECONDARY),
+                                        .color(palette::TEXT_SECONDARY()),
                                 );
-                                ui.label(RichText::new("→").size(12.0).color(palette::TEXT_MUTED));
+                                ui.label(RichText::new("→").size(12.0).color(palette::TEXT_MUTED()));
                                 ui.label(
                                     RichText::new(&tx_dev_label)
                                         .size(12.0)
-                                        .color(palette::TEXT_SECONDARY),
+                                        .color(palette::TEXT_SECONDARY()),
                                 );
-                                ui.label(RichText::new("·").size(12.0).color(palette::TEXT_MUTED));
+                                ui.label(RichText::new("·").size(12.0).color(palette::TEXT_MUTED()));
                                 ui.label(
                                     RichText::new(codec_spec)
                                         .size(12.0)
                                         .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_SECONDARY),
+                                        .color(palette::TEXT_SECONDARY()),
                                 );
                             });
                         });
@@ -1673,7 +1941,7 @@ impl RsRelayGuiApp {
                             .button(
                                 RichText::new(t.btn_grant_perm)
                                     .size(11.5)
-                                    .color(palette::STATUS_WARN),
+                                    .color(palette::STATUS_WARN()),
                             )
                             .on_hover_text(t.hover_grant_perm)
                             .clicked()
@@ -1729,7 +1997,7 @@ impl RsRelayGuiApp {
             // RIGHT CARD: 接收 (Receiver)
             // =================================================================
             let rx_running = self.active_receiver.is_some();
-            theme::studio_card_frame(rx_running, palette::ACCENT).show(&mut columns[1], |ui| {
+            theme::studio_card_frame(rx_running, palette::ACCENT()).show(&mut columns[1], |ui| {
                 // 1. Card Header (`.ch`)
                 egui::Frame::none()
                     .inner_margin(egui::Margin {
@@ -1745,7 +2013,7 @@ impl RsRelayGuiApp {
                             ui.label(
                                 RichText::new(t.rx_card_title)
                                     .size(15.0)
-                                    .color(palette::TEXT_PRIMARY)
+                                    .color(palette::TEXT_PRIMARY())
                                     .strong(),
                             );
                             if rx_running {
@@ -1791,7 +2059,7 @@ impl RsRelayGuiApp {
                             ui.label(
                                 RichText::new(t.hero_listen_any)
                                     .size(11.5)
-                                    .color(palette::TEXT_MUTED),
+                                    .color(palette::TEXT_MUTED()),
                             );
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -1800,16 +2068,16 @@ impl RsRelayGuiApp {
                                         .size(29.0)
                                         .family(FontFamily::Monospace)
                                         .color(if rx_running {
-                                            palette::TEXT_PRIMARY
+                                            palette::TEXT_PRIMARY()
                                         } else {
-                                            palette::TEXT_SECONDARY
+                                            palette::TEXT_SECONDARY()
                                         }),
                                 );
                                 ui.label(
                                     RichText::new(&rx_port)
                                         .size(29.0)
                                         .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_MUTED),
+                                        .color(palette::TEXT_MUTED()),
                                 );
                             });
                             ui.horizontal_wrapped(|ui| {
@@ -1817,20 +2085,20 @@ impl RsRelayGuiApp {
                                 ui.label(
                                     RichText::new(t.route_adaptive_jb)
                                         .size(12.0)
-                                        .color(palette::TEXT_SECONDARY),
+                                        .color(palette::TEXT_SECONDARY()),
                                 );
-                                ui.label(RichText::new("→").size(12.0).color(palette::TEXT_MUTED));
+                                ui.label(RichText::new("→").size(12.0).color(palette::TEXT_MUTED()));
                                 ui.label(
                                     RichText::new(&rx_dev_label)
                                         .size(12.0)
-                                        .color(palette::TEXT_SECONDARY),
+                                        .color(palette::TEXT_SECONDARY()),
                                 );
-                                ui.label(RichText::new("·").size(12.0).color(palette::TEXT_MUTED));
+                                ui.label(RichText::new("·").size(12.0).color(palette::TEXT_MUTED()));
                                 ui.label(
                                     RichText::new(format!("48 kHz · {}", t.channel_stereo))
                                         .size(12.0)
                                         .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_SECONDARY),
+                                        .color(palette::TEXT_SECONDARY()),
                                 );
                             });
                         });
@@ -1890,7 +2158,7 @@ impl RsRelayGuiApp {
                     0.0,
                     (self.target_buffer_ms as f32 * 2.0).max(36.0),
                     Some(self.target_buffer_ms as f32),
-                    palette::ACCENT,
+                    palette::ACCENT(),
                 );
 
                 // 6. Settings List (`.set`, 4 hairline rows)
@@ -1958,13 +2226,13 @@ impl RsRelayGuiApp {
                 ui.label(
                     RichText::new(t.page_c2_title)
                         .size(20.0)
-                        .color(palette::TEXT_PRIMARY)
+                        .color(palette::TEXT_PRIMARY())
                         .strong(),
                 );
                 ui.label(
                     RichText::new(t.page_c2_subtitle)
                         .size(13.0)
-                        .color(palette::TEXT_SECONDARY),
+                        .color(palette::TEXT_SECONDARY()),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(Align::Max), |ui| {
@@ -2018,8 +2286,8 @@ impl RsRelayGuiApp {
         };
 
         egui::Frame::none()
-            .fill(palette::BG_PANEL)
-            .stroke(Stroke::new(1.0_f32, palette::LINE))
+            .fill(palette::BG_PANEL())
+            .stroke(Stroke::new(1.0_f32, palette::LINE()))
             .rounding(Rounding::same(metrics::RADIUS_CARD))
             .inner_margin(egui::Margin::symmetric(22.0, 16.0))
             .show(ui, |ui| {
@@ -2030,22 +2298,22 @@ impl RsRelayGuiApp {
                     let (av_rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
                     if ui.is_rect_visible(av_rect) {
                         let p = ui.painter();
-                        p.rect_filled(av_rect, Rounding::same(11.0), palette::BG_RAISED);
+                        p.rect_filled(av_rect, Rounding::same(11.0), palette::BG_RAISED());
                         draw_vector_icon(
                             p,
                             av_rect.shrink(10.0),
                             IconKind::Laptop,
-                            palette::TEXT_PRIMARY,
+                            palette::TEXT_PRIMARY(),
                         );
                         let badge_pos = Pos2::new(av_rect.max.x - 2.0, av_rect.max.y - 2.0);
-                        p.circle_filled(badge_pos, 6.0, palette::BG_PANEL);
+                        p.circle_filled(badge_pos, 6.0, palette::BG_PANEL());
                         p.circle_filled(
                             badge_pos,
                             4.0,
                             if dpx_running {
-                                palette::ACCENT
+                                palette::ACCENT()
                             } else {
-                                palette::DOT_OFFLINE
+                                palette::DOT_OFFLINE()
                             },
                         );
                     }
@@ -2055,7 +2323,7 @@ impl RsRelayGuiApp {
                         ui.label(
                             RichText::new(&peer_name)
                                 .size(14.0)
-                                .color(palette::TEXT_PRIMARY)
+                                .color(palette::TEXT_PRIMARY())
                                 .strong(),
                         );
                         let conn_sub = format!(
@@ -2069,7 +2337,7 @@ impl RsRelayGuiApp {
                                 RichText::new(conn_sub)
                                     .size(11.5)
                                     .family(FontFamily::Monospace)
-                                    .color(palette::TEXT_MUTED),
+                                    .color(palette::TEXT_MUTED()),
                             )
                             .sense(Sense::click()),
                         );
@@ -2087,7 +2355,7 @@ impl RsRelayGuiApp {
                                 ui.label(
                                     RichText::new(t.label_target_addr)
                                         .size(11.0)
-                                        .color(palette::TEXT_MUTED),
+                                        .color(palette::TEXT_MUTED()),
                                 );
                                 quiet_mono_input_pill(
                                     ui,
@@ -2105,7 +2373,7 @@ impl RsRelayGuiApp {
                             Pos2::new(vr1.center().x, vr1.min.y),
                             Pos2::new(vr1.center().x, vr1.max.y),
                         ],
-                        Stroke::new(1.0_f32, palette::LINE),
+                        Stroke::new(1.0_f32, palette::LINE()),
                     );
 
                     // 2. Round-Trip Latency (`往返延迟`)
@@ -2114,7 +2382,7 @@ impl RsRelayGuiApp {
                         ui.label(
                             RichText::new(t.stat_rtt)
                                 .size(11.5)
-                                .color(palette::TEXT_MUTED),
+                                .color(palette::TEXT_MUTED()),
                         );
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 3.0;
@@ -2122,12 +2390,12 @@ impl RsRelayGuiApp {
                                 RichText::new(&rtt_str)
                                     .size(18.0)
                                     .family(FontFamily::Monospace)
-                                    .color(palette::TEXT_PRIMARY),
+                                    .color(palette::TEXT_PRIMARY()),
                             );
                             ui.label(
                                 RichText::new("ms")
                                     .size(11.0)
-                                    .color(palette::TEXT_MUTED),
+                                    .color(palette::TEXT_MUTED()),
                             );
                         });
                     });
@@ -2139,7 +2407,7 @@ impl RsRelayGuiApp {
                             Pos2::new(vr2.center().x, vr2.min.y),
                             Pos2::new(vr2.center().x, vr2.max.y),
                         ],
-                        Stroke::new(1.0_f32, palette::LINE),
+                        Stroke::new(1.0_f32, palette::LINE()),
                     );
 
                     // 3. Local Role (`本机角色`: 主机电脑 | 无线耳麦)
@@ -2148,7 +2416,7 @@ impl RsRelayGuiApp {
                         ui.label(
                             RichText::new(t.conn_local_role)
                                 .size(11.5)
-                                .color(palette::TEXT_MUTED),
+                                .color(palette::TEXT_MUTED()),
                         );
                         let roles = [
                             (DuplexRole::Host, t.role_host_short),
@@ -2163,7 +2431,7 @@ impl RsRelayGuiApp {
                         ui.label(
                             RichText::new(t.label_quality_latency)
                                 .size(11.5)
-                                .color(palette::TEXT_MUTED),
+                                .color(palette::TEXT_MUTED()),
                         );
                         latency_profile_selector(ui, &mut self.selected_profile, lang);
                     });
@@ -2176,7 +2444,7 @@ impl RsRelayGuiApp {
                                 ui.label(
                                     RichText::new(t.conn_codec)
                                         .size(11.5)
-                                        .color(palette::TEXT_MUTED),
+                                        .color(palette::TEXT_MUTED()),
                                 );
                             });
                             ui.with_layout(egui::Layout::right_to_left(Align::Min), |ui| {
@@ -2184,7 +2452,7 @@ impl RsRelayGuiApp {
                                     RichText::new(codec_badge)
                                         .size(12.0)
                                         .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_SECONDARY),
+                                        .color(palette::TEXT_SECONDARY()),
                                 );
                             });
                         });
@@ -2200,7 +2468,7 @@ impl RsRelayGuiApp {
             // =================================================================
             // LEFT CARD: 收听 (Listen / Downlink RX)
             // =================================================================
-            theme::studio_card_frame(dpx_running, palette::ACCENT).show(&mut columns[0], |ui| {
+            theme::studio_card_frame(dpx_running, palette::ACCENT()).show(&mut columns[0], |ui| {
                 // 1. Card Header (`.ch`)
                 egui::Frame::none()
                     .inner_margin(egui::Margin {
@@ -2218,13 +2486,13 @@ impl RsRelayGuiApp {
                                 ui.label(
                                     RichText::new(t.c2_listen_title)
                                         .size(15.0)
-                                        .color(palette::TEXT_PRIMARY)
+                                        .color(palette::TEXT_PRIMARY())
                                         .strong(),
                                 );
                                 ui.label(
                                     RichText::new(t.c2_listen_subtitle)
                                         .size(11.5)
-                                        .color(palette::TEXT_MUTED),
+                                        .color(palette::TEXT_MUTED()),
                                 );
                             });
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -2300,7 +2568,7 @@ impl RsRelayGuiApp {
                     0.0,
                     (target_buf_ms as f32 * 2.0).max(30.0),
                     Some(target_buf_ms as f32),
-                    palette::ACCENT,
+                    palette::ACCENT(),
                 );
 
                 // 5. Settings List (`.set`, 3 rows)
@@ -2352,7 +2620,7 @@ impl RsRelayGuiApp {
             // =================================================================
             // RIGHT CARD: 麦克风 (Microphone / Uplink TX)
             // =================================================================
-            theme::studio_card_frame(dpx_running, palette::ACCENT).show(&mut columns[1], |ui| {
+            theme::studio_card_frame(dpx_running, palette::ACCENT()).show(&mut columns[1], |ui| {
                 // 1. Card Header (`.ch`)
                 egui::Frame::none()
                     .inner_margin(egui::Margin {
@@ -2370,13 +2638,13 @@ impl RsRelayGuiApp {
                                 ui.label(
                                     RichText::new(t.c2_mic_title)
                                         .size(15.0)
-                                        .color(palette::TEXT_PRIMARY)
+                                        .color(palette::TEXT_PRIMARY())
                                         .strong(),
                                 );
                                 ui.label(
                                     RichText::new(t.c2_mic_subtitle)
                                         .size(11.5)
-                                        .color(palette::TEXT_MUTED),
+                                        .color(palette::TEXT_MUTED()),
                                 );
                             });
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -2458,7 +2726,7 @@ impl RsRelayGuiApp {
                     -60.0,
                     0.0,
                     Some(self.duplex_gate_db),
-                    palette::ACCENT,
+                    palette::ACCENT(),
                 );
 
                 // 5. Settings List (`.set`, 3 rows)
@@ -2524,13 +2792,13 @@ impl RsRelayGuiApp {
                 ui.label(
                     RichText::new(t.page_hw_title)
                         .size(20.0)
-                        .color(palette::TEXT_PRIMARY)
+                        .color(palette::TEXT_PRIMARY())
                         .strong(),
                 );
                 ui.label(
                     RichText::new(t.page_hw_subtitle)
                         .size(13.0)
-                        .color(palette::TEXT_SECONDARY),
+                        .color(palette::TEXT_SECONDARY()),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(Align::Max), |ui| {
@@ -2538,7 +2806,7 @@ impl RsRelayGuiApp {
                     .button(
                         RichText::new(t.btn_refresh_ports)
                             .size(12.5)
-                            .color(palette::TEXT_PRIMARY),
+                            .color(palette::TEXT_PRIMARY()),
                     )
                     .on_hover_text(t.btn_refresh_ports_hover)
                     .clicked()
@@ -2565,7 +2833,7 @@ impl RsRelayGuiApp {
 
         ui.columns(2, |cols| {
             // Left Card: Input Devices
-            theme::studio_card_frame(false, palette::LINE).show(&mut cols[0], |ui| {
+            theme::studio_card_frame(false, palette::LINE()).show(&mut cols[0], |ui| {
                 egui::Frame::none()
                     .inner_margin(egui::Margin::symmetric(20.0, 18.0))
                     .show(ui, |ui| {
@@ -2577,13 +2845,13 @@ impl RsRelayGuiApp {
                                 ui.label(
                                     RichText::new(t.hw_input_title)
                                         .size(15.0)
-                                        .color(palette::TEXT_PRIMARY)
+                                        .color(palette::TEXT_PRIMARY())
                                         .strong(),
                                 );
                                 ui.label(
                                     RichText::new(t.hw_input_subtitle)
                                         .size(11.5)
-                                        .color(palette::TEXT_MUTED),
+                                        .color(palette::TEXT_MUTED()),
                                 );
                             });
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -2611,7 +2879,7 @@ impl RsRelayGuiApp {
                             ))
                             .size(11.5)
                             .family(FontFamily::Monospace)
-                            .color(palette::TEXT_MUTED),
+                            .color(palette::TEXT_MUTED()),
                         );
                         if dev.is_default_input {
                             status_chip(ui, t.badge_default_in, None, true);
@@ -2621,7 +2889,7 @@ impl RsRelayGuiApp {
             });
 
             // Right Card: Output Devices
-            theme::studio_card_frame(false, palette::LINE).show(&mut cols[1], |ui| {
+            theme::studio_card_frame(false, palette::LINE()).show(&mut cols[1], |ui| {
                 egui::Frame::none()
                     .inner_margin(egui::Margin::symmetric(20.0, 18.0))
                     .show(ui, |ui| {
@@ -2633,13 +2901,13 @@ impl RsRelayGuiApp {
                                 ui.label(
                                     RichText::new(t.hw_output_title)
                                         .size(15.0)
-                                        .color(palette::TEXT_PRIMARY)
+                                        .color(palette::TEXT_PRIMARY())
                                         .strong(),
                                 );
                                 ui.label(
                                     RichText::new(t.hw_output_subtitle)
                                         .size(11.5)
-                                        .color(palette::TEXT_MUTED),
+                                        .color(palette::TEXT_MUTED()),
                                 );
                             });
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -2667,7 +2935,7 @@ impl RsRelayGuiApp {
                             ))
                             .size(11.5)
                             .family(FontFamily::Monospace)
-                            .color(palette::TEXT_MUTED),
+                            .color(palette::TEXT_MUTED()),
                         );
                         if dev.is_default_output {
                             status_chip(ui, t.badge_default_out, None, true);
@@ -2684,6 +2952,9 @@ impl RsRelayGuiApp {
     }
 
     pub fn render_ui(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        let _ = win32_tray::capture_main_window_hwnd();
+
         if !self.theme_initialized {
             theme::apply_studio_theme(ctx);
             if let Ok(mut guard) = global_egui_wakeup_ctx().lock() {
@@ -2691,6 +2962,7 @@ impl RsRelayGuiApp {
             }
             self.theme_initialized = true;
         }
+        theme::sync_theme_mode(ctx, self.theme_mode);
 
         if self.tray.is_some()
             && !self.quit_requested
@@ -2744,9 +3016,22 @@ impl RsRelayGuiApp {
                 } else if event_id == quit_id {
                     self.quit_requested = true;
                     self.stop_all_streams();
+                    self.tray = None;
+                    apply_os_background_tray_mode(false);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ctx.request_repaint();
+                    #[cfg(target_os = "windows")]
+                    win32_tray::request_close_main_window();
                 }
             }
+        }
+
+        if self.quit_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+            #[cfg(target_os = "windows")]
+            win32_tray::request_close_main_window();
+            return;
         }
 
         if self.last_device_poll.elapsed() >= Duration::from_millis(2500) {
@@ -2763,6 +3048,8 @@ impl RsRelayGuiApp {
                         frames_remaining: frames_remaining - 1,
                     };
                     ctx.request_repaint();
+                    #[cfg(target_os = "windows")]
+                    win32_tray::wake_main_window();
                 } else {
                     self.tray_window_state = TrayWindowState::HiddenInTray;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -2775,7 +3062,21 @@ impl RsRelayGuiApp {
                 ctx.request_repaint_after(Duration::from_millis(500));
                 return;
             }
-            TrayWindowState::Visible => {}
+            TrayWindowState::Visible => {
+                if self.pending_restore_focus {
+                    self.pending_restore_focus = false;
+                    #[cfg(target_os = "windows")]
+                    win32_tray::present_and_focus_main_window();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(
+                        980.0, 660.0,
+                    )));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                        1220.0, 760.0,
+                    )));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.request_repaint();
+                }
+            }
         }
 
         if self.active_sender.is_some()
@@ -2794,7 +3095,7 @@ impl RsRelayGuiApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(palette::BG_CANVAS)
+                    .fill(palette::BG_CANVAS())
                     .inner_margin(egui::Margin {
                         left: metrics::MAIN_PADDING_X,
                         right: metrics::MAIN_PADDING_X,
@@ -2987,6 +3288,10 @@ fn main() -> anyhow::Result<()> {
                 "2" | "hw" | "devices" | "matrix" => app.active_tab = WorkspaceTab::HardwareMatrix,
                 _ => {}
             }
+        } else if let Some(val) = arg.strip_prefix("--theme=") {
+            if let Some(tm) = ThemeMode::from_str_opt(val) {
+                app.theme_mode = tm;
+            }
         } else if arg == "--demo" {
             app.enable_demo_preview();
         } else if let Some(path) = arg.strip_prefix("--screenshot=") {
@@ -2997,16 +3302,64 @@ fn main() -> anyhow::Result<()> {
         app.enable_demo_preview();
     }
 
+    let test_tray_cycle = std::env::args().any(|a| a == "--test-tray-cycle");
+    if test_tray_cycle {
+        if let Some(ref tray) = app.tray {
+            let toggle_id = tray.toggle_window_id.clone();
+            let quit_id = tray.quit_id.clone();
+            thread::spawn(move || {
+                // 1. Wait until app is HiddenInTray, then simulate clicking "显示主页面" in tray menu
+                thread::sleep(Duration::from_millis(500));
+                let (tx, _) = global_tray_event_queue();
+                let _ = tx.send(toggle_id.clone());
+                if let Ok(guard) = global_egui_wakeup_ctx().lock() {
+                    if let Some(ref ctx) = *guard {
+                        ctx.request_repaint();
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                win32_tray::wake_main_window();
+
+                // 2. Wait while window is restored & visible, then simulate hiding back to tray
+                thread::sleep(Duration::from_millis(500));
+                let _ = tx.send(toggle_id);
+                if let Ok(guard) = global_egui_wakeup_ctx().lock() {
+                    if let Some(ref ctx) = *guard {
+                        ctx.request_repaint();
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                win32_tray::wake_main_window();
+
+                // 3. Wait until HiddenInTray again, then simulate clicking "退出" in tray menu
+                thread::sleep(Duration::from_millis(500));
+                let _ = tx.send(quit_id);
+                if let Ok(guard) = global_egui_wakeup_ctx().lock() {
+                    if let Some(ref ctx) = *guard {
+                        ctx.request_repaint();
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                win32_tray::wake_main_window();
+
+                thread::sleep(Duration::from_millis(1500));
+                std::process::exit(2);
+            });
+        }
+    }
+
     eframe::run_native(
         "rsrelay",
         native_options,
         Box::new(move |cc| {
+            #[cfg(target_os = "windows")]
+            let _ = win32_tray::capture_main_window_hwnd();
             theme::apply_studio_theme(&cc.egui_ctx);
             if let Ok(mut guard) = global_egui_wakeup_ctx().lock() {
                 *guard = Some(cc.egui_ctx.clone());
             }
             app.theme_initialized = true;
-            if start_in_tray {
+            if start_in_tray || test_tray_cycle {
                 app.enter_tray_background_mode(&cc.egui_ctx);
             }
             Ok(Box::new(app))
@@ -3030,15 +3383,18 @@ mod tests {
             app.set_language(lang);
             assert_eq!(app.lang, lang);
 
-            for tab in [
-                WorkspaceTab::DualConsole,
-                WorkspaceTab::FullDuplex,
-                WorkspaceTab::HardwareMatrix,
-            ] {
-                app.active_tab = tab;
-                let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                    app.render_ui(ctx);
-                });
+            for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
+                app.theme_mode = mode;
+                for tab in [
+                    WorkspaceTab::DualConsole,
+                    WorkspaceTab::FullDuplex,
+                    WorkspaceTab::HardwareMatrix,
+                ] {
+                    app.active_tab = tab;
+                    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                        app.render_ui(ctx);
+                    });
+                }
             }
         }
     }

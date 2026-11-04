@@ -1,89 +1,378 @@
-//! "Quiet Graphite" Design System for `rsrelay-gui`.
+//! "Quiet Graphite" (Dark) & "Quiet Daylight" (Light) Design System for `rsrelay-gui`.
 //!
-//! Implements the Quiet Graphite visual language (Frames C & C2):
-//! - Neutral graphite surfaces (`#0E0E10` canvas, `#0B0B0D` sidebar, `#151517` cards, `#1C1C1F` raised controls)
-//! - Single signal accent (`#3CE0A0` mint) reserved strictly for live/healthy states
-//! - Hairline dividers (`rgba(255, 255, 255, 0.06)`) instead of nested bordered boxes
+//! Supports three theme modes (`ThemeMode::System`, `ThemeMode::Light`, `ThemeMode::Dark`):
+//! - **Dark ("Quiet Graphite")**: Neutral graphite surfaces (`#0E0E10` canvas, `#0B0B0D` sidebar, `#151517` cards, `#1C1C1F` raised controls)
+//! - **Light ("Quiet Daylight")**: Warm architectural paper surfaces (`#F4F4F6` canvas, `#ECECEF` sidebar, `#FFFFFF` cards, `#F1F1F4` raised controls)
+//! - Single signal accent (`#3CE0A0` mint in dark / `#10B981` emerald in light) reserved strictly for live/healthy states
+//! - Hairline dividers (`1px`) instead of nested bordered boxes
 //! - Monospace typography reserved for numeric telemetry and network addresses
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Color32, FontFamily, FontId, Margin, Rounding, Stroke, TextStyle, Vec2};
 
-/// Semantic color tokens for the **Quiet Graphite** theme.
+/// User-selectable theme preference (`跟随系统` / `浅色` / `深色`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeMode {
+    /// Follow the operating system's dark/light appearance (`跟随系统`).
+    #[default]
+    System,
+    /// Always use the light "Quiet Daylight" appearance (`浅色`).
+    Light,
+    /// Always use the dark "Quiet Graphite" appearance (`深色`).
+    Dark,
+}
+
+impl ThemeMode {
+    /// Parse a CLI or config string (`"system"`, `"auto"`, `"light"`, `"dark"`) into a [`ThemeMode`].
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "system" | "auto" | "os" => Some(Self::System),
+            "light" | "day" | "white" => Some(Self::Light),
+            "dark" | "night" | "black" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+}
+
+static ACTIVE_THEME_IS_DARK: AtomicBool = AtomicBool::new(true);
+
+/// Returns `true` when the currently active resolved theme is Dark ("Quiet Graphite").
+#[inline]
+pub fn is_dark_theme() -> bool {
+    ACTIVE_THEME_IS_DARK.load(Ordering::Relaxed)
+}
+
+/// Explicitly set whether the resolved theme is Dark (`true`) or Light (`false`).
+#[inline]
+pub fn set_active_dark_theme(is_dark: bool) {
+    ACTIVE_THEME_IS_DARK.store(is_dark, Ordering::Relaxed);
+}
+
+/// Semantic color tokens that dynamically resolve to **Quiet Graphite** (Dark) or **Quiet Daylight** (Light).
+#[allow(non_snake_case)]
 pub mod palette {
     use eframe::egui::Color32;
 
+    use super::is_dark_theme;
+
+    #[inline]
+    fn pick(dark: Color32, light: Color32) -> Color32 {
+        if is_dark_theme() {
+            dark
+        } else {
+            light
+        }
+    }
+
     // === Canvas, Sidebar & Surface Hierarchy ===
-    /// Main workspace canvas (`#0E0E10`)
-    pub const BG_CANVAS: Color32 = Color32::from_rgb(14, 14, 16);
-    /// Left navigation sidebar (`#0B0B0D`)
-    pub const BG_SIDEBAR: Color32 = Color32::from_rgb(11, 11, 13);
-    /// Card panel surface (`#151517`)
-    pub const BG_PANEL: Color32 = Color32::from_rgb(21, 21, 23);
-    /// Raised control fill for selects, icon tiles, secondary buttons, active nav (`#1C1C1F`)
-    pub const BG_RAISED: Color32 = Color32::from_rgb(28, 28, 31);
-    /// Hover surface & active segmented pill fill (`#232327`)
-    pub const BG_HOVER: Color32 = Color32::from_rgb(35, 35, 39);
+    /// Main workspace canvas (`#0E0E10` dark / `#F4F4F6` light)
+    #[inline]
+    pub fn BG_CANVAS() -> Color32 {
+        pick(
+            Color32::from_rgb(14, 14, 16),
+            Color32::from_rgb(244, 244, 246),
+        )
+    }
+
+    /// Left navigation sidebar (`#0B0B0D` dark / `#ECECEF` light)
+    #[inline]
+    pub fn BG_SIDEBAR() -> Color32 {
+        pick(
+            Color32::from_rgb(11, 11, 13),
+            Color32::from_rgb(236, 236, 239),
+        )
+    }
+
+    /// Card panel surface (`#151517` dark / `#FFFFFF` light)
+    #[inline]
+    pub fn BG_PANEL() -> Color32 {
+        pick(
+            Color32::from_rgb(21, 21, 23),
+            Color32::from_rgb(255, 255, 255),
+        )
+    }
+
+    /// Raised control fill for selects, icon tiles, secondary buttons, active nav (`#1C1C1F` dark / `#F1F1F4` light)
+    #[inline]
+    pub fn BG_RAISED() -> Color32 {
+        pick(
+            Color32::from_rgb(28, 28, 31),
+            Color32::from_rgb(241, 241, 244),
+        )
+    }
+
+    /// Hover surface & active segmented pill fill (`#232327` dark / `#FFFFFF` light)
+    #[inline]
+    pub fn BG_HOVER() -> Color32 {
+        pick(
+            Color32::from_rgb(35, 35, 39),
+            Color32::from_rgb(255, 255, 255),
+        )
+    }
+
+    /// Sidebar item subtle hover fill (`#111114` dark / `#E4E4E9` light)
+    #[inline]
+    pub fn SIDEBAR_HOVER_BG() -> Color32 {
+        pick(
+            Color32::from_rgb(17, 17, 20),
+            Color32::from_rgb(228, 228, 233),
+        )
+    }
 
     // Backwards-compatible surface aliases
-    pub const BG_SURFACE: Color32 = BG_PANEL;
-    pub const BG_ELEVATED: Color32 = BG_RAISED;
-    pub const BG_ACTIVE: Color32 = BG_HOVER;
-    pub const BG_TRENCH: Color32 = BG_CANVAS;
+    #[inline]
+    pub fn BG_SURFACE() -> Color32 {
+        BG_PANEL()
+    }
+    #[inline]
+    pub fn BG_ELEVATED() -> Color32 {
+        BG_RAISED()
+    }
+    #[inline]
+    pub fn BG_ACTIVE() -> Color32 {
+        BG_HOVER()
+    }
+    #[inline]
+    pub fn BG_TRENCH() -> Color32 {
+        BG_CANVAS()
+    }
 
-    // === Hairlines & Borders (Pre-composited on #151517 / #0E0E10 to avoid linear-alpha washout) ===
-    /// Primary 1px hairline divider (`#222225`, equivalent to `rgba(255, 255, 255, 0.06)` on `#151517`)
-    pub const LINE: Color32 = Color32::from_rgb(34, 34, 37);
-    /// Stronger hairline for ghost buttons and dashed guides (`#2C2C30`, equivalent to `rgba(255, 255, 255, 0.10)`)
-    pub const LINE_STRONG: Color32 = Color32::from_rgb(44, 44, 48);
-    /// Subtle top inset highlight on cards and raised controls (`#26262A`)
-    pub const INSET_HIGHLIGHT: Color32 = Color32::from_rgb(38, 38, 42);
+    // === Hairlines & Borders ===
+    /// Primary 1px hairline divider (`#222225` dark / `#E5E5EA` light)
+    #[inline]
+    pub fn LINE() -> Color32 {
+        pick(
+            Color32::from_rgb(34, 34, 37),
+            Color32::from_rgb(229, 229, 234),
+        )
+    }
 
-    pub const BORDER_SUBTLE: Color32 = LINE;
-    pub const BORDER_WIDGET: Color32 = LINE_STRONG;
-    pub const BORDER_ACCENT: Color32 = Color32::from_rgb(60, 224, 160);
+    /// Stronger hairline for ghost buttons, popups, and dashed guides (`#2C2C30` dark / `#D1D1D8` light)
+    #[inline]
+    pub fn LINE_STRONG() -> Color32 {
+        pick(
+            Color32::from_rgb(44, 44, 48),
+            Color32::from_rgb(209, 209, 216),
+        )
+    }
+
+    /// Subtle inset border on raised controls (`#26262A` dark / `#DCDCE2` light)
+    #[inline]
+    pub fn INSET_HIGHLIGHT() -> Color32 {
+        pick(
+            Color32::from_rgb(38, 38, 42),
+            Color32::from_rgb(220, 220, 226),
+        )
+    }
+
+    #[inline]
+    pub fn BORDER_SUBTLE() -> Color32 {
+        LINE()
+    }
+    #[inline]
+    pub fn BORDER_WIDGET() -> Color32 {
+        LINE_STRONG()
+    }
+    #[inline]
+    pub fn BORDER_ACCENT() -> Color32 {
+        ACCENT()
+    }
 
     // === Signal Accent & Status Colors ===
-    /// Live / healthy signal mint (`#3CE0A0`)
-    pub const ACCENT: Color32 = Color32::from_rgb(60, 224, 160);
-    /// Darker mint for pressed states (`#2BB880`)
-    pub const ACCENT_DIM: Color32 = Color32::from_rgb(43, 184, 128);
-    /// Pre-composited mint tint for `.chip.live` on `#151517` (`rgba(60, 224, 160, 0.12)` -> `#1A3229`)
-    pub const ACCENT_TINT: Color32 = Color32::from_rgb(26, 50, 41);
-    /// Idle chip & meter track fill on `#151517` (`rgba(255, 255, 255, 0.05)` -> `#202024`)
-    pub const CHIP_IDLE_BG: Color32 = Color32::from_rgb(32, 32, 36);
-    /// Active peer highlight in `#0B0B0D` sidebar (`rgba(255, 255, 255, 0.035)` -> `#151518`)
-    pub const PEER_ACTIVE_BG: Color32 = Color32::from_rgb(21, 21, 24);
-    /// Slider track fill on `#151517` (`rgba(255, 255, 255, 0.08)` -> `#27272B`)
-    pub const SLIDER_TRACK_BG: Color32 = Color32::from_rgb(39, 39, 43);
+    /// Live / healthy signal mint (`#3CE0A0` dark / `#0D9F6E` light)
+    #[inline]
+    pub fn ACCENT() -> Color32 {
+        pick(
+            Color32::from_rgb(60, 224, 160),
+            Color32::from_rgb(13, 159, 110),
+        )
+    }
 
-    // Aliases mapped to the unified Quiet Graphite accent
-    pub const ACCENT_MINT: Color32 = ACCENT;
-    pub const ACCENT_MINT_DIM: Color32 = ACCENT_DIM;
-    pub const ACCENT_MINT_GLOW: Color32 = ACCENT_TINT;
-    pub const ACCENT_CYAN: Color32 = ACCENT;
-    pub const ACCENT_CYAN_GLOW: Color32 = ACCENT_TINT;
-    pub const ACCENT_INDIGO: Color32 = ACCENT;
+    /// Darker mint for pressed states (`#2BB880` dark / `#057A55` light)
+    #[inline]
+    pub fn ACCENT_DIM() -> Color32 {
+        pick(
+            Color32::from_rgb(43, 184, 128),
+            Color32::from_rgb(5, 122, 85),
+        )
+    }
 
-    /// Nominal status (`#3CE0A0`)
-    pub const STATUS_OK: Color32 = ACCENT;
-    /// Meter headroom warning zone (`#F2B84B`, top 14%)
-    pub const STATUS_WARN: Color32 = Color32::from_rgb(242, 184, 75);
-    /// Meter clipping zone & Stop button square indicator (`#FF6B5B`)
-    pub const STATUS_DANGER: Color32 = Color32::from_rgb(255, 107, 91);
-    pub const STATUS_DANGER_DIM: Color32 = Color32::from_rgb(190, 68, 56);
+    /// Mint tint for `.chip.live` (`#1A3229` dark / `#DEF7EC` light)
+    #[inline]
+    pub fn ACCENT_TINT() -> Color32 {
+        pick(
+            Color32::from_rgb(26, 50, 41),
+            Color32::from_rgb(222, 247, 236),
+        )
+    }
 
-    /// Inactive peer dot & toggle off track (`#4A4A50` / `#2C2C31`)
-    pub const DOT_OFFLINE: Color32 = Color32::from_rgb(74, 74, 80);
-    pub const TOGGLE_OFF_BG: Color32 = Color32::from_rgb(44, 44, 49);
-    pub const TOGGLE_OFF_KNOB: Color32 = Color32::from_rgb(138, 138, 146);
+    /// Idle chip & meter track fill (`#202024` dark / `#EAEAEF` light)
+    #[inline]
+    pub fn CHIP_IDLE_BG() -> Color32 {
+        pick(
+            Color32::from_rgb(32, 32, 36),
+            Color32::from_rgb(234, 234, 239),
+        )
+    }
 
-    // === Typography Hierarchy ===
-    /// Primary text & primary CTA button fill (`#EDEDEE`)
-    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(237, 237, 238);
-    /// Secondary labels & descriptions (`#9C9CA3`)
-    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(156, 156, 163);
-    /// Muted captions, units, and scale ticks (`#66666D`)
-    pub const TEXT_MUTED: Color32 = Color32::from_rgb(102, 102, 109);
+    /// Active peer highlight in sidebar (`#151518` dark / `#E0E0E6` light)
+    #[inline]
+    pub fn PEER_ACTIVE_BG() -> Color32 {
+        pick(
+            Color32::from_rgb(21, 21, 24),
+            Color32::from_rgb(224, 224, 230),
+        )
+    }
+
+    /// Slider track fill (`#27272B` dark / `#DCDCE2` light)
+    #[inline]
+    pub fn SLIDER_TRACK_BG() -> Color32 {
+        pick(
+            Color32::from_rgb(39, 39, 43),
+            Color32::from_rgb(220, 220, 226),
+        )
+    }
+
+    // Aliases mapped to the unified accent
+    #[inline]
+    pub fn ACCENT_MINT() -> Color32 {
+        ACCENT()
+    }
+    #[inline]
+    pub fn ACCENT_MINT_DIM() -> Color32 {
+        ACCENT_DIM()
+    }
+    #[inline]
+    pub fn ACCENT_MINT_GLOW() -> Color32 {
+        ACCENT_TINT()
+    }
+    #[inline]
+    pub fn ACCENT_CYAN() -> Color32 {
+        ACCENT()
+    }
+    #[inline]
+    pub fn ACCENT_CYAN_GLOW() -> Color32 {
+        ACCENT_TINT()
+    }
+    #[inline]
+    pub fn ACCENT_INDIGO() -> Color32 {
+        ACCENT()
+    }
+
+    /// Nominal status
+    #[inline]
+    pub fn STATUS_OK() -> Color32 {
+        ACCENT()
+    }
+
+    /// Meter headroom warning zone (`#F2B84B` dark / `#D97706` light)
+    #[inline]
+    pub fn STATUS_WARN() -> Color32 {
+        pick(
+            Color32::from_rgb(242, 184, 75),
+            Color32::from_rgb(217, 119, 6),
+        )
+    }
+
+    /// Meter clipping zone & Stop button square indicator (`#FF6B5B` dark / `#E11D48` light)
+    #[inline]
+    pub fn STATUS_DANGER() -> Color32 {
+        pick(
+            Color32::from_rgb(255, 107, 91),
+            Color32::from_rgb(225, 29, 72),
+        )
+    }
+
+    #[inline]
+    pub fn STATUS_DANGER_DIM() -> Color32 {
+        pick(
+            Color32::from_rgb(190, 68, 56),
+            Color32::from_rgb(190, 18, 60),
+        )
+    }
+
+    /// Inactive peer dot (`#4A4A50` dark / `#A1A1AA` light)
+    #[inline]
+    pub fn DOT_OFFLINE() -> Color32 {
+        pick(
+            Color32::from_rgb(74, 74, 80),
+            Color32::from_rgb(161, 161, 170),
+        )
+    }
+
+    /// Toggle off track (`#2C2C31` dark / `#D4D4D8` light)
+    #[inline]
+    pub fn TOGGLE_OFF_BG() -> Color32 {
+        pick(
+            Color32::from_rgb(44, 44, 49),
+            Color32::from_rgb(212, 212, 216),
+        )
+    }
+
+    /// Toggle off knob (`#8A8A92` dark / `#FFFFFF` light)
+    #[inline]
+    pub fn TOGGLE_OFF_KNOB() -> Color32 {
+        pick(
+            Color32::from_rgb(138, 138, 146),
+            Color32::from_rgb(255, 255, 255),
+        )
+    }
+
+    // === Typography & Primary CTA Hierarchy ===
+    /// Primary text (`#EDEDEE` dark / `#18181B` light)
+    #[inline]
+    pub fn TEXT_PRIMARY() -> Color32 {
+        pick(
+            Color32::from_rgb(237, 237, 238),
+            Color32::from_rgb(24, 24, 27),
+        )
+    }
+
+    /// Secondary labels & descriptions (`#9C9CA3` dark / `#52525B` light)
+    #[inline]
+    pub fn TEXT_SECONDARY() -> Color32 {
+        pick(
+            Color32::from_rgb(156, 156, 163),
+            Color32::from_rgb(82, 82, 91),
+        )
+    }
+
+    /// Muted captions, units, and scale ticks (`#66666D` dark / `#71717A` light)
+    #[inline]
+    pub fn TEXT_MUTED() -> Color32 {
+        pick(
+            Color32::from_rgb(102, 102, 109),
+            Color32::from_rgb(113, 113, 122),
+        )
+    }
+
+    /// Primary action button fill (`#EDEDEE` dark / `#18181B` light)
+    #[inline]
+    pub fn BTN_PRIMARY_BG() -> Color32 {
+        pick(
+            Color32::from_rgb(237, 237, 238),
+            Color32::from_rgb(24, 24, 27),
+        )
+    }
+
+    /// Primary action button hover fill (`#FFFFFF` dark / `#27272A` light)
+    #[inline]
+    pub fn BTN_PRIMARY_HOVER_BG() -> Color32 {
+        pick(Color32::WHITE, Color32::from_rgb(39, 39, 42))
+    }
+
+    /// Primary action button foreground text & icon (`#0E0E10` dark / `#FFFFFF` light)
+    #[inline]
+    pub fn BTN_PRIMARY_FG() -> Color32 {
+        pick(Color32::from_rgb(14, 14, 16), Color32::WHITE)
+    }
+
+    /// Peak-hold tick mark in VU meters (`#FFFFFF` dark / `#18181B` light)
+    #[inline]
+    pub fn PEAK_HOLD_TICK() -> Color32 {
+        pick(Color32::WHITE, Color32::from_rgb(24, 24, 27))
+    }
 }
 
 /// Spatial and geometric tokens matching Quiet Graphite (Frames C & C2).
@@ -209,10 +498,11 @@ pub fn configure_cjk_fallback_fonts(ctx: &egui::Context) {
     }
 }
 
-/// Apply the **Quiet Graphite** design system to an `egui::Context`.
-pub fn apply_studio_theme(ctx: &egui::Context) {
-    configure_cjk_fallback_fonts(ctx);
-    let mut style = (*ctx.style()).clone();
+fn build_style_for_polarity(base: &egui::Style, is_dark: bool) -> egui::Style {
+    let prev = is_dark_theme();
+    set_active_dark_theme(is_dark);
+
+    let mut style = base.clone();
 
     // Typography scale matching Quiet Graphite (H1 20, Card Title 15, Body 13, Caption 11.5, Mono 12.5)
     style.text_styles.insert(
@@ -238,82 +528,126 @@ pub fn apply_studio_theme(ctx: &egui::Context) {
     // Global spacing & padding
     style.spacing.item_spacing = Vec2::new(8.0, 6.0);
     style.spacing.window_margin = Margin::same(metrics::SPACE_LG);
+    style.spacing.menu_margin = Margin::same(6.0);
     style.spacing.button_padding = Vec2::new(12.0, 6.0);
     style.spacing.interact_size = Vec2::new(40.0, 30.0);
     style.spacing.slider_width = 150.0;
     style.spacing.combo_width = 190.0;
 
-    let mut visuals = egui::Visuals::dark();
-    visuals.dark_mode = true;
-    visuals.override_text_color = Some(palette::TEXT_PRIMARY);
-    visuals.panel_fill = palette::BG_CANVAS;
-    visuals.window_fill = palette::BG_PANEL;
-    visuals.faint_bg_color = palette::BG_CANVAS;
-    visuals.extreme_bg_color = palette::BG_RAISED;
-    visuals.code_bg_color = palette::BG_RAISED;
+    let mut visuals = if is_dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.dark_mode = is_dark;
+    visuals.override_text_color = Some(palette::TEXT_PRIMARY());
+    visuals.panel_fill = palette::BG_CANVAS();
+    // Popup menus (`ComboBox`, `popup_below_widget`, tooltips) use `window_fill`
+    visuals.window_fill = if is_dark {
+        palette::BG_RAISED()
+    } else {
+        palette::BG_PANEL()
+    };
+    visuals.faint_bg_color = palette::BG_CANVAS();
+    visuals.extreme_bg_color = palette::BG_RAISED();
+    visuals.code_bg_color = palette::BG_RAISED();
 
     visuals.window_rounding = Rounding::same(metrics::RADIUS_CARD);
     visuals.menu_rounding = Rounding::same(metrics::RADIUS_BUTTON);
-    visuals.window_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG);
+    visuals.window_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG());
 
     // Non-interactive surfaces (frames, labels, separators)
-    visuals.widgets.noninteractive.bg_fill = palette::BG_PANEL;
-    visuals.widgets.noninteractive.weak_bg_fill = palette::BG_PANEL;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, palette::LINE);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_SECONDARY);
+    visuals.widgets.noninteractive.bg_fill = palette::BG_PANEL();
+    visuals.widgets.noninteractive.weak_bg_fill = palette::BG_PANEL();
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, palette::LINE());
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_SECONDARY());
     visuals.widgets.noninteractive.rounding = Rounding::same(metrics::RADIUS_SELECT);
 
     // Inactive interactive widgets (selects, secondary buttons, text inputs)
-    visuals.widgets.inactive.bg_fill = palette::BG_RAISED;
-    visuals.widgets.inactive.weak_bg_fill = palette::BG_RAISED;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, palette::LINE);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
+    visuals.widgets.inactive.bg_fill = palette::BG_RAISED();
+    visuals.widgets.inactive.weak_bg_fill = palette::BG_RAISED();
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, palette::LINE());
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_PRIMARY());
     visuals.widgets.inactive.rounding = Rounding::same(metrics::RADIUS_SELECT);
 
     // Hovered widgets
-    visuals.widgets.hovered.bg_fill = palette::BG_HOVER;
-    visuals.widgets.hovered.weak_bg_fill = palette::BG_HOVER;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.2_f32, palette::TEXT_PRIMARY);
+    visuals.widgets.hovered.bg_fill = palette::BG_HOVER();
+    visuals.widgets.hovered.weak_bg_fill = palette::BG_HOVER();
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG());
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.2_f32, palette::TEXT_PRIMARY());
     visuals.widgets.hovered.rounding = Rounding::same(metrics::RADIUS_SELECT);
 
     // Active / pressed widgets
-    visuals.widgets.active.bg_fill = palette::BG_HOVER;
-    visuals.widgets.active.weak_bg_fill = palette::BG_HOVER;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.2_f32, palette::TEXT_PRIMARY);
+    visuals.widgets.active.bg_fill = palette::BG_HOVER();
+    visuals.widgets.active.weak_bg_fill = palette::BG_HOVER();
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG());
+    visuals.widgets.active.fg_stroke = Stroke::new(1.2_f32, palette::TEXT_PRIMARY());
     visuals.widgets.active.rounding = Rounding::same(metrics::RADIUS_SELECT);
 
     // Open combo box / popup state
-    visuals.widgets.open.bg_fill = palette::BG_HOVER;
-    visuals.widgets.open.weak_bg_fill = palette::BG_HOVER;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG);
-    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
+    visuals.widgets.open.bg_fill = palette::BG_HOVER();
+    visuals.widgets.open.weak_bg_fill = palette::BG_HOVER();
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG());
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_PRIMARY());
     visuals.widgets.open.rounding = Rounding::same(metrics::RADIUS_SELECT);
 
-    // Selection highlight
-    visuals.selection.bg_fill = palette::ACCENT_TINT;
-    visuals.selection.stroke = Stroke::new(1.0_f32, palette::ACCENT);
+    // Selection highlight inside dropdown menus & text inputs
+    visuals.selection.bg_fill = palette::ACCENT_TINT();
+    visuals.selection.stroke = Stroke::new(1.0_f32, palette::ACCENT());
 
     style.visuals = visuals;
-    ctx.set_style(style);
+    set_active_dark_theme(prev);
+    style
 }
 
-/// Construct a Quiet Graphite card frame (`#151517`, radius `14px`, `1px` hairline border).
+/// Initialize both Dark ("Quiet Graphite") and Light ("Quiet Daylight") styles on an `egui::Context`.
+pub fn apply_studio_theme(ctx: &egui::Context) {
+    configure_cjk_fallback_fonts(ctx);
+    let base = (*ctx.style()).clone();
+    let dark_style = build_style_for_polarity(&base, true);
+    let light_style = build_style_for_polarity(&base, false);
+    ctx.set_style_of(egui::Theme::Dark, dark_style);
+    ctx.set_style_of(egui::Theme::Light, light_style);
+    sync_theme_mode(ctx, ThemeMode::System);
+}
+
+/// Synchronize the active [`ThemeMode`] (`System`, `Light`, `Dark`) with `egui::Context` and `palette`.
+/// Returns the resolved `is_dark` boolean for the current frame.
+pub fn sync_theme_mode(ctx: &egui::Context, mode: ThemeMode) -> bool {
+    let pref = match mode {
+        ThemeMode::System => egui::ThemePreference::System,
+        ThemeMode::Light => egui::ThemePreference::Light,
+        ThemeMode::Dark => egui::ThemePreference::Dark,
+    };
+    ctx.set_theme(pref);
+
+    let is_dark = match mode {
+        ThemeMode::Dark => true,
+        ThemeMode::Light => false,
+        ThemeMode::System => ctx
+            .system_theme()
+            .map(|t| t == egui::Theme::Dark)
+            .unwrap_or(true),
+    };
+    set_active_dark_theme(is_dark);
+    is_dark
+}
+
+/// Construct a Quiet Graphite / Quiet Daylight card frame (`radius 14px`, `1px` hairline border).
 /// Never uses neon borders on active cards; active status is communicated via `.chip.live`.
 pub fn studio_card_frame(_is_active: bool, _active_border: Color32) -> egui::Frame {
     egui::Frame::none()
-        .fill(palette::BG_PANEL)
-        .stroke(Stroke::new(1.0_f32, palette::LINE))
+        .fill(palette::BG_PANEL())
+        .stroke(Stroke::new(1.0_f32, palette::LINE()))
         .rounding(Rounding::same(metrics::RADIUS_CARD))
         .inner_margin(Margin::same(0.0))
 }
 
-/// Construct a padded Quiet Graphite card frame when internal full-bleed hairlines are not needed.
+/// Construct a padded card frame when internal full-bleed hairlines are not needed.
 pub fn padded_card_frame() -> egui::Frame {
     egui::Frame::none()
-        .fill(palette::BG_PANEL)
-        .stroke(Stroke::new(1.0_f32, palette::LINE))
+        .fill(palette::BG_PANEL())
+        .stroke(Stroke::new(1.0_f32, palette::LINE()))
         .rounding(Rounding::same(metrics::RADIUS_CARD))
         .inner_margin(Margin::symmetric(
             metrics::CARD_PADDING_X,
@@ -324,8 +658,8 @@ pub fn padded_card_frame() -> egui::Frame {
 /// Construct a subtle raised row or well frame.
 pub fn trench_frame() -> egui::Frame {
     egui::Frame::none()
-        .fill(palette::BG_RAISED)
-        .stroke(Stroke::new(1.0_f32, palette::LINE))
+        .fill(palette::BG_RAISED())
+        .stroke(Stroke::new(1.0_f32, palette::LINE()))
         .rounding(Rounding::same(metrics::RADIUS_WIDGET))
         .inner_margin(Margin::symmetric(12.0, 10.0))
 }
@@ -338,11 +672,40 @@ mod tests {
     fn test_studio_theme_and_cjk_font_rendering() {
         let ctx = egui::Context::default();
         apply_studio_theme(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+
+        // 1. Simulate Windows Light Mode (`system_theme = Some(Theme::Light)`) with `ThemeMode::System`
+        let mut raw_light = egui::RawInput::default();
+        raw_light.system_theme = Some(egui::Theme::Light);
+        let _ = ctx.run(raw_light.clone(), |ctx| {
+            let is_dark = sync_theme_mode(ctx, ThemeMode::System);
+            assert!(!is_dark);
+            assert!(!ctx.style().visuals.dark_mode);
+            assert_eq!(ctx.style().visuals.window_fill, palette::BG_PANEL());
+            assert_ne!(palette::BG_PANEL(), palette::TEXT_PRIMARY());
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.label("外置麦克风 (48000 Hz) -> 外置耳机");
             });
         });
+
+        // 2. Force `ThemeMode::Dark` even when OS reports `Theme::Light`
+        let _ = ctx.run(raw_light, |ctx| {
+            let is_dark = sync_theme_mode(ctx, ThemeMode::Dark);
+            assert!(is_dark);
+            assert!(ctx.style().visuals.dark_mode);
+            assert_eq!(ctx.style().visuals.window_fill, palette::BG_RAISED());
+            assert_ne!(palette::BG_RAISED(), palette::TEXT_PRIMARY());
+        });
+
+        // 3. Force `ThemeMode::Light` even when OS reports `Theme::Dark`
+        let mut raw_dark = egui::RawInput::default();
+        raw_dark.system_theme = Some(egui::Theme::Dark);
+        let _ = ctx.run(raw_dark, |ctx| {
+            let is_dark = sync_theme_mode(ctx, ThemeMode::Light);
+            assert!(!is_dark);
+            assert!(!ctx.style().visuals.dark_mode);
+            assert_eq!(ctx.style().visuals.window_fill, palette::BG_PANEL());
+        });
+
         ctx.fonts(|f| {
             assert!(
                 f.has_glyph(&FontId::proportional(14.0), '中'),

@@ -332,6 +332,13 @@ impl Language {
         }
     }
 
+    pub fn status_theme_switched(self, mode_label: &str) -> String {
+        match self {
+            Self::En => format!("Theme set to {mode_label}."),
+            Self::Zh => format!("已切换主题模式：{mode_label}"),
+        }
+    }
+
     pub fn status_entered_tray_mode(self) -> String {
         match self {
             Self::En => "Minimized to system tray.".to_string(),
@@ -374,6 +381,9 @@ pub struct Texts {
     pub nav_section_nearby: &'static str,
     pub sidebar_local_addr: &'static str,
     pub chk_auto_follow_hotplug: &'static str,
+    pub theme_system: &'static str,
+    pub theme_light: &'static str,
+    pub theme_dark: &'static str,
     pub btn_minimize_tray_hover: &'static str,
     pub lan_ip_hover: &'static str,
     pub btn_scan_lan_hover: &'static str,
@@ -496,6 +506,9 @@ pub const TEXTS_ZH: Texts = Texts {
     nav_section_nearby: "附近设备",
     sidebar_local_addr: "本机地址",
     chk_auto_follow_hotplug: "自动跟随默认设备",
+    theme_system: "跟随系统",
+    theme_light: "浅色",
+    theme_dark: "深色",
     btn_minimize_tray_hover: "最小化到托盘",
     lan_ip_hover: "点击复制本机局域网地址",
     btn_scan_lan_hover: "扫描局域网内的附近设备",
@@ -612,6 +625,9 @@ pub const TEXTS_EN: Texts = Texts {
     nav_section_nearby: "NEARBY DEVICES",
     sidebar_local_addr: "Local Address",
     chk_auto_follow_hotplug: "Auto-follow default",
+    theme_system: "System",
+    theme_light: "Light",
+    theme_dark: "Dark",
     btn_minimize_tray_hover: "Minimize to system tray",
     lan_ip_hover: "Click to copy local LAN IP address",
     btn_scan_lan_hover: "Scan LAN for nearby devices via mDNS",

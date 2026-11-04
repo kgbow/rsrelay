@@ -332,10 +332,10 @@ pub fn draw_card_icon_tile(ui: &mut Ui, kind: IconKind) {
         p.rect(
             rect,
             Rounding::same(9.0),
-            palette::BG_RAISED,
-            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT),
+            palette::BG_RAISED(),
+            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
         );
-        draw_vector_icon(p, rect.shrink(8.0), kind, palette::TEXT_PRIMARY);
+        draw_vector_icon(p, rect.shrink(8.0), kind, palette::TEXT_PRIMARY());
     }
 }
 
@@ -347,14 +347,14 @@ pub fn draw_card_icon_tile(ui: &mut Ui, kind: IconKind) {
 /// Allocates a single atomic `Rect` so the indicator dot always stays on the left in both LTR and RTL parents.
 pub fn status_chip(ui: &mut Ui, label: &str, mono_suffix: Option<&str>, active: bool) {
     let bg = if active {
-        palette::ACCENT_TINT
+        palette::ACCENT_TINT()
     } else {
-        palette::CHIP_IDLE_BG
+        palette::CHIP_IDLE_BG()
     };
     let fg = if active {
-        palette::ACCENT
+        palette::ACCENT()
     } else {
-        palette::TEXT_SECONDARY
+        palette::TEXT_SECONDARY()
     };
 
     let prop_font = FontId::new(11.0, FontFamily::Proportional);
@@ -427,34 +427,35 @@ pub fn header_action_button(
         let p = ui.painter();
         if is_running {
             let fill = if resp.hovered() {
-                palette::BG_HOVER
+                palette::BG_HOVER()
             } else {
-                palette::BG_RAISED
+                palette::BG_RAISED()
             };
             p.rect(
                 rect,
                 Rounding::same(metrics::RADIUS_BUTTON),
                 fill,
-                Stroke::new(1.0_f32, palette::LINE_STRONG),
+                Stroke::new(1.0_f32, palette::LINE_STRONG()),
             );
             let sq_rect = Rect::from_center_size(
                 Pos2::new(rect.min.x + 17.0, rect.center().y),
                 Vec2::splat(9.0),
             );
-            p.rect_filled(sq_rect, Rounding::same(2.0), palette::STATUS_DANGER);
+            p.rect_filled(sq_rect, Rounding::same(2.0), palette::STATUS_DANGER());
             p.text(
                 Pos2::new(rect.min.x + 29.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 text,
                 font_id,
-                palette::TEXT_PRIMARY,
+                palette::TEXT_PRIMARY(),
             );
         } else {
             let fill = if resp.hovered() {
-                Color32::WHITE
+                palette::BTN_PRIMARY_HOVER_BG()
             } else {
-                palette::TEXT_PRIMARY
+                palette::BTN_PRIMARY_BG()
             };
+            let fg = palette::BTN_PRIMARY_FG();
             p.rect_filled(rect, Rounding::same(metrics::RADIUS_BUTTON), fill);
             // Play triangle
             let cx = rect.min.x + 17.5;
@@ -464,17 +465,13 @@ pub fn header_action_button(
                 Pos2::new(cx + 4.4, cy),
                 Pos2::new(cx - 3.2, cy + 4.2),
             ];
-            p.add(egui::Shape::convex_polygon(
-                tri,
-                palette::BG_CANVAS,
-                Stroke::NONE,
-            ));
+            p.add(egui::Shape::convex_polygon(tri, fg, Stroke::NONE));
             p.text(
                 Pos2::new(rect.min.x + 28.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 text,
                 font_id,
-                palette::BG_CANVAS,
+                fg,
             );
         }
     }
@@ -487,7 +484,7 @@ pub fn ghost_stop_all_button(ui: &mut Ui, label: &str) -> bool {
     let font_id = FontId::new(12.5, FontFamily::Proportional);
     let galley = ui
         .painter()
-        .layout_no_wrap(label.to_string(), font_id.clone(), palette::TEXT_SECONDARY);
+        .layout_no_wrap(label.to_string(), font_id.clone(), palette::TEXT_SECONDARY());
     let btn_w = (galley.size().x + 40.0).max(86.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(btn_w, 31.0), Sense::click());
     if resp.hovered() {
@@ -496,20 +493,20 @@ pub fn ghost_stop_all_button(ui: &mut Ui, label: &str) -> bool {
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         let fill = if resp.hovered() {
-            palette::BG_RAISED
+            palette::BG_RAISED()
         } else {
             Color32::TRANSPARENT
         };
         let fg = if resp.hovered() {
-            palette::TEXT_PRIMARY
+            palette::TEXT_PRIMARY()
         } else {
-            palette::TEXT_SECONDARY
+            palette::TEXT_SECONDARY()
         };
         p.rect(
             rect,
             Rounding::same(metrics::RADIUS_BUTTON),
             fill,
-            Stroke::new(1.0_f32, palette::LINE_STRONG),
+            Stroke::new(1.0_f32, palette::LINE_STRONG()),
         );
         let sq = Rect::from_center_size(
             Pos2::new(rect.min.x + 16.5, rect.center().y),
@@ -633,7 +630,7 @@ fn draw_segmented_meter_track(
     gate_norm: Option<f32>,
 ) {
     // 6px high dark track (`#202024`)
-    painter.rect_filled(track_rect, Rounding::same(3.0), palette::CHIP_IDLE_BG);
+    painter.rect_filled(track_rect, Rounding::same(3.0), palette::CHIP_IDLE_BG());
 
     let w = track_rect.width();
     if active_norm > 0.005 && w > 4.0 {
@@ -647,11 +644,11 @@ fn draw_segmented_meter_track(
             let x_end = (x + seg_w).min(max_x);
             let pos_norm = (x - track_rect.min.x) / w;
             let col = if pos_norm >= 0.94 {
-                palette::STATUS_DANGER
+                palette::STATUS_DANGER()
             } else if pos_norm >= 0.78 {
-                palette::STATUS_WARN
+                palette::STATUS_WARN()
             } else {
-                palette::ACCENT
+                palette::ACCENT()
             };
             let seg_rect = Rect::from_min_max(
                 Pos2::new(x, track_rect.min.y),
@@ -662,14 +659,14 @@ fn draw_segmented_meter_track(
         }
     }
 
-    // 2px crisp white peak-hold tick
+    // 2px crisp peak-hold tick
     if peak_norm > 0.015 {
         let px = (track_rect.min.x + peak_norm * w).clamp(track_rect.min.x, track_rect.max.x - 2.0);
         let peak_rect = Rect::from_min_size(
             Pos2::new(px, track_rect.min.y),
             Vec2::new(2.0, track_rect.height()),
         );
-        painter.rect_filled(peak_rect, Rounding::same(1.0), Color32::WHITE);
+        painter.rect_filled(peak_rect, Rounding::same(1.0), palette::PEAK_HOLD_TICK());
     }
 
     // Optional Noise Gate marker line extending 4px above and below the track
@@ -680,10 +677,7 @@ fn draw_segmented_meter_track(
                 Pos2::new(gx, track_rect.min.y - 4.0),
                 Pos2::new(gx, track_rect.max.y + 4.0),
             ],
-            Stroke::new(
-                1.5_f32,
-                Color32::from_rgba_unmultiplied(237, 237, 238, 150),
-            ),
+            Stroke::new(1.5_f32, palette::TEXT_PRIMARY().gamma_multiply(0.6)),
         );
     }
 }
@@ -713,7 +707,7 @@ fn draw_db_scale_row(painter: &egui::Painter, scale_rect: Rect) {
             align,
             label,
             font.clone(),
-            palette::TEXT_MUTED,
+            palette::TEXT_MUTED(),
         );
     }
 }
@@ -749,7 +743,7 @@ pub fn draw_stereo_vu_meter(ui: &mut Ui, meter: &VuMeterState, active: bool, mut
             egui::Align2::LEFT_CENTER,
             "L",
             font.clone(),
-            palette::TEXT_MUTED,
+            palette::TEXT_MUTED(),
         );
         let track_l = Rect::from_min_size(Pos2::new(track_x0, l_y - 3.0), Vec2::new(track_w, 6.0));
         draw_segmented_meter_track(p, track_l, norm_l, peak_l, None);
@@ -761,7 +755,7 @@ pub fn draw_stereo_vu_meter(ui: &mut Ui, meter: &VuMeterState, active: bool, mut
             egui::Align2::LEFT_CENTER,
             "R",
             font,
-            palette::TEXT_MUTED,
+            palette::TEXT_MUTED(),
         );
         let track_r = Rect::from_min_size(Pos2::new(track_x0, r_y - 3.0), Vec2::new(track_w, 6.0));
         draw_segmented_meter_track(p, track_r, norm_r, peak_r, None);
@@ -802,7 +796,7 @@ pub fn draw_mono_gate_vu_meter(
             egui::Align2::LEFT_CENTER,
             gate_text,
             FontId::new(10.5, FontFamily::Proportional),
-            palette::TEXT_SECONDARY,
+            palette::TEXT_SECONDARY(),
         );
 
         let (norm_m, peak_m) = if active && !muted {
@@ -820,7 +814,7 @@ pub fn draw_mono_gate_vu_meter(
             egui::Align2::LEFT_CENTER,
             "M",
             FontId::new(10.0, FontFamily::Monospace),
-            palette::TEXT_MUTED,
+            palette::TEXT_MUTED(),
         );
         let track_m = Rect::from_min_size(Pos2::new(track_x0, m_y - 3.0), Vec2::new(track_w, 6.0));
         draw_segmented_meter_track(p, track_m, norm_m, peak_m, Some(gate_norm));
@@ -863,7 +857,7 @@ pub fn draw_hairline(ui: &mut Ui) {
                 Pos2::new(rect.min.x, rect.center().y),
                 Pos2::new(rect.max.x, rect.center().y),
             ],
-            Stroke::new(1.0_f32, palette::LINE),
+            Stroke::new(1.0_f32, palette::LINE()),
         );
     }
 }
@@ -876,7 +870,7 @@ pub fn draw_stats_row_3(ui: &mut Ui, stats: [(&str, &str, &str); 3], active: boo
 
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        let line_stroke = Stroke::new(1.0_f32, palette::LINE);
+        let line_stroke = Stroke::new(1.0_f32, palette::LINE());
         // Top and bottom hairlines
         p.line_segment(
             [Pos2::new(rect.min.x, rect.min.y), Pos2::new(rect.max.x, rect.min.y)],
@@ -889,9 +883,9 @@ pub fn draw_stats_row_3(ui: &mut Ui, stats: [(&str, &str, &str); 3], active: boo
 
         let col_w = rect.width() / 3.0;
         let val_color = if active {
-            palette::TEXT_PRIMARY
+            palette::TEXT_PRIMARY()
         } else {
-            palette::TEXT_SECONDARY
+            palette::TEXT_SECONDARY()
         };
 
         for (i, &(caption, val, unit)) in stats.iter().enumerate() {
@@ -908,7 +902,7 @@ pub fn draw_stats_row_3(ui: &mut Ui, stats: [(&str, &str, &str); 3], active: boo
                 egui::Align2::LEFT_CENTER,
                 caption,
                 FontId::new(11.5, FontFamily::Proportional),
-                palette::TEXT_MUTED,
+                palette::TEXT_MUTED(),
             );
 
             let val_font = FontId::new(16.0, FontFamily::Monospace);
@@ -923,7 +917,7 @@ pub fn draw_stats_row_3(ui: &mut Ui, stats: [(&str, &str, &str); 3], active: boo
                     egui::Align2::LEFT_CENTER,
                     unit,
                     FontId::new(11.0, FontFamily::Proportional),
-                    palette::TEXT_MUTED,
+                    palette::TEXT_MUTED(),
                 );
             }
         }
@@ -979,7 +973,7 @@ pub fn draw_tx_waveform_chart(
         // Bottom hairline
         p.line_segment(
             [Pos2::new(rect.min.x, rect.max.y), Pos2::new(rect.max.x, rect.max.y)],
-            Stroke::new(1.0_f32, palette::LINE),
+            Stroke::new(1.0_f32, palette::LINE()),
         );
 
         let inner_x0 = rect.min.x + 20.0;
@@ -991,14 +985,14 @@ pub fn draw_tx_waveform_chart(
             egui::Align2::LEFT_CENTER,
             left_caption,
             FontId::new(11.5, FontFamily::Proportional),
-            palette::TEXT_MUTED,
+            palette::TEXT_MUTED(),
         );
         p.text(
             Pos2::new(inner_x1, head_y),
             egui::Align2::RIGHT_CENTER,
             right_caption,
             FontId::new(11.5, FontFamily::Monospace),
-            palette::TEXT_MUTED,
+            palette::TEXT_MUTED(),
         );
 
         let chart_rect = Rect::from_min_max(
@@ -1029,7 +1023,7 @@ pub fn draw_tx_waveform_chart(
                     Rect::from_min_size(Pos2::new(x, cy - bh * 0.5), Vec2::new(bar_w, bh));
 
                 let alpha = ((0.20 + 0.80 * t.powf(0.85)) * 255.0) as u8;
-                let [r, g, b, _] = palette::ACCENT.to_array();
+                let [r, g, b, _] = palette::ACCENT().to_array();
                 p.rect_filled(
                     bar_rect,
                     Rounding::same(1.2),
@@ -1053,7 +1047,7 @@ fn draw_idle_chart_grid(
     while gx <= chart_rect.max.x {
         painter.line_segment(
             [Pos2::new(gx, chart_rect.min.y), Pos2::new(gx, chart_rect.max.y)],
-            Stroke::new(1.0_f32, Color32::from_rgb(28, 28, 31)),
+            Stroke::new(1.0_f32, palette::BG_RAISED()),
         );
         gx += 45.0;
     }
@@ -1065,23 +1059,23 @@ fn draw_idle_chart_grid(
         chart_rect.min.x,
         chart_rect.max.x,
         dy,
-        Color32::from_rgb(45, 45, 49),
+        palette::LINE_STRONG(),
     );
 
     if !placeholder.is_empty() {
         let font = FontId::new(12.0, FontFamily::Proportional);
-        let galley = painter.layout_no_wrap(placeholder.to_string(), font.clone(), palette::TEXT_MUTED);
+        let galley = painter.layout_no_wrap(placeholder.to_string(), font.clone(), palette::TEXT_MUTED());
         let bg_rect = Rect::from_center_size(
             chart_rect.center(),
             Vec2::new(galley.size().x + 20.0, galley.size().y + 6.0),
         );
-        painter.rect_filled(bg_rect, Rounding::same(4.0), palette::BG_PANEL);
+        painter.rect_filled(bg_rect, Rounding::same(4.0), palette::BG_PANEL());
         painter.text(
             chart_rect.center(),
             egui::Align2::CENTER_CENTER,
             placeholder,
             font,
-            palette::TEXT_MUTED,
+            palette::TEXT_MUTED(),
         );
     }
 }
@@ -1119,7 +1113,7 @@ pub fn draw_sparkline(
         let p = ui.painter();
         p.line_segment(
             [Pos2::new(rect.min.x, rect.max.y), Pos2::new(rect.max.x, rect.max.y)],
-            Stroke::new(1.0_f32, palette::LINE),
+            Stroke::new(1.0_f32, palette::LINE()),
         );
 
         let inner_x0 = rect.min.x + 20.0;
@@ -1131,14 +1125,14 @@ pub fn draw_sparkline(
             egui::Align2::LEFT_CENTER,
             title,
             FontId::new(11.5, FontFamily::Proportional),
-            palette::TEXT_MUTED,
+            palette::TEXT_MUTED(),
         );
         p.text(
             Pos2::new(inner_x1, head_y),
             egui::Align2::RIGHT_CENTER,
             right_summary,
             FontId::new(11.5, FontFamily::Monospace),
-            palette::TEXT_MUTED,
+            palette::TEXT_MUTED(),
         );
 
         let chart_rect = Rect::from_min_max(
@@ -1162,7 +1156,7 @@ pub fn draw_sparkline(
             }
 
             let [sr, sg, sb, _] = stroke_color.to_array();
-            let [br, bg, bb, _] = palette::BG_PANEL.to_array();
+            let [br, bg, bb, _] = palette::BG_PANEL().to_array();
             let cols = (chart_rect.width().ceil() as usize).max(32);
             let col_w = chart_rect.width() / (cols as f32);
             let bands = 6usize;
@@ -1199,7 +1193,7 @@ pub fn draw_sparkline(
                 chart_rect.min.x,
                 chart_rect.max.x,
                 ty,
-                Color32::from_rgb(48, 48, 53),
+                palette::LINE_STRONG(),
             );
 
             p.add(egui::Shape::line(
@@ -1262,8 +1256,8 @@ pub fn segmented_control<T: Copy + PartialEq>(
         p.rect(
             outer_rect,
             Rounding::same(8.0),
-            palette::BG_CANVAS,
-            Stroke::new(1.0_f32, palette::LINE),
+            palette::BG_CANVAS(),
+            Stroke::new(1.0_f32, palette::LINE()),
         );
 
         let mut x = outer_rect.min.x + 2.0;
@@ -1284,14 +1278,14 @@ pub fn segmented_control<T: Copy + PartialEq>(
                 p.rect(
                     seg_rect,
                     Rounding::same(metrics::RADIUS_SEG_INNER),
-                    palette::BG_HOVER,
-                    Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT),
+                    palette::BG_HOVER(),
+                    Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
                 );
             }
             let fg = if selected || resp.hovered() {
-                palette::TEXT_PRIMARY
+                palette::TEXT_PRIMARY()
             } else {
-                palette::TEXT_SECONDARY
+                palette::TEXT_SECONDARY()
             };
             p.text(
                 seg_rect.center(),
@@ -1332,14 +1326,14 @@ pub fn pill_toggle(ui: &mut Ui, on: &mut bool) -> bool {
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         let bg = if *on {
-            palette::ACCENT
+            palette::ACCENT()
         } else {
-            palette::TOGGLE_OFF_BG
+            palette::TOGGLE_OFF_BG()
         };
         let knob_col = if *on {
-            palette::BG_CANVAS
+            palette::BG_CANVAS()
         } else {
-            palette::TOGGLE_OFF_KNOB
+            palette::TOGGLE_OFF_KNOB()
         };
         p.rect_filled(rect, Rounding::same(9.0), bg);
         let kx = if *on {
@@ -1398,25 +1392,23 @@ pub fn quiet_slider_f32(
             Pos2::new(s_rect.min.x, s_rect.center().y - 2.0),
             Vec2::new(s_rect.width(), 4.0),
         );
-        p.rect_filled(bar_rect, Rounding::same(2.0), palette::SLIDER_TRACK_BG);
+        p.rect_filled(bar_rect, Rounding::same(2.0), palette::SLIDER_TRACK_BG());
         let fill_rect = Rect::from_min_size(
             bar_rect.min,
             Vec2::new(norm * bar_rect.width(), bar_rect.height()),
         );
-        p.rect_filled(fill_rect, Rounding::same(2.0), palette::TEXT_SECONDARY);
+        p.rect_filled(fill_rect, Rounding::same(2.0), palette::TEXT_SECONDARY());
         let thumb_x = bar_rect.min.x + norm * bar_rect.width();
-        p.circle_filled(
-            Pos2::new(thumb_x, bar_rect.center().y),
-            7.0,
-            Color32::from_rgb(244, 244, 245),
-        );
+        let thumb_center = Pos2::new(thumb_x, bar_rect.center().y);
+        p.circle_filled(thumb_center, 7.0, Color32::from_rgb(248, 248, 250));
+        p.circle_stroke(thumb_center, 7.0, Stroke::new(1.0_f32, palette::LINE_STRONG()));
 
         p.text(
             Pos2::new(val_rect.max.x, val_rect.center().y),
             egui::Align2::RIGHT_CENTER,
             formatted_val,
             FontId::new(12.0, FontFamily::Monospace),
-            palette::TEXT_PRIMARY,
+            palette::TEXT_PRIMARY(),
         );
     }
     changed
@@ -1452,7 +1444,7 @@ pub fn quiet_select_pill<T: Clone + PartialEq>(
     let font = FontId::new(12.5, FontFamily::Proportional);
     let galley = ui
         .painter()
-        .layout_no_wrap(selected_label.to_string(), font.clone(), palette::TEXT_PRIMARY);
+        .layout_no_wrap(selected_label.to_string(), font.clone(), palette::TEXT_PRIMARY());
     let pill_w = (galley.size().x + 36.0).clamp(88.0, 250.0);
     let pill_h = 30.0;
 
@@ -1469,27 +1461,27 @@ pub fn quiet_select_pill<T: Clone + PartialEq>(
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         let fill = if resp.hovered() {
-            palette::BG_HOVER
+            palette::BG_HOVER()
         } else {
-            palette::BG_RAISED
+            palette::BG_RAISED()
         };
         p.rect(
             rect,
             Rounding::same(metrics::RADIUS_SELECT),
             fill,
-            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT),
+            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
         );
         p.text(
             Pos2::new(rect.min.x + 12.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             selected_label,
             font,
-            palette::TEXT_PRIMARY,
+            palette::TEXT_PRIMARY(),
         );
         // Chevron `⌄` on right
         let cx = rect.max.x - 14.0;
         let cy = rect.center().y;
-        let chev_stroke = Stroke::new(1.5_f32, palette::TEXT_MUTED);
+        let chev_stroke = Stroke::new(1.5_f32, palette::TEXT_MUTED());
         p.line_segment(
             [Pos2::new(cx - 3.5, cy - 1.5), Pos2::new(cx, cy + 2.0)],
             chev_stroke,
@@ -1514,9 +1506,9 @@ pub fn quiet_select_pill<T: Clone + PartialEq>(
                     RichText::new(label)
                         .size(12.5)
                         .color(if is_sel {
-                            palette::ACCENT
+                            palette::ACCENT()
                         } else {
-                            palette::TEXT_PRIMARY
+                            palette::TEXT_PRIMARY()
                         }),
                 );
                 if r.clicked() && !is_sel {
@@ -1535,7 +1527,7 @@ pub fn quiet_mono_input_pill(ui: &mut Ui, id_salt: &str, text: &mut String) {
     let font = FontId::new(12.0, FontFamily::Monospace);
     let galley = ui
         .painter()
-        .layout_no_wrap(text.clone(), font.clone(), palette::TEXT_PRIMARY);
+        .layout_no_wrap(text.clone(), font.clone(), palette::TEXT_PRIMARY());
     let pill_w = (galley.size().x + 36.0).clamp(136.0, 224.0);
     let pill_h = 30.0;
 
@@ -1544,8 +1536,8 @@ pub fn quiet_mono_input_pill(ui: &mut Ui, id_salt: &str, text: &mut String) {
         ui.painter().rect(
             rect,
             Rounding::same(metrics::RADIUS_SELECT),
-            palette::BG_RAISED,
-            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT),
+            palette::BG_RAISED(),
+            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
         );
     }
 
@@ -1561,7 +1553,7 @@ pub fn quiet_mono_input_pill(ui: &mut Ui, id_salt: &str, text: &mut String) {
                 .frame(false)
                 .clip_text(false)
                 .font(font)
-                .text_color(palette::TEXT_PRIMARY)
+                .text_color(palette::TEXT_PRIMARY())
                 .desired_width(inner_rect.width()),
         );
     });
@@ -1585,7 +1577,7 @@ pub fn settings_row(
             egui::Align2::LEFT_CENTER,
             label,
             FontId::new(12.5, FontFamily::Proportional),
-            palette::TEXT_SECONDARY,
+            palette::TEXT_SECONDARY(),
         );
         if has_bottom_border {
             p.line_segment(
@@ -1593,7 +1585,7 @@ pub fn settings_row(
                     Pos2::new(row_rect.min.x + 20.0, row_rect.max.y),
                     Pos2::new(row_rect.max.x - 20.0, row_rect.max.y),
                 ],
-                Stroke::new(1.0_f32, palette::LINE),
+                Stroke::new(1.0_f32, palette::LINE()),
             );
         }
     }
@@ -1619,15 +1611,15 @@ pub fn metric_tile(
     value_color: Color32,
 ) {
     egui::Frame::none()
-        .fill(palette::BG_RAISED)
-        .stroke(Stroke::new(1.0_f32, palette::LINE))
+        .fill(palette::BG_RAISED())
+        .stroke(Stroke::new(1.0_f32, palette::LINE()))
         .rounding(Rounding::same(metrics::RADIUS_WIDGET))
         .inner_margin(egui::Margin::symmetric(10.0, 7.0))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(RichText::new(title).size(11.0).color(palette::TEXT_MUTED));
+                ui.label(RichText::new(title).size(11.0).color(palette::TEXT_MUTED()));
                 ui.label(
                     RichText::new(primary_value)
                         .size(14.5)
@@ -1639,7 +1631,7 @@ pub fn metric_tile(
                     RichText::new(sub_value)
                         .size(11.0)
                         .family(FontFamily::Monospace)
-                        .color(palette::TEXT_SECONDARY),
+                        .color(palette::TEXT_SECONDARY()),
                 );
             });
         });
