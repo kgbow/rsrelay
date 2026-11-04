@@ -1,12 +1,11 @@
-//! Internationalization (`i18n`) module for `rsrelay-gui`.
+//! Internationalization (`i18n`) module for `rsrelay-gui` (Quiet Graphite edition).
 //!
-//! Supports English (`Language::En`) and Simplified Chinese (`Language::Zh`) with
-//! moderate, pro-audio-friendly localization where common technical terms (`TX`, `RX`,
-//! `UDP`, `LAN`, `mDNS`, `Opus`, `PCM`, `FEC`, `PLC`, `ASRC`, `Jitter Buffer`, `Loopback`,
-//! `Mic`, `dBFS`, `Hz`, `ms`) are preserved alongside natural Chinese labels.
+//! Follows the Quiet Graphite copywriting guidelines:
+//! - Natural, concise Chinese-first labels in `Language::Zh` (matching Frames C & C2)
+//! - Clean, concise English labels in `Language::En`
+//! - Technical tokens (`Opus`, `FEC`, `PCM16`, `kbps`, `dB`, `ms`, `kHz`, `pkt/s`) kept universal
 
 use std::net::{IpAddr, SocketAddr};
-use std::process::Command;
 
 use rsrelay_core::DuplexRole;
 
@@ -26,9 +25,7 @@ impl Default for Language {
 }
 
 impl Language {
-    /// Auto-detect preferred UI language from environment variables (`RSRELAY_LANG`,
-    /// `LC_ALL`, `LC_MESSAGES`, `LANG`) or native OS locale settings (macOS `AppleLanguages`,
-    /// Windows `GetUserDefaultUILanguage`).
+    /// Auto-detect preferred UI language from environment variables or OS locale.
     pub fn detect_system() -> Self {
         if let Ok(val) = std::env::var("RSRELAY_LANG") {
             if let Some(lang) = Self::from_locale_str(&val) {
@@ -53,7 +50,7 @@ impl Language {
 
         #[cfg(target_os = "macos")]
         {
-            if let Ok(output) = Command::new("defaults")
+            if let Ok(output) = std::process::Command::new("defaults")
                 .args(["read", "-g", "AppleLanguages"])
                 .output()
             {
@@ -77,14 +74,13 @@ impl Language {
             extern "system" {
                 fn GetUserDefaultUILanguage() -> u16;
             }
-            // PRIMARYLANGID(lang_id) == LANG_CHINESE (0x04)
             let lang_id = unsafe { GetUserDefaultUILanguage() };
             if (lang_id & 0x03ff) == 0x04 {
                 return Self::Zh;
             }
         }
 
-        Self::En
+        Self::Zh
     }
 
     /// Parse a locale string (e.g. `"zh_CN.UTF-8"`, `"zh-Hans"`, `"en_US"`) into a [`Language`].
@@ -129,68 +125,64 @@ impl Language {
 
     pub fn status_ready(self) -> String {
         match self {
-            Self::En => "Ready. Select a mode or scan LAN to begin streaming.".to_string(),
-            Self::Zh => "就绪。请选择工作模式或扫描 LAN 开始音频传输。".to_string(),
+            Self::En => "Ready.".to_string(),
+            Self::Zh => "就绪".to_string(),
         }
     }
 
     pub fn status_refreshed_ports(self, in_count: usize, out_count: usize) -> String {
         match self {
-            Self::En => format!(
-                "Refreshed audio ports: {in_count} input(s), {out_count} output(s) detected."
-            ),
-            Self::Zh => format!(
-                "已刷新音频设备：检测到 {in_count} 个输入 (IN)，{out_count} 个输出 (OUT)。"
-            ),
+            Self::En => format!("Refreshed devices: {in_count} input, {out_count} output."),
+            Self::Zh => format!("已刷新音频设备：{in_count} 个输入，{out_count} 个输出"),
         }
     }
 
     pub fn status_hotswapped_output(self, dev_name: &str) -> String {
         match self {
-            Self::En => format!("Hot-swapped output to newly connected default: '{dev_name}'"),
-            Self::Zh => format!("已热切换输出设备至新连接的默认设备：'{dev_name}'"),
+            Self::En => format!("Switched output to default device '{dev_name}'"),
+            Self::Zh => format!("已自动切换输出设备至 '{dev_name}'"),
         }
     }
 
     pub fn status_hotswapped_input(self, dev_name: &str) -> String {
         match self {
-            Self::En => format!("Hot-swapped input to newly connected default: '{dev_name}'"),
-            Self::Zh => format!("已热切换输入设备至新连接的默认设备：'{dev_name}'"),
+            Self::En => format!("Switched input to default device '{dev_name}'"),
+            Self::Zh => format!("已自动切换输入设备至 '{dev_name}'"),
         }
     }
 
     pub fn status_scanning_lan(self) -> String {
         match self {
-            Self::En => "Scanning local network via mDNS (_rsrelay._udp.local.)...".to_string(),
-            Self::Zh => "正在通过 mDNS (_rsrelay._udp.local.) 扫描局域网...".to_string(),
+            Self::En => "Scanning nearby LAN devices via mDNS...".to_string(),
+            Self::Zh => "正在扫描局域网内的附近设备...".to_string(),
         }
     }
 
     pub fn status_all_stopped(self) -> String {
         match self {
             Self::En => "All audio streams stopped.".to_string(),
-            Self::Zh => "已停止所有音频流。".to_string(),
+            Self::Zh => "已停止全部音频流".to_string(),
         }
     }
 
     pub fn status_all_stopped_tray(self) -> String {
         match self {
             Self::En => "All streams stopped from System Tray.".to_string(),
-            Self::Zh => "已通过系统托盘停止所有音频流。".to_string(),
+            Self::Zh => "已从系统托盘停止全部音频流".to_string(),
         }
     }
 
     pub fn status_sender_stopped(self) -> String {
         match self {
-            Self::En => "Sender stopped.".to_string(),
-            Self::Zh => "发送端 (TX) 已停止。".to_string(),
+            Self::En => "Transmitter stopped.".to_string(),
+            Self::Zh => "已停止发送".to_string(),
         }
     }
 
-    pub fn status_invalid_target_addr(self, err: & impl std::fmt::Display) -> String {
+    pub fn status_invalid_target_addr(self, err: &impl std::fmt::Display) -> String {
         match self {
-            Self::En => format!("Invalid Target IP:Port: {err}"),
-            Self::Zh => format!("目标 IP:Port 格式无效: {err}"),
+            Self::En => format!("Invalid target address: {err}"),
+            Self::Zh => format!("目标地址格式无效: {err}"),
         }
     }
 
@@ -201,7 +193,7 @@ impl Language {
         target_addr: SocketAddr,
     ) -> String {
         match self {
-            Self::En => format!("Streaming '{device_name}' ({sample_rate} Hz) -> {target_addr}"),
+            Self::En => format!("Sending '{device_name}' ({sample_rate} Hz) -> {target_addr}"),
             Self::Zh => format!("正在发送 '{device_name}' ({sample_rate} Hz) -> {target_addr}"),
         }
     }
@@ -209,21 +201,21 @@ impl Language {
     pub fn status_sender_failed(self, err: &impl std::fmt::Display) -> String {
         match self {
             Self::En => format!("Failed to start sender: {err}"),
-            Self::Zh => format!("启动发送端 (TX) 失败: {err}"),
+            Self::Zh => format!("启动发送失败: {err}"),
         }
     }
 
     pub fn status_receiver_stopped(self) -> String {
         match self {
             Self::En => "Receiver stopped.".to_string(),
-            Self::Zh => "接收端 (RX) 已停止。".to_string(),
+            Self::Zh => "已停止接收".to_string(),
         }
     }
 
     pub fn status_invalid_bind_addr(self, err: &impl std::fmt::Display) -> String {
         match self {
-            Self::En => format!("Invalid Bind IP:Port: {err}"),
-            Self::Zh => format!("监听 IP:Port 格式无效: {err}"),
+            Self::En => format!("Invalid listen address: {err}"),
+            Self::Zh => format!("监听地址格式无效: {err}"),
         }
     }
 
@@ -234,33 +226,29 @@ impl Language {
         sample_rate: u32,
     ) -> String {
         match self {
-            Self::En => format!(
-                "Listening on {bind_addr} -> Output '{device_name}' ({sample_rate} Hz)"
-            ),
-            Self::Zh => format!(
-                "正在监听 {bind_addr} -> 输出设备 '{device_name}' ({sample_rate} Hz)"
-            ),
+            Self::En => format!("Listening on {bind_addr} -> '{device_name}' ({sample_rate} Hz)"),
+            Self::Zh => format!("正在监听 {bind_addr} -> '{device_name}' ({sample_rate} Hz)"),
         }
     }
 
     pub fn status_receiver_failed(self, err: &impl std::fmt::Display) -> String {
         match self {
             Self::En => format!("Failed to start receiver: {err}"),
-            Self::Zh => format!("启动接收端 (RX) 失败: {err}"),
+            Self::Zh => format!("启动接收失败: {err}"),
         }
     }
 
     pub fn status_duplex_stopped(self) -> String {
         match self {
-            Self::En => "Full-Duplex session stopped.".to_string(),
-            Self::Zh => "Full-Duplex 双向会话已停止。".to_string(),
+            Self::En => "Duplex call ended.".to_string(),
+            Self::Zh => "已结束双工通话".to_string(),
         }
     }
 
     pub fn status_invalid_peer_ip(self, err: &impl std::fmt::Display) -> String {
         match self {
-            Self::En => format!("Invalid Peer IP address: {err}"),
-            Self::Zh => format!("对端 Peer IP 地址无效: {err}"),
+            Self::En => format!("Invalid peer IP: {err}"),
+            Self::Zh => format!("对端 IP 地址无效: {err}"),
         }
     }
 
@@ -272,112 +260,101 @@ impl Language {
         rx_dev: &str,
     ) -> String {
         match self {
-            Self::En => format!(
-                "Full-Duplex [{role:?}] active <-> {peer_ip} (TX: '{tx_dev}', RX: '{rx_dev}')"
-            ),
-            Self::Zh => format!(
-                "Full-Duplex [{role:?}] 运行中 <-> {peer_ip} (TX: '{tx_dev}', RX: '{rx_dev}')"
-            ),
+            Self::En => {
+                format!("Duplex [{role:?}] active <-> {peer_ip} (TX: '{tx_dev}', RX: '{rx_dev}')")
+            }
+            Self::Zh => {
+                format!("双工耳麦 [{role:?}] 通话中 <-> {peer_ip} (TX: '{tx_dev}', RX: '{rx_dev}')")
+            }
         }
     }
 
     pub fn status_duplex_failed(self, err: &impl std::fmt::Display) -> String {
         match self {
-            Self::En => format!("Failed to start Full-Duplex session: {err}"),
-            Self::Zh => format!("启动 Full-Duplex 会话失败: {err}"),
+            Self::En => format!("Failed to start duplex session: {err}"),
+            Self::Zh => format!("启动双工耳麦失败: {err}"),
         }
     }
 
     pub fn status_copied_lan_ip(self, ip: IpAddr) -> String {
         match self {
-            Self::En => format!("Copied local LAN IP '{ip}' to clipboard."),
-            Self::Zh => format!("已复制本机 LAN IP '{ip}' 到剪贴板。"),
+            Self::En => format!("Copied local IP '{ip}' to clipboard."),
+            Self::Zh => format!("已复制本机地址 '{ip}'"),
         }
     }
 
     pub fn status_copied_rx_endpoint(self, endpoint: &str) -> String {
         match self {
-            Self::En => format!("Copied Receiver LAN endpoint '{endpoint}' to clipboard."),
-            Self::Zh => format!("已复制接收端 LAN 地址 '{endpoint}' 到剪贴板。"),
+            Self::En => format!("Copied receiver endpoint '{endpoint}' to clipboard."),
+            Self::Zh => format!("已复制接收地址 '{endpoint}'"),
         }
     }
 
     pub fn hover_copy_rx_endpoint(self, endpoint: &str) -> String {
         match self {
-            Self::En => {
-                format!("Copy this Receiver's LAN address ({endpoint}) for the Sender machine")
-            }
-            Self::Zh => format!("复制此接收端的 LAN 地址 ({endpoint}) 供发送端连接"),
+            Self::En => format!("Copy receiver address ({endpoint})"),
+            Self::Zh => format!("复制接收端地址 ({endpoint})"),
         }
     }
 
     pub fn status_selected_lan_peer(self, hostname: &str, addr_str: &str) -> String {
         match self {
-            Self::En => format!("Selected LAN target '{hostname}' ({addr_str})"),
-            Self::Zh => format!("已选择局域网目标节点 '{hostname}' ({addr_str})"),
+            Self::En => format!("Selected peer '{hostname}' ({addr_str})"),
+            Self::Zh => format!("已选择附近设备 '{hostname}' ({addr_str})"),
         }
     }
 
     pub fn status_sck_granted(self) -> String {
         match self {
             Self::En => "macOS ScreenCaptureKit permission granted.".to_string(),
-            Self::Zh => "macOS ScreenCaptureKit 系统录音权限已授权。".to_string(),
+            Self::Zh => "macOS 系统内录权限已授权".to_string(),
         }
     }
 
     pub fn status_sck_prompted(self) -> String {
         match self {
-            Self::En => "Opened macOS Screen & System Audio Recording settings. Toggle 'rsrelay' (or drag /Applications/rsrelay.app into the list) and restart.".to_string(),
-            Self::Zh => "已打开 macOS『录屏与系统录音』设置。请勾选 rsrelay（或在『应用程序』中选择 / 拖入 /Applications/rsrelay.app）后重启应用。".to_string(),
+            Self::En => "Opened macOS Screen & System Audio Recording settings.".to_string(),
+            Self::Zh => "已打开 macOS『录屏与系统录音』权限设置".to_string(),
         }
     }
 
     pub fn status_installed_macos_app(self, path: &str) -> String {
         match self {
-            Self::En => format!(
-                "Installed '{path}' and revealed in Finder. Select '/Applications/rsrelay.app' in System Settings (or drag it into the list)!"
-            ),
-            Self::Zh => format!(
-                "已安装 '{path}' 并在 Finder 中打开！请在系统设置点『+』选择『应用程序 -> rsrelay.app』（或直接从 Finder 拖入列表）。"
-            ),
+            Self::En => format!("Installed '{path}' and revealed in Finder."),
+            Self::Zh => format!("已安装 '{path}' 并在 Finder 中打开"),
         }
     }
 
     pub fn status_language_switched(self) -> String {
         match self {
             Self::En => "Switched language to English.".to_string(),
-            Self::Zh => "界面语言已切换为中文。".to_string(),
+            Self::Zh => "已切换为中文".to_string(),
         }
     }
 
     pub fn status_entered_tray_mode(self) -> String {
         match self {
-            Self::En => {
-                "Running in system tray background mode (GPU window framebuffers released)."
-                    .to_string()
-            }
-            Self::Zh => "已转入系统托盘后台模式运行（已释放 GUI 窗口显存）。".to_string(),
+            Self::En => "Minimized to system tray.".to_string(),
+            Self::Zh => "已最小化到系统托盘运行".to_string(),
         }
     }
 
     pub fn status_restored_from_tray(self) -> String {
         match self {
-            Self::En => "Restored Studio Console window from system tray.".to_string(),
-            Self::Zh => "已从系统托盘恢复主控制台窗口。".to_string(),
+            Self::En => "Restored window from system tray.".to_string(),
+            Self::Zh => "已从系统托盘恢复窗口".to_string(),
         }
     }
 
     pub fn format_buffer_summary(self, current_ms: Option<f32>, target_ms: u16) -> String {
         match (self, current_ms) {
-            (Self::En, Some(cur)) => format!("{cur:.1} ms (Target {target_ms} ms)"),
-            (Self::Zh, Some(cur)) => format!("{cur:.1} ms (目标 {target_ms} ms)"),
-            (Self::En, None) => format!("Target {target_ms} ms"),
-            (Self::Zh, None) => format!("目标 {target_ms} ms"),
+            (Self::En, Some(_)) | (Self::En, None) => format!("Target {target_ms} ms"),
+            (Self::Zh, Some(_)) | (Self::Zh, None) => format!("目标 {target_ms} ms"),
         }
     }
 }
 
-/// Compile-time verified UI string table.
+/// Compile-time verified UI string table for Quiet Graphite (Frames C & C2).
 pub struct Texts {
     // Window & System Tray
     pub tray_title: &'static str,
@@ -389,346 +366,352 @@ pub struct Texts {
     pub tray_stop_all: &'static str,
     pub tray_quit: &'static str,
 
-    // Top Header Bar
-    pub app_subtitle: &'static str,
+    // Sidebar Navigation & Footer
+    pub nav_section_mode: &'static str,
     pub tab_dual_console: &'static str,
     pub tab_full_duplex: &'static str,
     pub tab_hardware_matrix: &'static str,
-    pub lang_toggle_btn: &'static str,
-    pub lang_toggle_hover: &'static str,
-    pub btn_minimize_tray: &'static str,
+    pub nav_section_nearby: &'static str,
+    pub sidebar_local_addr: &'static str,
+    pub chk_auto_follow_hotplug: &'static str,
     pub btn_minimize_tray_hover: &'static str,
+    pub lan_ip_hover: &'static str,
+    pub btn_scan_lan_hover: &'static str,
     pub btn_refresh_ports: &'static str,
     pub btn_refresh_ports_hover: &'static str,
-    pub btn_scanning_lan: &'static str,
-    pub btn_scan_lan: &'static str,
-    pub btn_scan_lan_hover: &'static str,
-    pub lan_ip_hover: &'static str,
-
-    // Bottom Footer Bar
-    pub btn_stop_all: &'static str,
-    pub chk_auto_follow_hotplug: &'static str,
-
-    // LAN Discovery Strip
-    pub discovered_lan_peers: &'static str,
     pub discovered_peer_hover: &'static str,
 
-    // Common Status & Device Labels
-    pub status_streaming: &'static str,
-    pub status_listening: &'static str,
-    pub status_duplex_active: &'static str,
+    // Page Headers (C, C2, Audio Devices)
+    pub page_c_title: &'static str,
+    pub page_c_subtitle: &'static str,
+    pub page_c2_title: &'static str,
+    pub page_c2_subtitle: &'static str,
+    pub page_hw_title: &'static str,
+    pub page_hw_subtitle: &'static str,
+    pub btn_stop_all: &'static str,
+
+    // Status Chips & Common Labels
+    pub status_sending: &'static str,
+    pub status_receiving: &'static str,
+    pub status_in_call: &'static str,
+    pub status_healthy: &'static str,
+    pub status_speaking: &'static str,
+    pub status_muted: &'static str,
     pub status_standby: &'static str,
     pub device_system_default: &'static str,
+    pub device_default_speaker: &'static str,
+    pub channel_stereo: &'static str,
+    pub channel_mono: &'static str,
 
-    // 01 // Transmitter (TX) Card
+    // Frame C — Left Card: 发送 (Transmitter)
     pub tx_card_title: &'static str,
-    pub tx_card_subtitle: &'static str,
-    pub label_target_ip_port: &'static str,
+    pub btn_start_tx: &'static str,
+    pub btn_stop_tx: &'static str,
+    pub hero_send_to: &'static str,
+    pub stat_bitrate: &'static str,
+    pub stat_rtt: &'static str,
+    pub stat_packets_sent: &'static str,
+    pub unit_packets: &'static str,
+    pub chart_last_20s: &'static str,
+    pub chart_tx_idle_hint: &'static str,
     pub label_audio_source: &'static str,
     pub source_system_loopback: &'static str,
     pub source_microphone: &'static str,
     pub source_synthetic_tone: &'static str,
     pub label_input_device: &'static str,
-    pub hover_refresh_input_ports: &'static str,
-    pub label_opus_bitrate: &'static str,
+    pub label_target_addr: &'static str,
+    pub label_quality_latency: &'static str,
+    pub profile_ultra_low: &'static str,
+    pub profile_balanced: &'static str,
+    pub profile_stable: &'static str,
+    pub profile_lossless: &'static str,
     pub macos_sck_ready: &'static str,
     pub macos_perm_required: &'static str,
     pub btn_grant_perm: &'static str,
     pub hover_grant_perm: &'static str,
     pub btn_install_macos_app: &'static str,
     pub hover_install_macos_app: &'static str,
-    pub section_latency_profile: &'static str,
-    pub profile_ultra_low: &'static str,
-    pub profile_balanced: &'static str,
-    pub profile_stable: &'static str,
-    pub profile_lossless: &'static str,
-    pub btn_start_tx: &'static str,
-    pub btn_stop_tx: &'static str,
-    pub vu_input_capture: &'static str,
-    pub tile_packets_tx: &'static str,
-    pub tile_silence_heartbeat: &'static str,
-    pub tile_silence_sub: &'static str,
-    pub tile_control_telemetry: &'static str,
-    pub awaiting_tx: &'static str,
 
-    // 02 // Receiver (RX) Card
+    // Frame C — Right Card: 接收 (Receiver)
     pub rx_card_title: &'static str,
-    pub rx_card_subtitle: &'static str,
-    pub label_bind_ip_port: &'static str,
-    pub btn_copy_lan: &'static str,
+    pub btn_start_rx: &'static str,
+    pub btn_stop_rx: &'static str,
+    pub hero_listen_any: &'static str,
+    pub route_adaptive_jb: &'static str,
+    pub stat_buffer_level: &'static str,
+    pub stat_clock_comp: &'static str,
+    pub stat_loss_repaired: &'static str,
+    pub chart_jitter_buffer: &'static str,
+    pub chart_rx_idle_hint: &'static str,
+    pub label_listen_port: &'static str,
     pub label_output_device: &'static str,
-    pub hover_refresh_output_ports: &'static str,
     pub label_target_buffer: &'static str,
     pub label_output_gain: &'static str,
     pub chk_advertise_mdns: &'static str,
-    pub btn_start_rx: &'static str,
-    pub btn_stop_rx: &'static str,
-    pub vu_output_playback: &'static str,
-    pub sparkline_jitter_watermark: &'static str,
-    pub sparkline_awaiting: &'static str,
-    pub tile_packets_rx: &'static str,
-    pub tile_loss_fec_plc: &'static str,
-    pub tile_pi_clock_asrc: &'static str,
 
-    // 03 // Full-Duplex Headset Tab
-    pub duplex_card_title: &'static str,
-    pub duplex_card_subtitle: &'static str,
-    pub role_host_title: &'static str,
-    pub role_host_desc: &'static str,
-    pub role_headset_title: &'static str,
-    pub role_headset_desc: &'static str,
-    pub label_peer_ip: &'static str,
-    pub label_udp_ports_dl_ul: &'static str,
-    pub label_tx_input_device: &'static str,
-    pub label_rx_output_device: &'static str,
-    pub label_mic_noise_gate: &'static str,
-    pub label_output_gain_mic: &'static str,
-    pub chk_mute_mic: &'static str,
+    // Frame C2 — 双工耳麦 (Full-Duplex Headset)
     pub btn_start_duplex: &'static str,
     pub btn_stop_duplex: &'static str,
-    pub vu_duplex_tx: &'static str,
-    pub tile_tx_capture_device: &'static str,
-    pub tile_uplink_telemetry: &'static str,
-    pub vu_duplex_rx: &'static str,
-    pub tile_downlink_packets: &'static str,
-    pub tile_drift_comp: &'static str,
+    pub conn_local_role: &'static str,
+    pub role_host_short: &'static str,
+    pub role_headset_short: &'static str,
+    pub conn_codec: &'static str,
+    pub c2_listen_title: &'static str,
+    pub c2_listen_subtitle: &'static str,
+    pub c2_jb_chart_title: &'static str,
+    pub label_channels: &'static str,
+    pub c2_mic_title: &'static str,
+    pub c2_mic_subtitle: &'static str,
+    pub c2_gate_marker_prefix: &'static str,
+    pub stat_level: &'static str,
+    pub stat_gated_frames: &'static str,
+    pub c2_voice_chart_title: &'static str,
+    pub label_microphone: &'static str,
+    pub label_noise_gate_threshold: &'static str,
+    pub label_mic_mute: &'static str,
 
-    // Hardware Matrix Tab
+    // Tab 3 — 音频设备 (Hardware Matrix)
     pub hw_input_title: &'static str,
+    pub hw_input_subtitle: &'static str,
     pub hw_output_title: &'static str,
+    pub hw_output_subtitle: &'static str,
     pub badge_default_in: &'static str,
     pub badge_default_out: &'static str,
 }
 
+pub const TEXTS_ZH: Texts = Texts {
+    tray_title: "rsrelay — 实时音频中继",
+    tray_show_console: "打开主窗口",
+    tray_hide_console: "最小化到托盘",
+    tray_toggle_tx: "开始 / 停止发送",
+    tray_toggle_rx: "开始 / 停止接收",
+    tray_toggle_duplex: "开始 / 结束双工通话",
+    tray_stop_all: "全部停止",
+    tray_quit: "退出 rsrelay",
+
+    nav_section_mode: "工作模式",
+    tab_dual_console: "收发",
+    tab_full_duplex: "双工耳麦",
+    tab_hardware_matrix: "音频设备",
+    nav_section_nearby: "附近设备",
+    sidebar_local_addr: "本机地址",
+    chk_auto_follow_hotplug: "自动跟随默认设备",
+    btn_minimize_tray_hover: "最小化到托盘",
+    lan_ip_hover: "点击复制本机局域网地址",
+    btn_scan_lan_hover: "扫描局域网内的附近设备",
+    btn_refresh_ports: "刷新设备",
+    btn_refresh_ports_hover: "重新枚举本机音频输入与输出设备",
+    discovered_peer_hover: "点击选择此设备作为目标地址",
+
+    page_c_title: "收发",
+    page_c_subtitle: "把本机声音推送到局域网内的另一台设备，或接收它传来的声音",
+    page_c2_title: "双工耳麦",
+    page_c2_subtitle: "把这台设备当作另一台电脑的无线耳麦：听它的声音，同时把你的麦克风传回去",
+    page_hw_title: "音频设备",
+    page_hw_subtitle: "管理本机输入采集与输出播放硬件、默认路由及局域网广播设置",
+    btn_stop_all: "全部停止",
+
+    status_sending: "正在发送",
+    status_receiving: "正在接收",
+    status_in_call: "通话中",
+    status_healthy: "正常",
+    status_speaking: "正在说话",
+    status_muted: "已静音",
+    status_standby: "待机",
+    device_system_default: "系统默认输入",
+    device_default_speaker: "系统默认扬声器",
+    channel_stereo: "立体声",
+    channel_mono: "单声道",
+
+    tx_card_title: "发送",
+    btn_start_tx: "开始发送",
+    btn_stop_tx: "停止",
+    hero_send_to: "发送到",
+    stat_bitrate: "码率",
+    stat_rtt: "往返延迟",
+    stat_packets_sent: "已发送",
+    unit_packets: "包",
+    chart_last_20s: "最近 20 秒",
+    chart_tx_idle_hint: "开始发送后将在此显示音频波形",
+    label_audio_source: "音频来源",
+    source_system_loopback: "系统内录",
+    source_microphone: "麦克风",
+    source_synthetic_tone: "测试信号 (440Hz)",
+    label_input_device: "输入设备",
+    label_target_addr: "目标地址",
+    label_quality_latency: "音质与延迟",
+    profile_ultra_low: "极低延迟",
+    profile_balanced: "均衡",
+    profile_stable: "稳定",
+    profile_lossless: "无损",
+    macos_sck_ready: "macOS 内录已就绪",
+    macos_perm_required: "需要系统录音权限",
+    btn_grant_perm: "授权权限",
+    hover_grant_perm: "打开 macOS 系统设置授权系统录音权限",
+    btn_install_macos_app: "安装到应用程序",
+    hover_install_macos_app: "将 rsrelay.app 安装到 /Applications 并在 Finder 中显示",
+
+    rx_card_title: "接收",
+    btn_start_rx: "开始接收",
+    btn_stop_rx: "停止",
+    hero_listen_any: "监听地址 · 接受任意来源",
+    route_adaptive_jb: "自适应抖动缓冲",
+    stat_buffer_level: "缓冲水位",
+    stat_clock_comp: "时钟补偿",
+    stat_loss_repaired: "丢包 / 修复",
+    chart_jitter_buffer: "抖动缓冲",
+    chart_rx_idle_hint: "开始接收后将在此显示缓冲曲线",
+    label_listen_port: "监听端口",
+    label_output_device: "输出设备",
+    label_target_buffer: "目标缓冲",
+    label_output_gain: "输出增益",
+    chk_advertise_mdns: "在局域网广播此接收端 (mDNS)",
+
+    btn_start_duplex: "开始通话",
+    btn_stop_duplex: "结束通话",
+    conn_local_role: "本机角色",
+    role_host_short: "主机电脑",
+    role_headset_short: "无线耳麦",
+    conn_codec: "编码",
+    c2_listen_title: "收听",
+    c2_listen_subtitle: "下行 · 立体声 48 kHz",
+    c2_jb_chart_title: "抖动缓冲 · 最近 20 秒",
+    label_channels: "声道",
+    c2_mic_title: "麦克风",
+    c2_mic_subtitle: "上行 · 单声道 48 kHz",
+    c2_gate_marker_prefix: "▼ 噪声门",
+    stat_level: "电平",
+    stat_gated_frames: "静音帧（已省流）",
+    c2_voice_chart_title: "人声包络 · 最近 20 秒",
+    label_microphone: "麦克风",
+    label_noise_gate_threshold: "噪声门阈值",
+    label_mic_mute: "麦克风静音",
+
+    hw_input_title: "输入设备",
+    hw_input_subtitle: "本机麦克风与环回采集硬件",
+    hw_output_title: "输出设备",
+    hw_output_subtitle: "本机扬声器与耳机播放硬件",
+    badge_default_in: "默认",
+    badge_default_out: "默认",
+};
+
 pub const TEXTS_EN: Texts = Texts {
-    tray_title: "rsrelay — Ultra-Low-Latency Audio Relay",
-    tray_show_console: "Open Studio Console (打开主窗口)",
-    tray_hide_console: "Hide Window to Tray (Low Memory)",
-    tray_toggle_tx: "Start / Stop Transmitter (TX)",
-    tray_toggle_rx: "Start / Stop Receiver (RX)",
-    tray_toggle_duplex: "Start / Stop Full-Duplex Headset",
-    tray_stop_all: "Stop All Audio Streams",
+    tray_title: "rsrelay — Audio Relay",
+    tray_show_console: "Open Window",
+    tray_hide_console: "Minimize to Tray",
+    tray_toggle_tx: "Start / Stop Transmit",
+    tray_toggle_rx: "Start / Stop Receive",
+    tray_toggle_duplex: "Start / End Duplex Call",
+    tray_stop_all: "Stop All",
     tray_quit: "Quit rsrelay",
 
-    app_subtitle: "Ultra-Low-Latency Real-Time Audio Relay",
-    tab_dual_console: "Dual Console (TX / RX)",
-    tab_full_duplex: "Full-Duplex Headset",
-    tab_hardware_matrix: "Audio Matrix & LAN",
-    lang_toggle_btn: "🌐 中文",
-    lang_toggle_hover: "Switch UI language to Chinese (切换为中文)",
-    btn_minimize_tray: "⬇ Tray",
-    btn_minimize_tray_hover:
-        "Close GUI window and run in the system tray (frees ~75 MB of Retina GPU framebuffer memory)",
-    btn_refresh_ports: "↻ Ports",
-    btn_refresh_ports_hover: "Re-enumerate OS audio input/output hardware",
-    btn_scanning_lan: "◎ Scanning...",
-    btn_scan_lan: "◎ Scan LAN",
-    btn_scan_lan_hover: "Discover active rsrelay receivers on LAN via mDNS",
-    lan_ip_hover: "Click to copy this machine's local LAN IPv4 address",
+    nav_section_mode: "MODE",
+    tab_dual_console: "Send & Receive",
+    tab_full_duplex: "Duplex Headset",
+    tab_hardware_matrix: "Audio Devices",
+    nav_section_nearby: "NEARBY DEVICES",
+    sidebar_local_addr: "Local Address",
+    chk_auto_follow_hotplug: "Auto-follow default",
+    btn_minimize_tray_hover: "Minimize to system tray",
+    lan_ip_hover: "Click to copy local LAN IP address",
+    btn_scan_lan_hover: "Scan LAN for nearby devices via mDNS",
+    btn_refresh_ports: "Refresh Devices",
+    btn_refresh_ports_hover: "Re-enumerate system audio input and output devices",
+    discovered_peer_hover: "Click to select this peer as target",
 
-    btn_stop_all: "■ Stop All",
-    chk_auto_follow_hotplug: "Auto-Follow Hot-Plug",
+    page_c_title: "Send & Receive",
+    page_c_subtitle:
+        "Stream this machine's audio to another device on the LAN, or listen to incoming audio",
+    page_c2_title: "Duplex Headset",
+    page_c2_subtitle:
+        "Use this device as a wireless headset for another computer: listen to its audio and send your mic back",
+    page_hw_title: "Audio Devices",
+    page_hw_subtitle:
+        "Inspect local capture and playback hardware, default routing, and LAN discovery settings",
+    btn_stop_all: "Stop All",
 
-    discovered_lan_peers: "◎ DISCOVERED LAN PEERS",
-    discovered_peer_hover: "Click to bind this peer IP:Port as target",
+    status_sending: "Sending",
+    status_receiving: "Receiving",
+    status_in_call: "In Call",
+    status_healthy: "Healthy",
+    status_speaking: "Speaking",
+    status_muted: "Muted",
+    status_standby: "Standby",
+    device_system_default: "System Default Input",
+    device_default_speaker: "System Default Speaker",
+    channel_stereo: "Stereo",
+    channel_mono: "Mono",
 
-    status_streaming: "STREAMING",
-    status_listening: "LISTENING",
-    status_duplex_active: "DUPLEX LINK ACTIVE",
-    status_standby: "STANDBY",
-    device_system_default: "System Default (Auto)",
-
-    tx_card_title: "01 // TRANSMITTER (SENDER)",
-    tx_card_subtitle: "System Loopback / Mic Capture -> UDP Opus/PCM",
-    label_target_ip_port: "Target IP:Port",
+    tx_card_title: "Transmit",
+    btn_start_tx: "Start Sending",
+    btn_stop_tx: "Stop",
+    hero_send_to: "Send to",
+    stat_bitrate: "Bitrate",
+    stat_rtt: "Round-Trip",
+    stat_packets_sent: "Sent",
+    unit_packets: "pkts",
+    chart_last_20s: "Last 20s",
+    chart_tx_idle_hint: "Audio waveform will appear when sending",
     label_audio_source: "Audio Source",
-    source_system_loopback: "System Loopback (SCK / WASAPI)",
-    source_microphone: "Microphone Input",
-    source_synthetic_tone: "Synthetic 440Hz/660Hz Reference Tone",
+    source_system_loopback: "System Loopback",
+    source_microphone: "Microphone",
+    source_synthetic_tone: "Test Tone (440Hz)",
     label_input_device: "Input Device",
-    hover_refresh_input_ports: "Refresh input ports",
-    label_opus_bitrate: "Opus Bitrate",
-    macos_sck_ready: "macOS SCK Driverless Loopback Ready",
-    macos_perm_required: "macOS Audio Permission Required",
-    btn_grant_perm: "Grant Permission",
-    hover_grant_perm:
-        "Trigger macOS System Settings > Privacy & Security > Screen & System Audio Recording prompt",
-    btn_install_macos_app: "Locate / Install rsrelay.app",
-    hover_install_macos_app:
-        "Install /Applications/rsrelay.app and reveal it in Finder so you can select or drag it into System Settings",
-    section_latency_profile: "LATENCY & CODEC PROFILE",
+    label_target_addr: "Target Address",
+    label_quality_latency: "Quality & Latency",
     profile_ultra_low: "Ultra-Low",
     profile_balanced: "Balanced",
     profile_stable: "Stable",
     profile_lossless: "Lossless",
-    btn_start_tx: "Start Transmitter",
-    btn_stop_tx: "Stop Transmitter",
-    vu_input_capture: "INPUT CAPTURE LEVEL",
-    tile_packets_tx: "PACKETS TX",
-    tile_silence_heartbeat: "SILENCE HEARTBEAT",
-    tile_silence_sub: "Zero-payload keepalive",
-    tile_control_telemetry: "CONTROL TELEMETRY",
-    awaiting_tx: "Awaiting TX",
+    macos_sck_ready: "macOS SCK Ready",
+    macos_perm_required: "Audio Permission Needed",
+    btn_grant_perm: "Grant Permission",
+    hover_grant_perm: "Open macOS System Settings for Screen & System Audio Recording",
+    btn_install_macos_app: "Install App",
+    hover_install_macos_app: "Install /Applications/rsrelay.app and reveal in Finder",
 
-    rx_card_title: "02 // RECEIVER (LISTENER)",
-    rx_card_subtitle: "Adaptive Jitter Buffer + PI Clock ASRC -> Speaker",
-    label_bind_ip_port: "Bind IP:Port",
-    btn_copy_lan: "Copy LAN",
+    rx_card_title: "Receive",
+    btn_start_rx: "Start Receiving",
+    btn_stop_rx: "Stop",
+    hero_listen_any: "Listen Address · Any Source",
+    route_adaptive_jb: "Adaptive Jitter Buffer",
+    stat_buffer_level: "Buffer Level",
+    stat_clock_comp: "Clock Drift",
+    stat_loss_repaired: "Lost / Fixed",
+    chart_jitter_buffer: "Jitter Buffer",
+    chart_rx_idle_hint: "Buffer curve will appear when receiving",
+    label_listen_port: "Listen Port",
     label_output_device: "Output Device",
-    hover_refresh_output_ports: "Refresh output ports",
     label_target_buffer: "Target Buffer",
     label_output_gain: "Output Gain",
-    chk_advertise_mdns: "Advertise receiver on LAN via mDNS (_rsrelay._udp.local.)",
-    btn_start_rx: "Start Receiver",
-    btn_stop_rx: "Stop Receiver",
-    vu_output_playback: "OUTPUT PLAYBACK LEVEL",
-    sparkline_jitter_watermark: "JITTER BUFFER WATERMARK",
-    sparkline_awaiting: "Awaiting live stream telemetry...",
-    tile_packets_rx: "PACKETS RX",
-    tile_loss_fec_plc: "LOSS & FEC / PLC",
-    tile_pi_clock_asrc: "PI CLOCK ASRC",
+    chk_advertise_mdns: "Advertise receiver on LAN (mDNS)",
 
-    duplex_card_title: "03 // FULL-DUPLEX WIRELESS HEADSET CONSOLE",
-    duplex_card_subtitle:
-        "Simultaneous Stereo System Audio Downlink + Noise-Gated Microphone Uplink",
-    role_host_title: "HOST WORKSTATION (MAIN PC)",
-    role_host_desc: "TX: System Audio Loopback (:49153)  •  RX: Remote Mic Uplink (:49155)",
-    role_headset_title: "WIRELESS HEADSET (SECONDARY DEVICE)",
-    role_headset_desc: "RX: Host System Audio (:49153)  •  TX: Local Mic with Noise Gate (:49155)",
-    label_peer_ip: "Peer IP Address",
-    label_udp_ports_dl_ul: "UDP Ports (DL / UL)",
-    label_tx_input_device: "TX Input Device",
-    label_rx_output_device: "RX Output Device",
-    label_mic_noise_gate: "Mic Noise Gate",
-    label_output_gain_mic: "Output Gain & Mic",
-    chk_mute_mic: "Mute Mic",
-    btn_start_duplex: "Start Full-Duplex Headset Session",
-    btn_stop_duplex: "Stop Full-Duplex Session",
-    vu_duplex_tx: "OUTGOING TX STREAM (CYAN LINE = NOISE GATE)",
-    tile_tx_capture_device: "TX CAPTURE DEVICE",
-    tile_uplink_telemetry: "UPLINK TELEMETRY",
-    vu_duplex_rx: "INCOMING RX PLAYBACK",
-    tile_downlink_packets: "DOWNLINK PACKETS",
-    tile_drift_comp: "Drift compensation",
+    btn_start_duplex: "Start Call",
+    btn_stop_duplex: "End Call",
+    conn_local_role: "Local Role",
+    role_host_short: "Host PC",
+    role_headset_short: "Headset",
+    conn_codec: "Codec",
+    c2_listen_title: "Listen",
+    c2_listen_subtitle: "Downlink · Stereo 48 kHz",
+    c2_jb_chart_title: "Jitter Buffer · Last 20s",
+    label_channels: "Channels",
+    c2_mic_title: "Microphone",
+    c2_mic_subtitle: "Uplink · Mono 48 kHz",
+    c2_gate_marker_prefix: "▼ Gate",
+    stat_level: "Level",
+    stat_gated_frames: "Gated Frames (Saved)",
+    c2_voice_chart_title: "Voice Envelope · Last 20s",
+    label_microphone: "Microphone",
+    label_noise_gate_threshold: "Noise Gate",
+    label_mic_mute: "Mute Mic",
 
-    hw_input_title: "INPUT CAPTURE HARDWARE (COREAUDIO / WASAPI)",
-    hw_output_title: "OUTPUT PLAYBACK HARDWARE (SPEAKERS / HEADPHONES)",
-    badge_default_in: "DEFAULT IN",
-    badge_default_out: "DEFAULT OUT",
-};
-
-pub const TEXTS_ZH: Texts = Texts {
-    tray_title: "rsrelay — 超低延迟实时音频中继",
-    tray_show_console: "打开主控制台窗口 (Open Console)",
-    tray_hide_console: "隐藏窗口至后台托盘 (释放显存)",
-    tray_toggle_tx: "启动 / 停止发送端 (TX)",
-    tray_toggle_rx: "启动 / 停止接收端 (RX)",
-    tray_toggle_duplex: "启动 / 停止 Full-Duplex 耳麦",
-    tray_stop_all: "停止所有音频流 (Stop All)",
-    tray_quit: "退出 rsrelay (Quit)",
-
-    app_subtitle: "超低延迟实时音频中继 (Real-Time Audio Relay)",
-    tab_dual_console: "收发控制台 (TX / RX)",
-    tab_full_duplex: "Full-Duplex 无线耳麦",
-    tab_hardware_matrix: "音频设备 & LAN",
-    lang_toggle_btn: "🌐 EN",
-    lang_toggle_hover: "切换界面语言为英文 (Switch to English)",
-    btn_minimize_tray: "⬇ 后台托盘",
-    btn_minimize_tray_hover: "关闭 GUI 窗口转入系统托盘后台运行，立即释放 ~75 MB Retina 窗口显存",
-    btn_refresh_ports: "↻ 刷新设备",
-    btn_refresh_ports_hover: "重新扫描系统音频输入/输出硬件设备",
-    btn_scanning_lan: "◎ 扫描中...",
-    btn_scan_lan: "◎ 扫描 LAN",
-    btn_scan_lan_hover: "通过 mDNS 扫描局域网内活跃的 rsrelay 接收端",
-    lan_ip_hover: "点击复制本机局域网 (LAN) IPv4 地址",
-
-    btn_stop_all: "■ 全部停止",
-    chk_auto_follow_hotplug: "热插拔自动跟随 (Hot-Plug)",
-
-    discovered_lan_peers: "◎ 已发现 LAN 节点 (PEERS)",
-    discovered_peer_hover: "点击将此节点 IP:Port 设为目标地址",
-
-    status_streaming: "发送中 LIVE",
-    status_listening: "监听中 LIVE",
-    status_duplex_active: "双向链路运行中",
-    status_standby: "待机 STANDBY",
-    device_system_default: "系统默认 (System Default)",
-
-    tx_card_title: "01 // 发送端 (TRANSMITTER / TX)",
-    tx_card_subtitle: "系统内录 Loopback / Mic 采集 -> UDP Opus/PCM",
-    label_target_ip_port: "目标 IP:Port",
-    label_audio_source: "音频源 (Source)",
-    source_system_loopback: "系统内录 Loopback (SCK / WASAPI)",
-    source_microphone: "麦克风输入 (Mic Input)",
-    source_synthetic_tone: "内置 440Hz/660Hz 测试信号 (Test Tone)",
-    label_input_device: "输入设备 (Input)",
-    hover_refresh_input_ports: "刷新输入设备列表",
-    label_opus_bitrate: "Opus 码率 (Bitrate)",
-    macos_sck_ready: "macOS SCK 免驱内录已就绪",
-    macos_perm_required: "需要 macOS 系统录音权限",
-    btn_grant_perm: "授权权限 (打开设置)",
-    hover_grant_perm: "打开 macOS 系统设置 > 隐私与安全性 > 录屏与系统录音授权提示",
-    btn_install_macos_app: "定位 / 安装到应用程序 (rsrelay.app)",
-    hover_install_macos_app: "将 rsrelay.app 安装到『/Applications (应用程序)』并在 Finder 中打开，方便在系统设置中选择或拖入授权",
-    section_latency_profile: "延迟与编码档位 (LATENCY PROFILE)",
-    profile_ultra_low: "极低延迟 (Ultra)",
-    profile_balanced: "均衡 (Balanced)",
-    profile_stable: "稳定抗抖 (Stable)",
-    profile_lossless: "无损 (Lossless)",
-    btn_start_tx: "启动发送端 (Start TX)",
-    btn_stop_tx: "停止发送端 (Stop TX)",
-    vu_input_capture: "输入采集电平 (INPUT LEVEL)",
-    tile_packets_tx: "已发包 (PACKETS TX)",
-    tile_silence_heartbeat: "静音心跳 (HEARTBEAT)",
-    tile_silence_sub: "零负载保活帧 (Keepalive)",
-    tile_control_telemetry: "控制遥测 (TELEMETRY)",
-    awaiting_tx: "等待发送 (Awaiting TX)",
-
-    rx_card_title: "02 // 接收端 (RECEIVER / RX)",
-    rx_card_subtitle: "自适应 Jitter Buffer + PI 时钟同步 ASRC -> 扬声器",
-    label_bind_ip_port: "监听 IP:Port",
-    btn_copy_lan: "复制 LAN",
-    label_output_device: "输出设备 (Output)",
-    hover_refresh_output_ports: "刷新输出设备列表",
-    label_target_buffer: "目标缓冲 (Buffer)",
-    label_output_gain: "输出增益 (Gain)",
-    chk_advertise_mdns: "通过 mDNS 在局域网广播此接收端 (_rsrelay._udp.local.)",
-    btn_start_rx: "启动接收端 (Start RX)",
-    btn_stop_rx: "停止接收端 (Stop RX)",
-    vu_output_playback: "输出播放电平 (OUTPUT LEVEL)",
-    sparkline_jitter_watermark: "缓冲水位曲线 (JITTER BUFFER)",
-    sparkline_awaiting: "等待实时音频流数据...",
-    tile_packets_rx: "已收包 (PACKETS RX)",
-    tile_loss_fec_plc: "丢包与恢复 (LOSS / FEC)",
-    tile_pi_clock_asrc: "时钟漂移补偿 (PI ASRC)",
-
-    duplex_card_title: "03 // FULL-DUPLEX 双向无线耳麦控制台",
-    duplex_card_subtitle:
-        "立体声系统音频下行 (Downlink) + 噪声门控 Mic 上行 (Uplink) 双向同步传输",
-    role_host_title: "主机端 HOST (主电脑 Main PC)",
-    role_host_desc: "TX: 系统音频内录 (:49153)  •  RX: 接收远端 Mic 上行 (:49155)",
-    role_headset_title: "无线耳麦端 HEADSET (副机 / 笔记本)",
-    role_headset_desc: "RX: 接收主机系统音频 (:49153)  •  TX: 本地 Mic 降噪回传 (:49155)",
-    label_peer_ip: "对端 IP (Peer IP)",
-    label_udp_ports_dl_ul: "UDP 端口 (DL / UL)",
-    label_tx_input_device: "TX 输入设备",
-    label_rx_output_device: "RX 输出设备",
-    label_mic_noise_gate: "Mic 噪声门 (Gate)",
-    label_output_gain_mic: "输出增益 & Mic",
-    chk_mute_mic: "静音 Mic",
-    btn_start_duplex: "启动 Full-Duplex 双向耳麦会话",
-    btn_stop_duplex: "停止 Full-Duplex 会话",
-    vu_duplex_tx: "上行发送电平 TX (青色线 = 噪声门阈值)",
-    tile_tx_capture_device: "TX 采集设备",
-    tile_uplink_telemetry: "上行遥测 (UPLINK)",
-    vu_duplex_rx: "下行播放电平 RX (PLAYBACK)",
-    tile_downlink_packets: "下行收包 (DOWNLINK)",
-    tile_drift_comp: "晶振漂移补偿 (Drift Comp)",
-
-    hw_input_title: "输入采集硬件设备 (INPUT / COREAUDIO / WASAPI)",
-    hw_output_title: "输出播放硬件设备 (OUTPUT / 扬声器 & 耳机)",
-    badge_default_in: "默认输入 (DEFAULT IN)",
-    badge_default_out: "默认输出 (DEFAULT OUT)",
+    hw_input_title: "Input Devices",
+    hw_input_subtitle: "Local microphone and loopback capture hardware",
+    hw_output_title: "Output Devices",
+    hw_output_subtitle: "Local speaker and headphone playback hardware",
+    badge_default_in: "Default",
+    badge_default_out: "Default",
 };
 
 #[cfg(test)]

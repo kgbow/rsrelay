@@ -1,80 +1,114 @@
-//! "Sonic Obsidian" (声学黑曜石) Design System for `rsrelay-gui`.
+//! "Quiet Graphite" Design System for `rsrelay-gui`.
 //!
-//! Defines semantic color tokens, spatial scales, typography helpers, and global
-//! `egui::Visuals` configuration tailored for ultra-low-latency pro-audio telemetry.
+//! Implements the Quiet Graphite visual language (Frames C & C2):
+//! - Neutral graphite surfaces (`#0E0E10` canvas, `#0B0B0D` sidebar, `#151517` cards, `#1C1C1F` raised controls)
+//! - Single signal accent (`#3CE0A0` mint) reserved strictly for live/healthy states
+//! - Hairline dividers (`rgba(255, 255, 255, 0.06)`) instead of nested bordered boxes
+//! - Monospace typography reserved for numeric telemetry and network addresses
 
 use eframe::egui::{self, Color32, FontFamily, FontId, Margin, Rounding, Stroke, TextStyle, Vec2};
 
-/// Semantic color palette for the **Sonic Obsidian** studio theme.
+/// Semantic color tokens for the **Quiet Graphite** theme.
 pub mod palette {
     use eframe::egui::Color32;
 
-    // === Canvas & Surface Hierarchy ===
-    /// Root window canvas background (`#0B0E14` Deep Obsidian)
-    pub const BG_CANVAS: Color32 = Color32::from_rgb(11, 14, 20);
-    /// Primary card / module surface (`#121722` Studio Slate)
-    pub const BG_SURFACE: Color32 = Color32::from_rgb(18, 23, 34);
-    /// Elevated interactive surface / hover card (`#192030`)
-    pub const BG_ELEVATED: Color32 = Color32::from_rgb(25, 32, 48);
-    /// Active / highlighted control fill (`#222B40`)
-    pub const BG_ACTIVE: Color32 = Color32::from_rgb(34, 43, 64);
-    /// Recessed trench for inputs, meters, and telemetry tiles (`#0D111A`)
-    pub const BG_TRENCH: Color32 = Color32::from_rgb(13, 17, 26);
+    // === Canvas, Sidebar & Surface Hierarchy ===
+    /// Main workspace canvas (`#0E0E10`)
+    pub const BG_CANVAS: Color32 = Color32::from_rgb(14, 14, 16);
+    /// Left navigation sidebar (`#0B0B0D`)
+    pub const BG_SIDEBAR: Color32 = Color32::from_rgb(11, 11, 13);
+    /// Card panel surface (`#151517`)
+    pub const BG_PANEL: Color32 = Color32::from_rgb(21, 21, 23);
+    /// Raised control fill for selects, icon tiles, secondary buttons, active nav (`#1C1C1F`)
+    pub const BG_RAISED: Color32 = Color32::from_rgb(28, 28, 31);
+    /// Hover surface & active segmented pill fill (`#232327`)
+    pub const BG_HOVER: Color32 = Color32::from_rgb(35, 35, 39);
 
-    // === Borders & Hairlines ===
-    /// Subtle 1px card border (`#21293A`)
-    pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(33, 41, 58);
-    /// Interactive widget border (`#2E3A52`)
-    pub const BORDER_WIDGET: Color32 = Color32::from_rgb(46, 58, 82);
-    /// High-contrast focus / active border (`#00D4AA`)
-    pub const BORDER_ACCENT: Color32 = Color32::from_rgb(0, 212, 170);
+    // Backwards-compatible surface aliases
+    pub const BG_SURFACE: Color32 = BG_PANEL;
+    pub const BG_ELEVATED: Color32 = BG_RAISED;
+    pub const BG_ACTIVE: Color32 = BG_HOVER;
+    pub const BG_TRENCH: Color32 = BG_CANVAS;
 
-    // === Brand & Signal Accents ===
-    /// Primary Acoustic Mint (`#00D4AA`) — Healthy signal, active TX, primary CTA
-    pub const ACCENT_MINT: Color32 = Color32::from_rgb(0, 212, 170);
-    /// Darker Mint for button fills (`#00A886`)
-    pub const ACCENT_MINT_DIM: Color32 = Color32::from_rgb(0, 168, 134);
-    /// Soft Mint tint for active card backgrounds
-    pub const ACCENT_MINT_GLOW: Color32 = Color32::from_rgba_premultiplied(0, 42, 34, 65);
+    // === Hairlines & Borders (Pre-composited on #151517 / #0E0E10 to avoid linear-alpha washout) ===
+    /// Primary 1px hairline divider (`#222225`, equivalent to `rgba(255, 255, 255, 0.06)` on `#151517`)
+    pub const LINE: Color32 = Color32::from_rgb(34, 34, 37);
+    /// Stronger hairline for ghost buttons and dashed guides (`#2C2C30`, equivalent to `rgba(255, 255, 255, 0.10)`)
+    pub const LINE_STRONG: Color32 = Color32::from_rgb(44, 44, 48);
+    /// Subtle top inset highlight on cards and raised controls (`#26262A`)
+    pub const INSET_HIGHLIGHT: Color32 = Color32::from_rgb(38, 38, 42);
 
-    /// Telemetry Cyan (`#38BDF8`) — Network RX, ASRC clock ratio, mDNS discovery
-    pub const ACCENT_CYAN: Color32 = Color32::from_rgb(56, 189, 248);
-    /// Soft Cyan tint for active receiver badges
-    pub const ACCENT_CYAN_GLOW: Color32 = Color32::from_rgba_premultiplied(11, 38, 50, 65);
+    pub const BORDER_SUBTLE: Color32 = LINE;
+    pub const BORDER_WIDGET: Color32 = LINE_STRONG;
+    pub const BORDER_ACCENT: Color32 = Color32::from_rgb(60, 224, 160);
 
-    /// Full-Duplex Indigo (`#818CF8`) — Bidirectional wireless headset link
-    pub const ACCENT_INDIGO: Color32 = Color32::from_rgb(129, 140, 248);
+    // === Signal Accent & Status Colors ===
+    /// Live / healthy signal mint (`#3CE0A0`)
+    pub const ACCENT: Color32 = Color32::from_rgb(60, 224, 160);
+    /// Darker mint for pressed states (`#2BB880`)
+    pub const ACCENT_DIM: Color32 = Color32::from_rgb(43, 184, 128);
+    /// Pre-composited mint tint for `.chip.live` on `#151517` (`rgba(60, 224, 160, 0.12)` -> `#1A3229`)
+    pub const ACCENT_TINT: Color32 = Color32::from_rgb(26, 50, 41);
+    /// Idle chip & meter track fill on `#151517` (`rgba(255, 255, 255, 0.05)` -> `#202024`)
+    pub const CHIP_IDLE_BG: Color32 = Color32::from_rgb(32, 32, 36);
+    /// Active peer highlight in `#0B0B0D` sidebar (`rgba(255, 255, 255, 0.035)` -> `#151518`)
+    pub const PEER_ACTIVE_BG: Color32 = Color32::from_rgb(21, 21, 24);
+    /// Slider track fill on `#151517` (`rgba(255, 255, 255, 0.08)` -> `#27272B`)
+    pub const SLIDER_TRACK_BG: Color32 = Color32::from_rgb(39, 39, 43);
 
-    // === Acoustic & Telemetry Status Colors ===
-    /// Nominal audio zone (`-60..-12 dBFS`) & healthy link (`#10B981`)
-    pub const STATUS_OK: Color32 = Color32::from_rgb(16, 185, 129);
-    /// Headroom warning zone (`-12..-3 dBFS`), FEC recovery, or moderate jitter (`#F59E0B`)
-    pub const STATUS_WARN: Color32 = Color32::from_rgb(245, 158, 11);
-    /// Clipping zone (`-3..0 dBFS`), packet loss, underrun, or Stop action (`#EF4444`)
-    pub const STATUS_DANGER: Color32 = Color32::from_rgb(239, 68, 68);
-    /// Darker Crimson for Stop button fill (`#B91C1C`)
-    pub const STATUS_DANGER_DIM: Color32 = Color32::from_rgb(185, 28, 28);
+    // Aliases mapped to the unified Quiet Graphite accent
+    pub const ACCENT_MINT: Color32 = ACCENT;
+    pub const ACCENT_MINT_DIM: Color32 = ACCENT_DIM;
+    pub const ACCENT_MINT_GLOW: Color32 = ACCENT_TINT;
+    pub const ACCENT_CYAN: Color32 = ACCENT;
+    pub const ACCENT_CYAN_GLOW: Color32 = ACCENT_TINT;
+    pub const ACCENT_INDIGO: Color32 = ACCENT;
+
+    /// Nominal status (`#3CE0A0`)
+    pub const STATUS_OK: Color32 = ACCENT;
+    /// Meter headroom warning zone (`#F2B84B`, top 14%)
+    pub const STATUS_WARN: Color32 = Color32::from_rgb(242, 184, 75);
+    /// Meter clipping zone & Stop button square indicator (`#FF6B5B`)
+    pub const STATUS_DANGER: Color32 = Color32::from_rgb(255, 107, 91);
+    pub const STATUS_DANGER_DIM: Color32 = Color32::from_rgb(190, 68, 56);
+
+    /// Inactive peer dot & toggle off track (`#4A4A50` / `#2C2C31`)
+    pub const DOT_OFFLINE: Color32 = Color32::from_rgb(74, 74, 80);
+    pub const TOGGLE_OFF_BG: Color32 = Color32::from_rgb(44, 44, 49);
+    pub const TOGGLE_OFF_KNOB: Color32 = Color32::from_rgb(138, 138, 146);
 
     // === Typography Hierarchy ===
-    /// Crisp primary text (`#F1F5F9`)
-    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(241, 245, 249);
-    /// Secondary control labels (`#94A3B8`)
-    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(148, 163, 184);
-    /// Muted hints, units, and inactive metrics (`#64748B`)
-    pub const TEXT_MUTED: Color32 = Color32::from_rgb(100, 116, 139);
+    /// Primary text & primary CTA button fill (`#EDEDEE`)
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(237, 237, 238);
+    /// Secondary labels & descriptions (`#9C9CA3`)
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(156, 156, 163);
+    /// Muted captions, units, and scale ticks (`#66666D`)
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(102, 102, 109);
 }
 
-/// Spatial and geometric tokens (8px baseline grid).
+/// Spatial and geometric tokens matching Quiet Graphite (Frames C & C2).
 pub mod metrics {
+    pub const SIDEBAR_WIDTH: f32 = 232.0;
+
     pub const SPACE_XS: f32 = 4.0;
     pub const SPACE_SM: f32 = 8.0;
     pub const SPACE_MD: f32 = 12.0;
     pub const SPACE_LG: f32 = 16.0;
-    pub const SPACE_XL: f32 = 22.0;
+    pub const SPACE_XL: f32 = 20.0;
 
-    pub const RADIUS_CARD: f32 = 10.0;
-    pub const RADIUS_WIDGET: f32 = 6.0;
-    pub const RADIUS_PILL: f32 = 14.0;
+    pub const CARD_PADDING_X: f32 = 20.0;
+    pub const CARD_PADDING_Y: f32 = 18.0;
+    pub const MAIN_PADDING_X: f32 = 28.0;
+    pub const MAIN_PADDING_Y: f32 = 22.0;
+    pub const SETTING_ROW_HEIGHT: f32 = 50.0;
+
+    pub const RADIUS_CARD: f32 = 14.0;
+    pub const RADIUS_BUTTON: f32 = 8.0;
+    pub const RADIUS_SELECT: f32 = 7.0;
+    pub const RADIUS_WIDGET: f32 = 8.0;
+    pub const RADIUS_SEG_INNER: f32 = 6.0;
+    pub const RADIUS_CHIP: f32 = 10.0;
+    pub const RADIUS_PILL: f32 = 10.0;
 
     pub const LABEL_COL_WIDTH: f32 = 108.0;
 }
@@ -103,9 +137,6 @@ fn map_font_file_readonly(path: &str) -> Option<&'static [u8]> {
         return None;
     }
 
-    // SAFETY: Mapping a read-only system font file for the lifetime of the process.
-    // Because it is mapped `PROT_READ | MAP_PRIVATE`, pages are backed directly by
-    // the OS unified page cache (`Clean` file-backed memory) with 0 KB of dirty heap.
     unsafe {
         let ptr = mmap(
             std::ptr::null_mut(),
@@ -128,7 +159,7 @@ fn load_cjk_font_static_slice() -> Option<(&'static str, &'static [u8])> {
 
     *CJK_FONT_CACHE.get_or_init(|| {
         let candidate_paths: &[&'static str] = &[
-            // macOS system CJK fonts (prefer compact 22MB Hiragino / Arial Unicode before 53MB STHeiti)
+            // macOS system CJK fonts
             "/System/Library/Fonts/Hiragino Sans GB.ttc",
             "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
             "/System/Library/Fonts/STHeiti Medium.ttc",
@@ -159,13 +190,7 @@ fn load_cjk_font_static_slice() -> Option<(&'static str, &'static [u8])> {
     })
 }
 
-/// Load native OS CJK fallback fonts (macOS `Hiragino` / `STHeiti` / `Arial Unicode`,
-/// Windows `Microsoft YaHei` / `SimHei`) so localized audio device names (e.g. `"外置麦克风"`,
-/// `"外置耳机"`, `"扬声器"`) and Chinese UI text render crisply without missing-glyph tofu boxes.
-///
-/// Uses zero-copy `FontData::from_static` backed by read-only `mmap` on Unix so `epaint`
-/// borrows the OS page cache directly (`ab_glyph::FontRef`) without allocating or cloning
-/// multi-megabyte font buffers on the heap.
+/// Load native OS CJK fallback fonts so Chinese UI text and localized device names render crisply.
 pub fn configure_cjk_fallback_fonts(ctx: &egui::Context) {
     if let Some((path, bytes)) = load_cjk_font_static_slice() {
         let mut fonts = egui::FontDefinitions::default();
@@ -184,22 +209,22 @@ pub fn configure_cjk_fallback_fonts(ctx: &egui::Context) {
     }
 }
 
-/// Apply the **Sonic Obsidian** design system to an `egui::Context`.
+/// Apply the **Quiet Graphite** design system to an `egui::Context`.
 pub fn apply_studio_theme(ctx: &egui::Context) {
     configure_cjk_fallback_fonts(ctx);
     let mut style = (*ctx.style()).clone();
 
-    // Typography scale
+    // Typography scale matching Quiet Graphite (H1 20, Card Title 15, Body 13, Caption 11.5, Mono 12.5)
     style.text_styles.insert(
         TextStyle::Heading,
-        FontId::new(16.5, FontFamily::Proportional),
+        FontId::new(20.0, FontFamily::Proportional),
     );
     style
         .text_styles
         .insert(TextStyle::Body, FontId::new(13.0, FontFamily::Proportional));
     style.text_styles.insert(
         TextStyle::Button,
-        FontId::new(13.0, FontFamily::Proportional),
+        FontId::new(12.5, FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Small,
@@ -211,89 +236,96 @@ pub fn apply_studio_theme(ctx: &egui::Context) {
     );
 
     // Global spacing & padding
-    style.spacing.item_spacing = Vec2::new(metrics::SPACE_SM, metrics::SPACE_SM);
+    style.spacing.item_spacing = Vec2::new(8.0, 6.0);
     style.spacing.window_margin = Margin::same(metrics::SPACE_LG);
     style.spacing.button_padding = Vec2::new(12.0, 6.0);
-    style.spacing.interact_size = Vec2::new(44.0, 28.0);
+    style.spacing.interact_size = Vec2::new(40.0, 30.0);
     style.spacing.slider_width = 150.0;
-    style.spacing.combo_width = 210.0;
+    style.spacing.combo_width = 190.0;
 
     let mut visuals = egui::Visuals::dark();
     visuals.dark_mode = true;
     visuals.override_text_color = Some(palette::TEXT_PRIMARY);
     visuals.panel_fill = palette::BG_CANVAS;
-    visuals.window_fill = palette::BG_SURFACE;
-    visuals.faint_bg_color = palette::BG_TRENCH;
-    visuals.extreme_bg_color = palette::BG_TRENCH;
-    visuals.code_bg_color = palette::BG_TRENCH;
+    visuals.window_fill = palette::BG_PANEL;
+    visuals.faint_bg_color = palette::BG_CANVAS;
+    visuals.extreme_bg_color = palette::BG_RAISED;
+    visuals.code_bg_color = palette::BG_RAISED;
 
     visuals.window_rounding = Rounding::same(metrics::RADIUS_CARD);
-    visuals.menu_rounding = Rounding::same(metrics::RADIUS_WIDGET);
-    visuals.window_stroke = Stroke::new(1.0_f32, palette::BORDER_SUBTLE);
+    visuals.menu_rounding = Rounding::same(metrics::RADIUS_BUTTON);
+    visuals.window_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG);
 
     // Non-interactive surfaces (frames, labels, separators)
-    visuals.widgets.noninteractive.bg_fill = palette::BG_SURFACE;
-    visuals.widgets.noninteractive.weak_bg_fill = palette::BG_SURFACE;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, palette::BORDER_SUBTLE);
+    visuals.widgets.noninteractive.bg_fill = palette::BG_PANEL;
+    visuals.widgets.noninteractive.weak_bg_fill = palette::BG_PANEL;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, palette::LINE);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_SECONDARY);
-    visuals.widgets.noninteractive.rounding = Rounding::same(metrics::RADIUS_WIDGET);
+    visuals.widgets.noninteractive.rounding = Rounding::same(metrics::RADIUS_SELECT);
 
-    // Inactive interactive widgets (buttons, combo boxes, text inputs, sliders)
-    visuals.widgets.inactive.bg_fill = palette::BG_ELEVATED;
-    visuals.widgets.inactive.weak_bg_fill = palette::BG_ELEVATED;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, palette::BORDER_WIDGET);
+    // Inactive interactive widgets (selects, secondary buttons, text inputs)
+    visuals.widgets.inactive.bg_fill = palette::BG_RAISED;
+    visuals.widgets.inactive.weak_bg_fill = palette::BG_RAISED;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, palette::LINE);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
-    visuals.widgets.inactive.rounding = Rounding::same(metrics::RADIUS_WIDGET);
+    visuals.widgets.inactive.rounding = Rounding::same(metrics::RADIUS_SELECT);
 
     // Hovered widgets
-    visuals.widgets.hovered.bg_fill = palette::BG_ACTIVE;
-    visuals.widgets.hovered.weak_bg_fill = palette::BG_ACTIVE;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, palette::ACCENT_MINT);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
-    visuals.widgets.hovered.rounding = Rounding::same(metrics::RADIUS_WIDGET);
+    visuals.widgets.hovered.bg_fill = palette::BG_HOVER;
+    visuals.widgets.hovered.weak_bg_fill = palette::BG_HOVER;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.2_f32, palette::TEXT_PRIMARY);
+    visuals.widgets.hovered.rounding = Rounding::same(metrics::RADIUS_SELECT);
 
     // Active / pressed widgets
-    visuals.widgets.active.bg_fill = palette::ACCENT_MINT_DIM;
-    visuals.widgets.active.weak_bg_fill = palette::ACCENT_MINT_DIM;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, palette::ACCENT_MINT);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
-    visuals.widgets.active.rounding = Rounding::same(metrics::RADIUS_WIDGET);
+    visuals.widgets.active.bg_fill = palette::BG_HOVER;
+    visuals.widgets.active.weak_bg_fill = palette::BG_HOVER;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.2_f32, palette::TEXT_PRIMARY);
+    visuals.widgets.active.rounding = Rounding::same(metrics::RADIUS_SELECT);
 
-    // Open combo box / menu state
-    visuals.widgets.open.bg_fill = palette::BG_ACTIVE;
-    visuals.widgets.open.weak_bg_fill = palette::BG_ACTIVE;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, palette::ACCENT_CYAN);
-    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
-    visuals.widgets.open.rounding = Rounding::same(metrics::RADIUS_WIDGET);
+    // Open combo box / popup state
+    visuals.widgets.open.bg_fill = palette::BG_HOVER;
+    visuals.widgets.open.weak_bg_fill = palette::BG_HOVER;
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, palette::LINE_STRONG);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
+    visuals.widgets.open.rounding = Rounding::same(metrics::RADIUS_SELECT);
 
     // Selection highlight
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0, 212, 170, 55);
-    visuals.selection.stroke = Stroke::new(1.0_f32, palette::ACCENT_MINT);
+    visuals.selection.bg_fill = palette::ACCENT_TINT;
+    visuals.selection.stroke = Stroke::new(1.0_f32, palette::ACCENT);
 
     style.visuals = visuals;
     ctx.set_style(style);
 }
 
-/// Construct a styled studio card `egui::Frame`, optionally tinted when a stream is live.
-pub fn studio_card_frame(is_active: bool, active_border: Color32) -> egui::Frame {
-    let border_color = if is_active {
-        active_border
-    } else {
-        palette::BORDER_SUBTLE
-    };
-    let width: f32 = if is_active { 1.5 } else { 1.0 };
+/// Construct a Quiet Graphite card frame (`#151517`, radius `14px`, `1px` hairline border).
+/// Never uses neon borders on active cards; active status is communicated via `.chip.live`.
+pub fn studio_card_frame(_is_active: bool, _active_border: Color32) -> egui::Frame {
     egui::Frame::none()
-        .fill(palette::BG_SURFACE)
-        .stroke(Stroke::new(width, border_color))
+        .fill(palette::BG_PANEL)
+        .stroke(Stroke::new(1.0_f32, palette::LINE))
         .rounding(Rounding::same(metrics::RADIUS_CARD))
-        .inner_margin(Margin::same(metrics::SPACE_LG))
+        .inner_margin(Margin::same(0.0))
 }
 
-/// Construct a recessed sub-panel frame (for telemetry dashboards, peer lists, etc.).
+/// Construct a padded Quiet Graphite card frame when internal full-bleed hairlines are not needed.
+pub fn padded_card_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(palette::BG_PANEL)
+        .stroke(Stroke::new(1.0_f32, palette::LINE))
+        .rounding(Rounding::same(metrics::RADIUS_CARD))
+        .inner_margin(Margin::symmetric(
+            metrics::CARD_PADDING_X,
+            metrics::CARD_PADDING_Y,
+        ))
+}
+
+/// Construct a subtle raised row or well frame.
 pub fn trench_frame() -> egui::Frame {
     egui::Frame::none()
-        .fill(palette::BG_TRENCH)
-        .stroke(Stroke::new(1.0_f32, palette::BORDER_SUBTLE))
+        .fill(palette::BG_RAISED)
+        .stroke(Stroke::new(1.0_f32, palette::LINE))
         .rounding(Rounding::same(metrics::RADIUS_WIDGET))
         .inner_margin(Margin::symmetric(12.0, 10.0))
 }
@@ -323,4 +355,3 @@ mod tests {
         });
     }
 }
-
