@@ -1559,6 +1559,256 @@ pub fn quiet_mono_input_pill(ui: &mut Ui, id_salt: &str, text: &mut String) {
     });
 }
 
+/// Interaction result of `quiet_mono_combo_pill`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ComboInputOutcome {
+    /// True if the user typed or modified the text input directly.
+    pub edited_manually: bool,
+    /// Index of the dropdown option selected, if any.
+    pub selected_option_idx: Option<usize>,
+    /// True if the user opened the dropdown or clicked the rescan item.
+    pub request_rescan: bool,
+}
+
+/// Render a Quiet Graphite hybrid manual input + dropdown selector pill for target addresses.
+/// Supports both typing any `IP:port` manually on the left and clicking `⌄` on the right to
+/// pick from auto-discovered LAN peers.
+pub fn quiet_mono_combo_pill(
+    ui: &mut Ui,
+    id_salt: &str,
+    text: &mut String,
+    options: &[(String, String, bool)],
+    rescan_label: &str,
+    empty_hint: &str,
+) -> ComboInputOutcome {
+    let mut outcome = ComboInputOutcome::default();
+    let font = FontId::new(12.0, FontFamily::Monospace);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.clone(), font.clone(), palette::TEXT_PRIMARY());
+    let btn_w = 28.0;
+    let pill_w = (galley.size().x + 34.0 + btn_w).clamp(172.0, 256.0);
+    let pill_h = 30.0;
+
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(pill_w, pill_h), Sense::hover());
+    let drop_rect = Rect::from_min_max(Pos2::new(rect.max.x - btn_w, rect.min.y), rect.max);
+    let drop_resp = ui.interact(
+        drop_rect,
+        ui.id().with((id_salt, "combo_drop_btn")),
+        Sense::click(),
+    );
+    if drop_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let popup_id = ui.make_persistent_id((id_salt, "combo_popup"));
+    if drop_resp.clicked() {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+        outcome.request_rescan = true;
+    }
+
+    let has_remote_peers = options.iter().any(|(_, _, is_remote)| *is_remote);
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        p.rect(
+            rect,
+            Rounding::same(metrics::RADIUS_SELECT),
+            palette::BG_RAISED(),
+            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
+        );
+        if drop_resp.hovered() {
+            p.rect_filled(
+                drop_rect.shrink(1.0),
+                Rounding {
+                     nw: 0.0,
+                     sw: 0.0,
+                     ne: metrics::RADIUS_SELECT - 1.0,
+                     se: metrics::RADIUS_SELECT - 1.0,
+                },
+                palette::BG_HOVER(),
+            );
+        }
+        // Vertical separator between manual input and dropdown button
+        p.line_segment(
+            [
+                Pos2::new(drop_rect.min.x, rect.min.y + 5.0),
+                Pos2::new(drop_rect.min.x, rect.max.y - 5.0),
+            ],
+            Stroke::new(1.0_f32, palette::LINE()),
+        );
+        // Chevron `⌄`
+        let cx = drop_rect.center().x;
+        let cy = drop_rect.center().y;
+        let chev_col = if drop_resp.hovered() {
+            palette::TEXT_PRIMARY()
+        } else {
+            palette::TEXT_MUTED()
+        };
+        let chev_stroke = Stroke::new(1.5_f32, chev_col);
+        p.line_segment(
+            [Pos2::new(cx - 3.5, cy - 1.5), Pos2::new(cx, cy + 2.0)],
+            chev_stroke,
+        );
+        p.line_segment(
+            [Pos2::new(cx, cy + 2.0), Pos2::new(cx + 3.5, cy - 1.5)],
+            chev_stroke,
+        );
+        if has_remote_peers {
+            p.circle_filled(
+                Pos2::new(drop_rect.max.x - 5.5, drop_rect.min.y + 5.5),
+                2.5,
+                palette::ACCENT(),
+            );
+        }
+    }
+
+    let text_rect = Rect::from_min_max(
+        Pos2::new(rect.min.x + 10.0, rect.min.y + 4.0),
+        Pos2::new(drop_rect.min.x - 6.0, rect.max.y - 4.0),
+    );
+    let mut child_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(text_rect)
+            .layout(egui::Layout::left_to_right(Align::Center)),
+    );
+    child_ui.push_id(id_salt, |ui| {
+        let resp = ui.add(
+            egui::TextEdit::singleline(text)
+                .frame(false)
+                .clip_text(true)
+                .font(font)
+                .text_color(palette::TEXT_PRIMARY())
+                .desired_width(text_rect.width()),
+        );
+        if resp.changed() {
+            outcome.edited_manually = true;
+        }
+    });
+
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &drop_resp,
+        egui::PopupCloseBehavior::CloseOnClick,
+        |ui| {
+            ui.set_min_width(pill_w.max(236.0));
+            if !has_remote_peers && !empty_hint.is_empty() {
+                ui.label(
+                    RichText::new(empty_hint)
+                        .size(11.5)
+                        .color(palette::TEXT_MUTED()),
+                );
+                ui.separator();
+            }
+            for (idx, (addr_val, display_label, is_remote)) in options.iter().enumerate() {
+                let is_sel = text.trim() == addr_val;
+                let prefix = if *is_remote { "● " } else { "○ " };
+                let r = ui.selectable_label(
+                    is_sel,
+                    RichText::new(format!("{prefix}{display_label}"))
+                        .size(12.0)
+                        .color(if is_sel || *is_remote {
+                            palette::ACCENT()
+                        } else {
+                            palette::TEXT_PRIMARY()
+                        }),
+                );
+                if r.clicked() {
+                    *text = addr_val.clone();
+                    outcome.selected_option_idx = Some(idx);
+                }
+            }
+            ui.separator();
+            if ui
+                .selectable_label(
+                    false,
+                    RichText::new(rescan_label)
+                        .size(12.0)
+                        .color(palette::TEXT_SECONDARY()),
+                )
+                .clicked()
+            {
+                outcome.request_rescan = true;
+            }
+        },
+    );
+
+    outcome
+}
+
+/// Render a Quiet Graphite source-address badge pill for the Receiver card.
+pub fn quiet_source_addr_pill(
+    ui: &mut Ui,
+    text: &str,
+    active: bool,
+    hover_hint: Option<&str>,
+) -> bool {
+    let font = if active {
+        FontId::new(12.0, FontFamily::Monospace)
+    } else {
+        FontId::new(12.0, FontFamily::Proportional)
+    };
+    let fg = if active {
+        palette::ACCENT()
+    } else {
+        palette::TEXT_MUTED()
+    };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), fg);
+    let dot_space = if active { 14.0 } else { 0.0 };
+    let pill_w = (galley.size().x + 24.0 + dot_space).clamp(136.0, 260.0);
+    let pill_h = 30.0;
+
+    let sense = if active { Sense::click() } else { Sense::hover() };
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(pill_w, pill_h), sense);
+    if active && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let bg = if active {
+            if resp.hovered() {
+                palette::BG_HOVER()
+            } else {
+                palette::ACCENT_TINT()
+            }
+        } else {
+            palette::BG_RAISED()
+        };
+        let border = if active {
+            palette::ACCENT().gamma_multiply(0.35)
+        } else {
+            palette::INSET_HIGHLIGHT()
+        };
+        p.rect(
+            rect,
+            Rounding::same(metrics::RADIUS_SELECT),
+            bg,
+            Stroke::new(1.0_f32, border),
+        );
+        let mut x = rect.min.x + 12.0;
+        if active {
+            p.circle_filled(Pos2::new(x + 3.0, rect.center().y), 3.0, palette::ACCENT());
+            x += 12.0;
+        }
+        p.text(
+            Pos2::new(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            font,
+            fg,
+        );
+    }
+
+    if let Some(hint) = hover_hint {
+        if active {
+            resp = resp.on_hover_text(hint);
+        }
+    }
+    active && resp.clicked()
+}
+
 /// Render a single `.set .row` setting line (`52px` high, label on left, right-aligned control, optional bottom hairline).
 pub fn settings_row(
     ui: &mut Ui,

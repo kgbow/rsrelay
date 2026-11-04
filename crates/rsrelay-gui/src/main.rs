@@ -17,11 +17,11 @@ use eframe::egui::{
     self, Align, Color32, FontFamily, FontId, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2,
 };
 use rsrelay_core::{
-    detect_local_lan_ip, has_system_loopback_permission, list_audio_devices,
-    request_system_loopback_permission, AudioDeviceInfo, CaptureSource, ChannelLayout,
-    DiscoveredPeer, DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig,
-    LatencyProfile, ReceiverSession, ReceiverSessionConfig, SenderSession, SenderSessionConfig,
-    DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT,
+    detect_all_local_ipv4s, detect_local_lan_ip, has_system_loopback_permission,
+    list_audio_devices, request_system_loopback_permission, AudioDeviceInfo, CaptureSource,
+    ChannelLayout, DiscoveredPeer, DiscoveryService, DuplexRole, DuplexSession,
+    DuplexSessionConfig, LatencyProfile, ReceiverSession, ReceiverSessionConfig, SenderSession,
+    SenderSessionConfig, DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT,
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
@@ -34,9 +34,9 @@ use crate::widgets::{
     draw_card_icon_tile, draw_hairline, draw_mono_gate_vu_meter, draw_sparkline, draw_stats_row_3,
     draw_stereo_vu_meter, draw_tx_waveform_chart, draw_vector_icon, format_gain_db,
     format_with_commas, ghost_stop_all_button, header_action_button, latency_profile_selector,
-    linear_to_dbfs, pill_toggle, quiet_mono_input_pill, quiet_select_pill, quiet_slider_f32,
-    quiet_slider_u16, segmented_control, settings_row, status_chip, IconKind, SparklineBuffer,
-    VuMeterState,
+    linear_to_dbfs, pill_toggle, quiet_mono_combo_pill, quiet_mono_input_pill, quiet_select_pill,
+    quiet_slider_f32, quiet_slider_u16, quiet_source_addr_pill, segmented_control, settings_row,
+    status_chip, IconKind, SparklineBuffer, VuMeterState,
 };
 
 /// Top-level workspace navigation modes.
@@ -477,6 +477,29 @@ fn split_host_port(input: &str, default_port: u16) -> (String, String) {
     }
 }
 
+fn parse_socket_addr_flexible(
+    input: &str,
+    default_ip: IpAddr,
+    default_port: u16,
+) -> Result<SocketAddr, std::net::AddrParseError> {
+    let trimmed = input.trim();
+    if let Ok(sa) = trimmed.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, default_port));
+    }
+    if let Some(port_str) = trimmed.strip_prefix(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return Ok(SocketAddr::new(default_ip, port));
+        }
+    }
+    if let Ok(port) = trimmed.parse::<u16>() {
+        return Ok(SocketAddr::new(default_ip, port));
+    }
+    trimmed.parse::<SocketAddr>()
+}
+
 pub struct RsRelayGuiApp {
     pub lang: Language,
     pub theme_mode: ThemeMode,
@@ -490,6 +513,9 @@ pub struct RsRelayGuiApp {
     polling_devices: Arc<AtomicBool>,
     pub discovered_peers: Arc<Mutex<Vec<DiscoveredPeer>>>,
     pub scanning_lan: Arc<AtomicBool>,
+    pub target_addr_manually_edited: bool,
+    last_lan_scan: Instant,
+    lan_advertiser: Option<DiscoveryService>,
 
     // Sender controls
     pub target_addr_input: String,
@@ -559,7 +585,16 @@ impl RsRelayGuiApp {
         let local_lan_ip = detect_local_lan_ip();
         let sck_permission_granted = has_system_loopback_permission();
 
-        Ok(Self {
+        let lan_advertiser = if enable_tray {
+            DiscoveryService::new().ok().map(|mut svc| {
+                let _ = svc.advertise("rsrelay-desktop", DEFAULT_AUDIO_UDP_PORT);
+                svc
+            })
+        } else {
+            None
+        };
+
+        let mut app = Self {
             lang,
             theme_mode: ThemeMode::System,
             active_tab: WorkspaceTab::DualConsole,
@@ -571,6 +606,9 @@ impl RsRelayGuiApp {
             polling_devices: Arc::new(AtomicBool::new(false)),
             discovered_peers: Arc::new(Mutex::new(Vec::new())),
             scanning_lan: Arc::new(AtomicBool::new(false)),
+            target_addr_manually_edited: false,
+            last_lan_scan: Instant::now(),
+            lan_advertiser,
             target_addr_input: format!("127.0.0.1:{DEFAULT_AUDIO_UDP_PORT}"),
             selected_source: CaptureSource::SystemLoopback,
             selected_tx_device: None,
@@ -612,7 +650,13 @@ impl RsRelayGuiApp {
             pending_restore_focus: false,
             quit_requested: false,
             tray,
-        })
+        };
+
+        if enable_tray {
+            app.trigger_lan_scan_internal(false);
+        }
+
+        Ok(app)
     }
 
     pub fn set_language(&mut self, lang: Language) {
@@ -771,25 +815,139 @@ impl RsRelayGuiApp {
         }
     }
 
+    fn current_configured_rx_port(&self) -> u16 {
+        parse_socket_addr_flexible(
+            &self.bind_addr_input,
+            IpAddr::from([0, 0, 0, 0]),
+            DEFAULT_AUDIO_UDP_PORT,
+        )
+        .map(|sa| sa.port())
+        .unwrap_or(DEFAULT_AUDIO_UDP_PORT)
+    }
+
+    fn sync_lan_advertiser(&mut self) {
+        let port = self.current_configured_rx_port();
+        if self.advertise_mdns {
+            if let Some(ref svc) = self.lan_advertiser {
+                svc.set_advertised_port(port);
+            } else if let Ok(mut svc) = DiscoveryService::new() {
+                let _ = svc.advertise("rsrelay-desktop", port);
+                self.lan_advertiser = Some(svc);
+            }
+        } else {
+            self.lan_advertiser = None;
+        }
+    }
+
     pub fn trigger_lan_scan(&mut self) {
+        self.trigger_lan_scan_internal(true);
+    }
+
+    fn trigger_lan_scan_internal(&mut self, manual: bool) {
         if self.scanning_lan.load(Ordering::Relaxed) {
             return;
         }
+        self.last_lan_scan = Instant::now();
         self.scanning_lan.store(true, Ordering::Relaxed);
-        self.last_status_msg = self.lang.status_scanning_lan();
+        if manual {
+            self.last_status_msg = self.lang.status_scanning_lan();
+        }
         let peers_arc = Arc::clone(&self.discovered_peers);
         let scanning_flag = Arc::clone(&self.scanning_lan);
 
         thread::spawn(move || {
+            let local_ips: Vec<IpAddr> = detect_all_local_ipv4s()
+                .into_iter()
+                .map(IpAddr::V4)
+                .collect();
             if let Ok(svc) = DiscoveryService::new() {
-                if let Ok(found) = svc.scan(Duration::from_millis(1500)) {
+                if let Ok(found) = svc.scan(Duration::from_millis(900)) {
+                    let remote_peers: Vec<DiscoveredPeer> = found
+                        .into_iter()
+                        .filter_map(|mut p| {
+                            p.addresses
+                                .retain(|ip| !ip.is_loopback() && !local_ips.contains(ip));
+                            if p.addresses.is_empty() {
+                                None
+                            } else {
+                                Some(p)
+                            }
+                        })
+                        .collect();
                     if let Ok(mut guard) = peers_arc.lock() {
-                        *guard = found;
+                        *guard = remote_peers;
                     }
                 }
             }
             scanning_flag.store(false, Ordering::Relaxed);
         });
+    }
+
+    fn apply_auto_discovered_target(&mut self) {
+        if self.demo_mode
+            || self.target_addr_manually_edited
+            || self.active_sender.is_some()
+            || self.active_duplex.is_some()
+        {
+            return;
+        }
+        let trimmed = self.target_addr_input.trim();
+        let is_default_loopback = trimmed.is_empty()
+            || trimmed.starts_with("127.0.0.1")
+            || trimmed.starts_with("localhost");
+        if !is_default_loopback {
+            return;
+        }
+
+        let first_remote = self.discovered_peers.lock().ok().and_then(|guard| {
+            guard.iter().find_map(|p| {
+                let ip = p.addresses.first()?;
+                Some((p.hostname.clone(), *ip, p.udp_port))
+            })
+        });
+
+        if let Some((hostname, ip, port)) = first_remote {
+            let addr_str = format!("{ip}:{port}");
+            self.target_addr_input = addr_str.clone();
+            self.duplex_peer_ip_input = ip.to_string();
+            self.last_status_msg = self.lang.status_auto_discovered_peer(&hostname, &addr_str);
+        }
+    }
+
+    fn build_target_combo_options(&self) -> Vec<(String, String, bool)> {
+        let t = self.lang.texts();
+        let mut opts: Vec<(String, String, bool)> = Vec::new();
+
+        if let Ok(guard) = self.discovered_peers.lock() {
+            for peer in guard.iter() {
+                for ip in &peer.addresses {
+                    if ip.is_ipv4() {
+                        let addr_val = format!("{ip}:{}", peer.udp_port);
+                        if !opts.iter().any(|(a, _, _)| a == &addr_val) {
+                            let label = format!("{} · {addr_val} ({})", peer.hostname, peer.os);
+                            opts.push((addr_val, label, true));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(lan_ip) = self.local_lan_ip {
+            let rx_port = self.current_configured_rx_port();
+            let addr_val = format!("{lan_ip}:{rx_port}");
+            if !opts.iter().any(|(a, _, _)| a == &addr_val) {
+                let label = format!("{} · {addr_val}", t.combo_local_lan);
+                opts.push((addr_val, label, false));
+            }
+        }
+
+        let lo_addr = format!("127.0.0.1:{DEFAULT_AUDIO_UDP_PORT}");
+        if !opts.iter().any(|(a, _, _)| a == &lo_addr) {
+            let label = format!("{} · {lo_addr}", t.combo_local_loopback);
+            opts.push((lo_addr, label, false));
+        }
+
+        opts
     }
 
     pub fn stop_all_streams(&mut self) {
@@ -818,8 +976,15 @@ impl RsRelayGuiApp {
         self.active_duplex = None;
         self.duplex_started_at = None;
 
-        let target_addr: SocketAddr = match self.target_addr_input.trim().parse() {
-            Ok(addr) => addr,
+        let target_addr: SocketAddr = match parse_socket_addr_flexible(
+            &self.target_addr_input,
+            IpAddr::from([127, 0, 0, 1]),
+            DEFAULT_AUDIO_UDP_PORT,
+        ) {
+            Ok(addr) => {
+                self.target_addr_input = addr.to_string();
+                addr
+            }
             Err(e) => {
                 self.last_status_msg = self.lang.status_invalid_target_addr(&e);
                 return;
@@ -870,13 +1035,22 @@ impl RsRelayGuiApp {
         self.active_duplex = None;
         self.duplex_started_at = None;
 
-        let bind_addr: SocketAddr = match self.bind_addr_input.trim().parse() {
-            Ok(addr) => addr,
+        let bind_addr: SocketAddr = match parse_socket_addr_flexible(
+            &self.bind_addr_input,
+            IpAddr::from([0, 0, 0, 0]),
+            DEFAULT_AUDIO_UDP_PORT,
+        ) {
+            Ok(addr) => {
+                self.bind_addr_input = addr.to_string();
+                addr
+            }
             Err(e) => {
                 self.last_status_msg = self.lang.status_invalid_bind_addr(&e);
                 return;
             }
         };
+
+        self.sync_lan_advertiser();
 
         let cfg = ReceiverSessionConfig {
             bind_addr,
@@ -884,7 +1058,8 @@ impl RsRelayGuiApp {
             channels: ChannelLayout::Stereo,
             target_buffer_ms: self.target_buffer_ms,
             initial_volume: self.volume,
-            advertise_mdns: self.advertise_mdns,
+            // Background `lan_advertiser` already advertises this GUI instance when enabled
+            advertise_mdns: self.advertise_mdns && self.lan_advertiser.is_none(),
             node_name: "rsrelay-desktop".to_string(),
         };
 
@@ -921,8 +1096,16 @@ impl RsRelayGuiApp {
         self.tx_started_at = None;
         self.rx_started_at = None;
 
-        let peer_ip: IpAddr = match self.duplex_peer_ip_input.trim().parse() {
-            Ok(ip) => ip,
+        let trimmed_peer = self.duplex_peer_ip_input.trim();
+        let peer_ip_res: Result<IpAddr, std::net::AddrParseError> = trimmed_peer
+            .parse::<IpAddr>()
+            .or_else(|_| trimmed_peer.parse::<SocketAddr>().map(|sa| sa.ip()));
+
+        let peer_ip: IpAddr = match peer_ip_res {
+            Ok(ip) => {
+                self.duplex_peer_ip_input = ip.to_string();
+                ip
+            }
             Err(e) => {
                 self.last_status_msg = self.lang.status_invalid_peer_ip(&e);
                 return;
@@ -937,6 +1120,7 @@ impl RsRelayGuiApp {
         cfg.profile = self.selected_profile;
         cfg.mic_noise_gate_db = Some(self.duplex_gate_db);
         cfg.initial_volume = self.volume;
+        cfg.advertise_mdns = self.advertise_mdns && self.lan_advertiser.is_none();
 
         match DuplexSession::start(cfg) {
             Ok(session) => {
@@ -1595,6 +1779,7 @@ impl RsRelayGuiApp {
                     ) {
                         self.target_addr_input = format!("{lan_str}:{DEFAULT_AUDIO_UDP_PORT}");
                         self.duplex_peer_ip_input = lan_str;
+                        self.target_addr_manually_edited = true;
                     }
                 }
             }
@@ -1626,6 +1811,7 @@ impl RsRelayGuiApp {
                 ) {
                     self.target_addr_input = addr_str.clone();
                     self.duplex_peer_ip_input = ip_str;
+                    self.target_addr_manually_edited = true;
                     self.last_status_msg =
                         self.lang.status_selected_lan_peer(&peer.hostname, &addr_str);
                 }
@@ -1984,9 +2170,39 @@ impl RsRelayGuiApp {
                     }
                 });
 
+                let target_combo_opts = self.build_target_combo_options();
+                let mut combo_outcome = crate::widgets::ComboInputOutcome::default();
                 settings_row(ui, t.label_target_addr, true, |ui| {
-                    quiet_mono_input_pill(ui, "c_target_addr_input", &mut self.target_addr_input);
+                    combo_outcome = quiet_mono_combo_pill(
+                        ui,
+                        "c_target_addr_input",
+                        &mut self.target_addr_input,
+                        &target_combo_opts,
+                        t.combo_scan_lan,
+                        t.combo_no_lan_peers,
+                    );
                 });
+                if combo_outcome.edited_manually {
+                    self.target_addr_manually_edited = true;
+                    let (host, _) =
+                        split_host_port(&self.target_addr_input, DEFAULT_AUDIO_UDP_PORT);
+                    if !host.is_empty() && host != "—" {
+                        self.duplex_peer_ip_input = host;
+                    }
+                }
+                if let Some(idx) = combo_outcome.selected_option_idx {
+                    self.target_addr_manually_edited = true;
+                    if let Some((addr_val, label, _)) = target_combo_opts.get(idx) {
+                        let (host, _) = split_host_port(addr_val, DEFAULT_AUDIO_UDP_PORT);
+                        self.duplex_peer_ip_input = host;
+                        let peer_name = label.split(" · ").next().unwrap_or(addr_val);
+                        self.last_status_msg =
+                            lang.status_selected_lan_peer(peer_name, addr_val);
+                    }
+                }
+                if combo_outcome.request_rescan {
+                    self.trigger_lan_scan();
+                }
 
                 settings_row(ui, t.label_quality_latency, false, |ui| {
                     latency_profile_selector(ui, &mut self.selected_profile, lang);
@@ -1997,6 +2213,10 @@ impl RsRelayGuiApp {
             // RIGHT CARD: 接收 (Receiver)
             // =================================================================
             let rx_running = self.active_receiver.is_some();
+            let rx_source_addr = self
+                .active_receiver
+                .as_ref()
+                .and_then(|r| r.status().net.source_addr);
             theme::studio_card_frame(rx_running, palette::ACCENT()).show(&mut columns[1], |ui| {
                 // 1. Card Header (`.ch`)
                 egui::Frame::none()
@@ -2046,6 +2266,35 @@ impl RsRelayGuiApp {
                     .or_else(|| self.selected_rx_device.clone())
                     .unwrap_or_else(|| t.device_default_speaker.to_string());
 
+                let (hero_caption, hero_caption_active, hero_host, hero_port) =
+                    if let Some(src_addr) = rx_source_addr {
+                        let src_ip_str = src_addr.ip().to_string();
+                        let src_peer_name = self.resolve_peer_name(&src_ip_str);
+                        (
+                            format!(
+                                "{} · {src_peer_name} ({rx_host}{rx_port})",
+                                t.hero_receiving_from
+                            ),
+                            true,
+                            src_ip_str,
+                            format!(":{}", src_addr.port()),
+                        )
+                    } else if rx_running {
+                        (
+                            t.hero_listen_waiting.to_string(),
+                            false,
+                            rx_host.clone(),
+                            rx_port.clone(),
+                        )
+                    } else {
+                        (
+                            t.hero_listen_any.to_string(),
+                            false,
+                            rx_host.clone(),
+                            rx_port.clone(),
+                        )
+                    };
+
                 egui::Frame::none()
                     .inner_margin(egui::Margin {
                         left: 20.0,
@@ -2057,14 +2306,18 @@ impl RsRelayGuiApp {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 6.0;
                             ui.label(
-                                RichText::new(t.hero_listen_any)
+                                RichText::new(&hero_caption)
                                     .size(11.5)
-                                    .color(palette::TEXT_MUTED()),
+                                    .color(if hero_caption_active {
+                                        palette::ACCENT()
+                                    } else {
+                                        palette::TEXT_MUTED()
+                                    }),
                             );
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
                                 ui.label(
-                                    RichText::new(&rx_host)
+                                    RichText::new(&hero_host)
                                         .size(29.0)
                                         .family(FontFamily::Monospace)
                                         .color(if rx_running {
@@ -2074,7 +2327,7 @@ impl RsRelayGuiApp {
                                         }),
                                 );
                                 ui.label(
-                                    RichText::new(&rx_port)
+                                    RichText::new(&hero_port)
                                         .size(29.0)
                                         .family(FontFamily::Monospace)
                                         .color(palette::TEXT_MUTED()),
@@ -2161,10 +2414,46 @@ impl RsRelayGuiApp {
                     palette::ACCENT(),
                 );
 
-                // 6. Settings List (`.set`, 4 hairline rows)
+                // 6. Settings List (`.set`)
+                let (source_pill_text, source_pill_active) = if let Some(src_addr) = rx_source_addr {
+                    let src_ip_str = src_addr.ip().to_string();
+                    let src_peer_name = self.resolve_peer_name(&src_ip_str);
+                    (format!("{src_peer_name} · {src_addr}"), true)
+                } else {
+                    (t.source_waiting_any.to_string(), false)
+                };
+                let mut clicked_source_pill = false;
+                settings_row(ui, t.label_source_addr, true, |ui| {
+                    if quiet_source_addr_pill(
+                        ui,
+                        &source_pill_text,
+                        source_pill_active,
+                        Some(t.source_addr_hover),
+                    ) {
+                        clicked_source_pill = true;
+                    }
+                });
+                if clicked_source_pill {
+                    if let Some(src_addr) = rx_source_addr {
+                        let src_ip = src_addr.ip().to_string();
+                        ui.ctx().copy_text(src_addr.to_string());
+                        let peer_name = self.resolve_peer_name(&src_ip);
+                        let target_str = format!("{src_ip}:{DEFAULT_AUDIO_UDP_PORT}");
+                        self.target_addr_input = target_str.clone();
+                        self.duplex_peer_ip_input = src_ip;
+                        self.target_addr_manually_edited = true;
+                        self.last_status_msg =
+                            lang.status_selected_lan_peer(&peer_name, &target_str);
+                    }
+                }
+
+                let prev_bind = self.bind_addr_input.clone();
                 settings_row(ui, t.label_listen_port, true, |ui| {
                     quiet_mono_input_pill(ui, "c_bind_addr_input", &mut self.bind_addr_input);
                 });
+                if self.bind_addr_input != prev_bind {
+                    self.sync_lan_advertiser();
+                }
 
                 let mut rx_dev_opts = vec![(None, t.device_default_speaker.to_string())];
                 for dev in &self.devices {
@@ -2345,25 +2634,70 @@ impl RsRelayGuiApp {
                         if sub_resp.clicked() {
                             ui.memory_mut(|mem| mem.toggle_popup(ip_popup_id));
                         }
+                        let c2_combo_opts = self.build_target_combo_options();
+                        let mut c2_selected_addr: Option<(String, String)> = None;
+                        let mut c2_edited_manually = false;
+                        let mut c2_rescan = false;
                         egui::popup_below_widget(
                             ui,
                             ip_popup_id,
                             &sub_resp,
                             egui::PopupCloseBehavior::CloseOnClickOutside,
                             |ui| {
-                                ui.set_min_width(180.0);
+                                ui.set_min_width(240.0);
                                 ui.label(
                                     RichText::new(t.label_target_addr)
                                         .size(11.0)
                                         .color(palette::TEXT_MUTED()),
                                 );
+                                let prev_peer_ip = self.duplex_peer_ip_input.clone();
                                 quiet_mono_input_pill(
                                     ui,
                                     "c2_peer_ip_edit",
                                     &mut self.duplex_peer_ip_input,
                                 );
+                                if self.duplex_peer_ip_input != prev_peer_ip {
+                                    c2_edited_manually = true;
+                                }
+                                ui.add_space(4.0);
+                                ui.separator();
+                                for (addr_val, display_label, _is_lan) in &c2_combo_opts {
+                                    let (host, _) =
+                                        split_host_port(addr_val, DEFAULT_AUDIO_UDP_PORT);
+                                    let selected = self.duplex_peer_ip_input.trim() == host;
+                                    if ui.selectable_label(selected, display_label).clicked() {
+                                        c2_selected_addr =
+                                            Some((addr_val.clone(), display_label.clone()));
+                                        ui.memory_mut(|mem| mem.close_popup());
+                                    }
+                                }
+                                ui.separator();
+                                if ui.selectable_label(false, t.combo_scan_lan).clicked() {
+                                    c2_rescan = true;
+                                    ui.memory_mut(|mem| mem.close_popup());
+                                }
                             },
                         );
+                        if c2_edited_manually {
+                            self.target_addr_manually_edited = true;
+                            let host = self.duplex_peer_ip_input.trim();
+                            if !host.is_empty() {
+                                self.target_addr_input =
+                                    format!("{host}:{}", self.duplex_downlink_port);
+                            }
+                        }
+                        if let Some((addr_val, label)) = c2_selected_addr {
+                            self.target_addr_manually_edited = true;
+                            let (host, _) = split_host_port(&addr_val, DEFAULT_AUDIO_UDP_PORT);
+                            self.duplex_peer_ip_input = host;
+                            self.target_addr_input = addr_val.clone();
+                            let peer_label = label.split(" · ").next().unwrap_or(&addr_val);
+                            self.last_status_msg =
+                                lang.status_selected_lan_peer(peer_label, &addr_val);
+                        }
+                        if c2_rescan {
+                            self.trigger_lan_scan();
+                        }
                     });
 
                     // Vertical Divider `.vr`
@@ -2489,8 +2823,17 @@ impl RsRelayGuiApp {
                                         .color(palette::TEXT_PRIMARY())
                                         .strong(),
                                 );
+                                let listen_sub = if let Some(src_addr) =
+                                    st_opt.as_ref().and_then(|st| st.rx.net.source_addr)
+                                {
+                                    let src_ip = src_addr.ip().to_string();
+                                    let src_peer = self.resolve_peer_name(&src_ip);
+                                    format!("{} · {src_peer} ({src_addr})", t.c2_listen_subtitle)
+                                } else {
+                                    t.c2_listen_subtitle.to_string()
+                                };
                                 ui.label(
-                                    RichText::new(t.c2_listen_subtitle)
+                                    RichText::new(listen_sub)
                                         .size(11.5)
                                         .color(palette::TEXT_MUTED()),
                                 );
@@ -2944,9 +3287,15 @@ impl RsRelayGuiApp {
                 }
 
                 draw_hairline(ui);
+                let mut mdns_toggled = false;
                 settings_row(ui, t.chk_advertise_mdns, false, |ui| {
-                    pill_toggle(ui, &mut self.advertise_mdns);
+                    if pill_toggle(ui, &mut self.advertise_mdns) {
+                        mdns_toggled = true;
+                    }
                 });
+                if mdns_toggled {
+                    self.sync_lan_advertiser();
+                }
             });
         });
     }
@@ -3038,7 +3387,11 @@ impl RsRelayGuiApp {
             self.last_device_poll = Instant::now();
             self.refresh_audio_devices(false);
         }
+        if !self.demo_mode && self.last_lan_scan.elapsed() >= Duration::from_secs(4) {
+            self.trigger_lan_scan_internal(false);
+        }
         self.apply_pending_device_updates();
+        self.apply_auto_discovered_target();
         self.sync_tray_status_title();
 
         match self.tray_window_state {
@@ -3426,5 +3779,54 @@ mod tests {
             app.restore_from_tray(ctx);
         });
         assert_eq!(app.tray_window_state, TrayWindowState::Visible);
+    }
+
+    #[test]
+    fn test_auto_discovered_target_and_hybrid_combo_options() {
+        let mut app = RsRelayGuiApp::new_with_tray(false).expect("init app");
+        assert_eq!(app.target_addr_input, "127.0.0.1:49153");
+        assert!(!app.target_addr_manually_edited);
+
+        if let Ok(mut guard) = app.discovered_peers.lock() {
+            guard.push(DiscoveredPeer {
+                instance_name: "rsrelay-desktop-PC110".to_string(),
+                hostname: "PC-110".to_string(),
+                addresses: vec!["192.168.3.110".parse().unwrap()],
+                udp_port: 49153,
+                version: "0.1.0".to_string(),
+                os: "windows".to_string(),
+            });
+            guard.push(DiscoveredPeer {
+                instance_name: "rsrelay-desktop-PC151".to_string(),
+                hostname: "PC-151".to_string(),
+                addresses: vec!["192.168.3.151".parse().unwrap()],
+                udp_port: 49153,
+                version: "0.1.0".to_string(),
+                os: "windows".to_string(),
+            });
+        }
+
+        // Auto-recognition fills the first discovered LAN peer when still on default loopback
+        app.apply_auto_discovered_target();
+        assert_eq!(app.target_addr_input, "192.168.3.110:49153");
+        assert_eq!(app.duplex_peer_ip_input, "192.168.3.110");
+
+        // Dropdown options include both discovered LAN peers + local options
+        let opts = app.build_target_combo_options();
+        assert!(opts
+            .iter()
+            .any(|(addr, _, is_lan)| addr == "192.168.3.110:49153" && *is_lan));
+        assert!(opts
+            .iter()
+            .any(|(addr, _, is_lan)| addr == "192.168.3.151:49153" && *is_lan));
+
+        // Flexible manual input parsing allows bare IP without port
+        let parsed = parse_socket_addr_flexible(
+            "192.168.3.151",
+            IpAddr::from([127, 0, 0, 1]),
+            DEFAULT_AUDIO_UDP_PORT,
+        )
+        .expect("parse bare IP");
+        assert_eq!(parsed.to_string(), "192.168.3.151:49153");
     }
 }

@@ -4,6 +4,9 @@ use crate::header::{ChannelLayout, CodecType, FrameDuration};
 /// mDNS-SD service type used for zero-configuration LAN discovery.
 pub const MDNS_SERVICE_TYPE: &str = "_rsrelay._udp.local.";
 
+/// Default UDP broadcast & unicast LAN discovery beacon port.
+pub const DEFAULT_DISCOVERY_UDP_PORT: u16 = 49151;
+
 /// Default TCP control port (downlink / primary stream).
 pub const DEFAULT_CONTROL_PORT: u16 = 49152;
 

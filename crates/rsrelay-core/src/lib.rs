@@ -11,8 +11,11 @@ pub use rsrelay_audio::{
     has_system_loopback_permission, list_audio_devices, request_system_loopback_permission,
     AudioDeviceInfo, CaptureSource,
 };
-pub use rsrelay_net::{detect_local_lan_ip, DiscoveredPeer, DiscoveryService};
+pub use rsrelay_net::{
+    detect_all_local_ipv4s, detect_local_lan_ip, DiscoveredPeer, DiscoveryService,
+};
 pub use rsrelay_proto::{
     ChannelLayout, CodecType, DuplexRole, FrameDuration, DEFAULT_AUDIO_UDP_PORT,
-    DEFAULT_CONTROL_PORT, DEFAULT_UPLINK_CONTROL_PORT, DEFAULT_UPLINK_UDP_PORT,
+    DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_UDP_PORT, DEFAULT_UPLINK_CONTROL_PORT,
+    DEFAULT_UPLINK_UDP_PORT,
 };

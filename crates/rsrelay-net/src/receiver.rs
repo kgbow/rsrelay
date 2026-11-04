@@ -1,7 +1,7 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -36,6 +36,7 @@ pub struct ReceiverMetrics {
     pub jitter_us: AtomicU64,
     pub buffer_level_ms_bits: AtomicU32,
     pub resample_ratio_bits: AtomicU64,
+    pub source_addr: Mutex<Option<SocketAddr>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -47,6 +48,7 @@ pub struct ReceiverSnapshot {
     pub jitter_us: u64,
     pub buffer_level_ms: f32,
     pub resample_ratio: f64,
+    pub source_addr: Option<SocketAddr>,
 }
 
 pub struct AudioReceiverWorker {
@@ -110,15 +112,25 @@ impl AudioReceiverWorker {
 
                 let base_step_us = current_frame_dur.duration_us();
                 let mut next_deadline = Instant::now() + Duration::from_micros(base_step_us);
+                let mut current_src: Option<SocketAddr> = None;
+                let mut last_packet_at: Option<Instant> = None;
 
                 while !stop_clone.load(Ordering::Relaxed) {
                     // 1. Drain all arrived UDP datagrams from the OS socket into JitterBuffer
                     loop {
                         match socket.recv_from(&mut udp_buf) {
-                            Ok((len, _src)) => {
+                            Ok((len, src)) => {
                                 if let Ok((hdr, payload)) =
                                     PacketHeader::decode_packet(&udp_buf[..len])
                                 {
+                                    last_packet_at = Some(Instant::now());
+                                    if current_src != Some(src) {
+                                        current_src = Some(src);
+                                        if let Ok(mut guard) = metrics_clone.source_addr.lock() {
+                                            *guard = Some(src);
+                                        }
+                                    }
+
                                     // Reconfigure pipeline on the fly if sender changed codec or frame size
                                     if hdr.flags.codec != current_codec
                                         || hdr.flags.frame_duration != current_frame_dur
@@ -161,6 +173,17 @@ impl AudioReceiverWorker {
                     //    decode, and resample into the playback ring buffer.
                     let now = Instant::now();
                     if now >= next_deadline {
+                        if current_src.is_some()
+                            && last_packet_at
+                                .map(|t| now.saturating_duration_since(t) > Duration::from_secs(3))
+                                .unwrap_or(false)
+                        {
+                            current_src = None;
+                            if let Ok(mut guard) = metrics_clone.source_addr.lock() {
+                                *guard = None;
+                            }
+                        }
+
                         let dynamic_step_ns = ((current_frame_dur.duration_us() as f64)
                             * 1000.0
                             * current_rel_ratio)
@@ -287,6 +310,7 @@ impl AudioReceiverWorker {
             resample_ratio: f64::from_bits(
                 self.metrics.resample_ratio_bits.load(Ordering::Relaxed),
             ),
+            source_addr: self.metrics.source_addr.lock().ok().and_then(|g| *g),
         }
     }
 }
@@ -312,4 +336,56 @@ fn build_low_latency_udp_receiver(bind_addr: SocketAddr) -> std::io::Result<UdpS
     socket.bind(&bind_addr.into())?;
     socket.set_nonblocking(true)?;
     Ok(socket.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsrelay_proto::{FormatFlags, HEADER_LEN};
+
+    #[test]
+    fn test_receiver_records_source_addr_on_packet() {
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let bind_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let (producer, _consumer) = rtrb::RingBuffer::new(9600);
+        let cfg = ReceiverConfig {
+            bind_addr,
+            output_sample_rate: 48_000,
+            output_channels: ChannelLayout::Stereo,
+            target_buffer_ms: 20,
+            ringbuffer_capacity_samples: 9600,
+        };
+        let worker = AudioReceiverWorker::spawn(cfg, producer).expect("spawn receiver");
+        assert!(worker.snapshot().source_addr.is_none());
+
+        let tx_sock = UdpSocket::bind("127.0.0.1:0").expect("bind tx");
+        let tx_local_addr = tx_sock.local_addr().unwrap();
+
+        let mut flags = FormatFlags::new(CodecType::Opus, ChannelLayout::Stereo, FrameDuration::Ms5);
+        flags.is_silence = true;
+        let hdr = PacketHeader {
+            seq: 1,
+            timestamp: 0,
+            flags,
+            payload_len: 0,
+        };
+        let mut buf = [0u8; HEADER_LEN];
+        hdr.encode(&mut buf);
+        tx_sock.send_to(&buf, bind_addr).expect("send packet");
+
+        let start = Instant::now();
+        let mut recorded = None;
+        while start.elapsed() < Duration::from_millis(500) {
+            if let Some(src) = worker.snapshot().source_addr {
+                recorded = Some(src);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(recorded, Some(tx_local_addr));
+    }
 }

@@ -153,7 +153,7 @@ impl Language {
 
     pub fn status_scanning_lan(self) -> String {
         match self {
-            Self::En => "Scanning nearby LAN devices via mDNS...".to_string(),
+            Self::En => "Scanning nearby LAN devices...".to_string(),
             Self::Zh => "正在扫描局域网内的附近设备...".to_string(),
         }
     }
@@ -304,6 +304,13 @@ impl Language {
         }
     }
 
+    pub fn status_auto_discovered_peer(self, hostname: &str, addr_str: &str) -> String {
+        match self {
+            Self::En => format!("Auto-discovered LAN peer '{hostname}' ({addr_str})"),
+            Self::Zh => format!("已自动识别局域网设备 '{hostname}' ({addr_str})"),
+        }
+    }
+
     pub fn status_sck_granted(self) -> String {
         match self {
             Self::En => "macOS ScreenCaptureKit permission granted.".to_string(),
@@ -430,6 +437,10 @@ pub struct Texts {
     pub source_synthetic_tone: &'static str,
     pub label_input_device: &'static str,
     pub label_target_addr: &'static str,
+    pub combo_scan_lan: &'static str,
+    pub combo_no_lan_peers: &'static str,
+    pub combo_local_loopback: &'static str,
+    pub combo_local_lan: &'static str,
     pub label_quality_latency: &'static str,
     pub profile_ultra_low: &'static str,
     pub profile_balanced: &'static str,
@@ -447,6 +458,11 @@ pub struct Texts {
     pub btn_start_rx: &'static str,
     pub btn_stop_rx: &'static str,
     pub hero_listen_any: &'static str,
+    pub hero_listen_waiting: &'static str,
+    pub hero_receiving_from: &'static str,
+    pub label_source_addr: &'static str,
+    pub source_waiting_any: &'static str,
+    pub source_addr_hover: &'static str,
     pub route_adaptive_jb: &'static str,
     pub stat_buffer_level: &'static str,
     pub stat_clock_comp: &'static str,
@@ -552,6 +568,10 @@ pub const TEXTS_ZH: Texts = Texts {
     source_synthetic_tone: "测试信号 (440Hz)",
     label_input_device: "输入设备",
     label_target_addr: "目标地址",
+    combo_scan_lan: "↻ 重新扫描局域网设备",
+    combo_no_lan_peers: "暂未发现其他局域网设备 (可手动输入)",
+    combo_local_loopback: "本机回环",
+    combo_local_lan: "本机节点 (LAN)",
     label_quality_latency: "音质与延迟",
     profile_ultra_low: "极低延迟",
     profile_balanced: "均衡",
@@ -568,6 +588,11 @@ pub const TEXTS_ZH: Texts = Texts {
     btn_start_rx: "开始接收",
     btn_stop_rx: "停止",
     hero_listen_any: "监听地址 · 接受任意来源",
+    hero_listen_waiting: "监听地址 · 等待来源接入",
+    hero_receiving_from: "正在接收来自",
+    label_source_addr: "来源地址",
+    source_waiting_any: "等待接入 (任意来源)",
+    source_addr_hover: "点击复制此来源地址并设为发送目标",
     route_adaptive_jb: "自适应抖动缓冲",
     stat_buffer_level: "缓冲水位",
     stat_clock_comp: "时钟补偿",
@@ -578,7 +603,7 @@ pub const TEXTS_ZH: Texts = Texts {
     label_output_device: "输出设备",
     label_target_buffer: "目标缓冲",
     label_output_gain: "输出增益",
-    chk_advertise_mdns: "在局域网广播此接收端 (mDNS)",
+    chk_advertise_mdns: "在局域网广播此节点 (自动发现)",
 
     btn_start_duplex: "开始通话",
     btn_stop_duplex: "结束通话",
@@ -630,7 +655,7 @@ pub const TEXTS_EN: Texts = Texts {
     theme_dark: "Dark",
     btn_minimize_tray_hover: "Minimize to system tray",
     lan_ip_hover: "Click to copy local LAN IP address",
-    btn_scan_lan_hover: "Scan LAN for nearby devices via mDNS",
+    btn_scan_lan_hover: "Scan LAN for nearby devices",
     btn_refresh_ports: "Refresh Devices",
     btn_refresh_ports_hover: "Re-enumerate system audio input and output devices",
     discovered_peer_hover: "Click to select this peer as target",
@@ -674,6 +699,10 @@ pub const TEXTS_EN: Texts = Texts {
     source_synthetic_tone: "Test Tone (440Hz)",
     label_input_device: "Input Device",
     label_target_addr: "Target Address",
+    combo_scan_lan: "↻ Rescan LAN Devices",
+    combo_no_lan_peers: "No other LAN peers found yet (manual input ready)",
+    combo_local_loopback: "Localhost",
+    combo_local_lan: "This Machine (LAN)",
     label_quality_latency: "Quality & Latency",
     profile_ultra_low: "Ultra-Low",
     profile_balanced: "Balanced",
@@ -690,6 +719,11 @@ pub const TEXTS_EN: Texts = Texts {
     btn_start_rx: "Start Receiving",
     btn_stop_rx: "Stop",
     hero_listen_any: "Listen Address · Any Source",
+    hero_listen_waiting: "Listen Address · Waiting for Source",
+    hero_receiving_from: "Receiving from",
+    label_source_addr: "Source Address",
+    source_waiting_any: "Waiting (Any Source)",
+    source_addr_hover: "Click to copy source address and use as target",
     route_adaptive_jb: "Adaptive Jitter Buffer",
     stat_buffer_level: "Buffer Level",
     stat_clock_comp: "Clock Drift",
@@ -700,7 +734,7 @@ pub const TEXTS_EN: Texts = Texts {
     label_output_device: "Output Device",
     label_target_buffer: "Target Buffer",
     label_output_gain: "Output Gain",
-    chk_advertise_mdns: "Advertise receiver on LAN (mDNS)",
+    chk_advertise_mdns: "Advertise node on LAN (Auto-Discovery)",
 
     btn_start_duplex: "Start Call",
     btn_stop_duplex: "End Call",
