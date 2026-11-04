@@ -11,7 +11,7 @@ use rsrelay_core::{
     list_audio_devices, AudioDeviceInfo, CaptureSource, ChannelLayout, DiscoveredPeer,
     DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig, LatencyProfile,
     ReceiverSession, ReceiverSessionConfig, SenderSession, SenderSessionConfig,
-    DEFAULT_AUDIO_UDP_PORT,
+    DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT,
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
@@ -101,12 +101,14 @@ pub struct RsRelayGuiApp {
     // Sender controls
     pub target_addr_input: String,
     pub selected_source: CaptureSource,
+    pub selected_tx_device: Option<String>,
     pub selected_profile: LatencyProfile,
     pub opus_bitrate_kbps: u32,
     pub active_sender: Option<SenderSession>,
 
     // Receiver controls
     pub bind_addr_input: String,
+    pub selected_rx_device: Option<String>,
     pub target_buffer_ms: u16,
     pub volume: f32,
     pub advertise_mdns: bool,
@@ -115,6 +117,8 @@ pub struct RsRelayGuiApp {
     // Full-Duplex Wireless Headset controls
     pub duplex_role: DuplexRole,
     pub duplex_peer_ip_input: String,
+    pub duplex_downlink_port: u16,
+    pub duplex_uplink_port: u16,
     pub duplex_gate_db: f32,
     pub duplex_mic_muted: bool,
     pub active_duplex: Option<DuplexSession>,
@@ -135,16 +139,20 @@ impl RsRelayGuiApp {
             scanning_lan: Arc::new(AtomicBool::new(false)),
             target_addr_input: format!("127.0.0.1:{DEFAULT_AUDIO_UDP_PORT}"),
             selected_source: CaptureSource::SystemLoopback,
+            selected_tx_device: None,
             selected_profile: LatencyProfile::Balanced,
             opus_bitrate_kbps: 128,
             active_sender: None,
             bind_addr_input: format!("0.0.0.0:{DEFAULT_AUDIO_UDP_PORT}"),
+            selected_rx_device: None,
             target_buffer_ms: 20,
             volume: 1.0,
             advertise_mdns: true,
             active_receiver: None,
             duplex_role: DuplexRole::Headset,
             duplex_peer_ip_input: "127.0.0.1".to_string(),
+            duplex_downlink_port: DEFAULT_AUDIO_UDP_PORT,
+            duplex_uplink_port: DEFAULT_UPLINK_UDP_PORT,
             duplex_gate_db: -45.0,
             duplex_mic_muted: false,
             active_duplex: None,
@@ -191,7 +199,7 @@ impl RsRelayGuiApp {
         let cfg = SenderSessionConfig {
             target_addr,
             source: self.selected_source,
-            device_name: None,
+            device_name: self.selected_tx_device.clone(),
             codec: self.selected_profile.default_codec(),
             channels: ChannelLayout::Stereo,
             frame_duration: self.selected_profile.default_frame_duration(),
@@ -232,7 +240,7 @@ impl RsRelayGuiApp {
 
         let cfg = ReceiverSessionConfig {
             bind_addr,
-            device_name: None,
+            device_name: self.selected_rx_device.clone(),
             channels: ChannelLayout::Stereo,
             target_buffer_ms: self.target_buffer_ms,
             initial_volume: self.volume,
@@ -275,6 +283,10 @@ impl RsRelayGuiApp {
         };
 
         let mut cfg = DuplexSessionConfig::new(self.duplex_role, peer_ip);
+        cfg.downlink_udp_port = self.duplex_downlink_port;
+        cfg.uplink_udp_port = self.duplex_uplink_port;
+        cfg.tx_device_name = self.selected_tx_device.clone();
+        cfg.rx_device_name = self.selected_rx_device.clone();
         cfg.profile = self.selected_profile;
         cfg.mic_noise_gate_db = Some(self.duplex_gate_db);
         cfg.initial_volume = self.volume;
@@ -405,6 +417,49 @@ impl eframe::App for RsRelayGuiApp {
                     });
 
                     ui.horizontal(|ui| {
+                        ui.label("Input Device:");
+                        let current_label = self
+                            .selected_tx_device
+                            .as_deref()
+                            .unwrap_or("System Default (Auto)");
+                        let prev_dev = self.selected_tx_device.clone();
+                        egui::ComboBox::from_id_salt("tx_device_combo")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.selected_tx_device,
+                                    None,
+                                    "System Default (Auto)",
+                                );
+                                for dev in &self.devices {
+                                    // Show input devices (or output devices for Windows WASAPI Loopback)
+                                    let eligible = dev.is_input
+                                        || (cfg!(target_os = "windows")
+                                            && self.selected_source
+                                                == CaptureSource::SystemLoopback
+                                            && dev.is_output);
+                                    if eligible {
+                                        let label = format!(
+                                            "{} ({} Hz)",
+                                            dev.name,
+                                            dev.default_sample_rate.unwrap_or(48_000)
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.selected_tx_device,
+                                            Some(dev.name.clone()),
+                                            label,
+                                        );
+                                    }
+                                }
+                            });
+                        if self.selected_tx_device != prev_dev && self.active_sender.is_some() {
+                            // Live hot-swap input device when changed while running
+                            self.active_sender = None;
+                            self.toggle_sender();
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
                         ui.label("Latency Profile:");
                         egui::ComboBox::from_id_salt("profile_combo")
                             .selected_text(match self.selected_profile {
@@ -480,6 +535,43 @@ impl eframe::App for RsRelayGuiApp {
                     ui.horizontal(|ui| {
                         ui.label("Bind IP:Port:");
                         ui.text_edit_singleline(&mut self.bind_addr_input);
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Output Device:");
+                        let current_label = self
+                            .selected_rx_device
+                            .as_deref()
+                            .unwrap_or("System Default (Auto)");
+                        let prev_dev = self.selected_rx_device.clone();
+                        egui::ComboBox::from_id_salt("rx_device_combo")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.selected_rx_device,
+                                    None,
+                                    "System Default (Auto)",
+                                );
+                                for dev in &self.devices {
+                                    if dev.is_output {
+                                        let label = format!(
+                                            "{} ({} Hz)",
+                                            dev.name,
+                                            dev.default_sample_rate.unwrap_or(48_000)
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.selected_rx_device,
+                                            Some(dev.name.clone()),
+                                            label,
+                                        );
+                                    }
+                                }
+                            });
+                        if self.selected_rx_device != prev_dev && self.active_receiver.is_some() {
+                            // Live hot-swap output playback device when changed while running
+                            self.active_receiver = None;
+                            self.toggle_receiver();
+                        }
                     });
 
                     ui.horizontal(|ui| {
@@ -560,7 +652,13 @@ impl eframe::App for RsRelayGuiApp {
                         });
 
                     ui.label("Peer IP:");
-                    ui.add(egui::TextEdit::singleline(&mut self.duplex_peer_ip_input).desired_width(120.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.duplex_peer_ip_input).desired_width(110.0));
+
+                    ui.label("Downlink Port:");
+                    ui.add(egui::DragValue::new(&mut self.duplex_downlink_port).range(1024..=65535));
+
+                    ui.label("Uplink Port:");
+                    ui.add(egui::DragValue::new(&mut self.duplex_uplink_port).range(1024..=65535));
 
                     ui.label("Mic Gate:");
                     ui.add(egui::Slider::new(&mut self.duplex_gate_db, -65.0..=-20.0).suffix(" dB"));

@@ -150,6 +150,14 @@ enum Commands {
         #[arg(long)]
         rx_device: Option<String>,
 
+        /// Downlink UDP port (Host -> Headset system audio)
+        #[arg(long, default_value_t = DEFAULT_AUDIO_UDP_PORT)]
+        downlink_port: u16,
+
+        /// Uplink UDP port (Headset -> Host microphone audio)
+        #[arg(long, default_value_t = DEFAULT_UPLINK_UDP_PORT)]
+        uplink_port: u16,
+
         /// Playback volume multiplier (0.0 to 2.0)
         #[arg(short, long, default_value_t = 1.0)]
         volume: f32,
@@ -307,6 +315,8 @@ fn main() -> anyhow::Result<()> {
             gate_db,
             tx_device,
             rx_device,
+            downlink_port,
+            uplink_port,
             volume,
         } => {
             let duplex_role: DuplexRole = role.into();
@@ -314,6 +324,8 @@ fn main() -> anyhow::Result<()> {
 
             let mut cfg = DuplexSessionConfig::new(duplex_role, peer);
             cfg.profile = lat_profile;
+            cfg.downlink_udp_port = downlink_port;
+            cfg.uplink_udp_port = uplink_port;
             cfg.tx_device_name = tx_device;
             cfg.rx_device_name = rx_device;
             cfg.mic_noise_gate_db = if gate_db > -90.0 { Some(gate_db) } else { None };
@@ -323,7 +335,7 @@ fn main() -> anyhow::Result<()> {
             let st = session.status();
             println!(
                 "Started Full-Duplex [{:?}] <-> Peer {} (Downlink :{}, Uplink :{})",
-                duplex_role, peer, DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT
+                duplex_role, peer, downlink_port, uplink_port
             );
             println!(
                 "  TX Source : '{}' ({} Hz) | RX Output: '{}' ({} Hz)",
