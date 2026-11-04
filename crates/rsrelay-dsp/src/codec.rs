@@ -112,8 +112,9 @@ pub struct AudioDecoder {
     codec: CodecType,
     channels: ChannelLayout,
     opus: Option<OpusDecoder>,
-    /// Stores the last decoded frame for smooth fade-out PLC when using Raw PCM modes.
-    last_pcm_frame: Vec<f32>,
+    /// Stores the final `[L, R]` sample pair of the last decoded frame for smooth fade-out PLC in Raw PCM modes.
+    last_pcm_sample: [f32; 2],
+    has_last_pcm: bool,
 }
 
 impl AudioDecoder {
@@ -132,7 +133,8 @@ impl AudioDecoder {
             codec,
             channels,
             opus,
-            last_pcm_frame: Vec::with_capacity(960 * channels.channels()),
+            last_pcm_sample: [0.0; 2],
+            has_last_pcm: false,
         })
     }
 
@@ -160,7 +162,7 @@ impl AudioDecoder {
                     let raw = i16::from_le_bytes([payload[i * 2], payload[i * 2 + 1]]);
                     out_interleaved[i] = (raw as f32) / 32768.0;
                 }
-                self.save_last_frame(&out_interleaved[..count]);
+                self.save_last_sample(&out_interleaved[..count]);
                 Ok(count)
             }
             CodecType::PcmF32Le => {
@@ -177,7 +179,7 @@ impl AudioDecoder {
                     ]);
                     out_interleaved[i] = raw;
                 }
-                self.save_last_frame(&out_interleaved[..count]);
+                self.save_last_sample(&out_interleaved[..count]);
                 Ok(count)
             }
         }
@@ -201,25 +203,21 @@ impl AudioDecoder {
                 Ok(samples_per_ch * ch)
             }
             CodecType::PcmI16Le | CodecType::PcmF32Le => {
-                // Smooth exponential decay from last known PCM sample values to prevent click/pop
+                // Smooth quadratic decay from last known PCM sample values to prevent click/pop
                 let total = out_interleaved.len();
-                if self.last_pcm_frame.len() >= ch {
-                    let last_l = self.last_pcm_frame[self.last_pcm_frame.len() - ch];
-                    let last_r = if ch > 1 {
-                        self.last_pcm_frame[self.last_pcm_frame.len() - 1]
-                    } else {
-                        last_l
-                    };
+                if self.has_last_pcm {
+                    let [last_l, last_r] = self.last_pcm_sample;
                     let frames = total / ch;
                     for f in 0..frames {
-                        let decay = 1.0 - (f as f32 / frames as f32);
+                        let decay = 1.0 - (f as f32 / frames.max(1) as f32);
                         let attenuation = decay * decay * 0.5;
                         out_interleaved[f * ch] = last_l * attenuation;
                         if ch > 1 {
                             out_interleaved[f * ch + 1] = last_r * attenuation;
                         }
                     }
-                    self.last_pcm_frame.fill(0.0);
+                    self.last_pcm_sample = [0.0; 2];
+                    self.has_last_pcm = false;
                 } else {
                     out_interleaved.fill(0.0);
                 }
@@ -229,9 +227,18 @@ impl AudioDecoder {
     }
 
     #[inline]
-    fn save_last_frame(&mut self, samples: &[f32]) {
-        self.last_pcm_frame.clear();
-        self.last_pcm_frame.extend_from_slice(samples);
+    fn save_last_sample(&mut self, samples: &[f32]) {
+        let ch = self.channels.channels();
+        if samples.len() >= ch {
+            let last_l = samples[samples.len() - ch];
+            let last_r = if ch > 1 {
+                samples[samples.len() - 1]
+            } else {
+                last_l
+            };
+            self.last_pcm_sample = [last_l, last_r];
+            self.has_last_pcm = true;
+        }
     }
 }
 

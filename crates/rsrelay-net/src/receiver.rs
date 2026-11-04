@@ -14,7 +14,8 @@ use rsrelay_dsp::{
     AdaptiveResampler, AudioDecoder, ClockDriftController, JitterBuffer, PopOutcome,
 };
 use rsrelay_proto::{
-    ChannelLayout, CodecType, FrameDuration, PacketHeader, MAX_PACKET_SIZE, STANDARD_SAMPLE_RATE,
+    ChannelLayout, CodecType, FrameDuration, PacketHeader, MAX_PACKET_SIZE, MAX_UDP_PAYLOAD,
+    STANDARD_SAMPLE_RATE,
 };
 
 #[derive(Debug, Clone)]
@@ -32,6 +33,7 @@ pub struct ReceiverMetrics {
     pub packets_lost: AtomicU64,
     pub fec_recovered: AtomicU64,
     pub plc_frames: AtomicU64,
+    pub jitter_us: AtomicU64,
     pub buffer_level_ms_bits: AtomicU32,
     pub resample_ratio_bits: AtomicU64,
 }
@@ -42,6 +44,7 @@ pub struct ReceiverSnapshot {
     pub packets_lost: u64,
     pub fec_recovered: u64,
     pub plc_frames: u64,
+    pub jitter_us: u64,
     pub buffer_level_ms: f32,
     pub resample_ratio: f64,
 }
@@ -59,6 +62,21 @@ impl AudioReceiverWorker {
     ) -> Result<Self, anyhow::Error> {
         let socket = build_low_latency_udp_receiver(config.bind_addr)?;
 
+        let mut current_codec = CodecType::Opus;
+        let current_channels = config.output_channels;
+        let mut current_frame_dur = FrameDuration::Ms5;
+        let ch = current_channels.channels();
+        let frames_per_pkt = current_frame_dur.samples_per_channel();
+
+        let mut decoder = AudioDecoder::new(current_codec, current_channels)?;
+        let mut resampler = AdaptiveResampler::new(
+            STANDARD_SAMPLE_RATE,
+            config.output_sample_rate,
+            ch,
+            frames_per_pkt,
+            1.01,
+        )?;
+
         let stop_flag = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(ReceiverMetrics::default());
         metrics
@@ -71,42 +89,27 @@ impl AudioReceiverWorker {
         let join_handle = thread::Builder::new()
             .name("rsrelay-rx-worker".to_string())
             .spawn(move || {
-                let mut current_codec = CodecType::Opus;
-                let current_channels = config.output_channels;
-                let mut current_frame_dur = FrameDuration::Ms5;
-
                 let prefetch_packets = ((config.target_buffer_ms as u64 * 1000)
                     / current_frame_dur.duration_us())
                 .max(2) as usize;
 
                 let mut jitter = JitterBuffer::new(prefetch_packets);
-                let mut decoder =
-                    AudioDecoder::new(current_codec, current_channels).expect("init decoder");
-
-                let ch = current_channels.channels();
-                let frames_per_pkt = current_frame_dur.samples_per_channel();
 
                 let target_rtrb_frames = ((config.target_buffer_ms as usize)
                     * (config.output_sample_rate as usize))
                     / 1000;
                 let mut drift_ctrl = ClockDriftController::new(target_rtrb_frames.max(480));
-                let mut resampler = AdaptiveResampler::new(
-                    STANDARD_SAMPLE_RATE,
-                    config.output_sample_rate,
-                    ch,
-                    frames_per_pkt,
-                    1.01,
-                )
-                .expect("init receiver resampler");
+                let mut current_rel_ratio = 1.0f64;
 
                 promote_worker_thread_priority(config.output_sample_rate, frames_per_pkt as u32);
 
                 let mut udp_buf = [0u8; MAX_PACKET_SIZE];
+                let mut pkt_payload = [0u8; MAX_UDP_PAYLOAD];
                 let mut decoded_pcm = vec![0.0f32; frames_per_pkt * ch];
                 let mut resampled_pcm = Vec::with_capacity(frames_per_pkt * ch * 2);
 
-                let mut step_duration = Duration::from_micros(current_frame_dur.duration_us());
-                let mut next_deadline = Instant::now() + step_duration;
+                let base_step_us = current_frame_dur.duration_us();
+                let mut next_deadline = Instant::now() + Duration::from_micros(base_step_us);
 
                 while !stop_clone.load(Ordering::Relaxed) {
                     // 1. Drain all arrived UDP datagrams from the OS socket into JitterBuffer
@@ -122,6 +125,12 @@ impl AudioReceiverWorker {
                                     {
                                         current_codec = hdr.flags.codec;
                                         current_frame_dur = hdr.flags.frame_duration;
+                                        let new_prefetch = ((config.target_buffer_ms as u64 * 1000)
+                                            / current_frame_dur.duration_us())
+                                        .max(2)
+                                            as usize;
+                                        jitter.set_target_prefetch(new_prefetch);
+
                                         if let Ok(new_dec) =
                                             AudioDecoder::new(current_codec, current_channels)
                                         {
@@ -138,8 +147,6 @@ impl AudioReceiverWorker {
                                         ) {
                                             resampler = new_res;
                                         }
-                                        step_duration =
-                                            Duration::from_micros(current_frame_dur.duration_us());
                                     }
 
                                     jitter.push(hdr, payload);
@@ -150,26 +157,35 @@ impl AudioReceiverWorker {
                         }
                     }
 
-                    // 2. When frame deadline arrives, pop from JitterBuffer, decode, and clock-drift resample
+                    // 2. When clock-drift-modulated frame deadline arrives, pop from JitterBuffer,
+                    //    decode, and resample into the playback ring buffer.
                     let now = Instant::now();
                     if now >= next_deadline {
+                        let dynamic_step_ns = ((current_frame_dur.duration_us() as f64)
+                            * 1000.0
+                            * current_rel_ratio)
+                            as u64;
+                        let step_duration = Duration::from_nanos(dynamic_step_ns.max(500_000));
                         next_deadline += step_duration;
                         if now > next_deadline + step_duration * 4 {
                             // Recover timer if OS suspended or thread was delayed
                             next_deadline = now + step_duration;
                         }
 
-                        let outcome = jitter.pop();
+                        let outcome = jitter.pop(&mut pkt_payload);
                         let has_frame = match outcome {
-                            PopOutcome::Ready { payload, .. } => {
-                                decoder.decode(&payload, &mut decoded_pcm).is_ok()
-                            }
+                            PopOutcome::Ready { payload_len, .. } => decoder
+                                .decode(&pkt_payload[..payload_len], &mut decoded_pcm)
+                                .is_ok(),
                             PopOutcome::SilenceHeartbeat { .. } => {
                                 decoded_pcm.fill(0.0);
                                 true
                             }
-                            PopOutcome::MissingWithFec { next_payload } => decoder
-                                .conceal_loss(Some(&next_payload), &mut decoded_pcm)
+                            PopOutcome::MissingWithFec { fec_payload_len } => decoder
+                                .conceal_loss(
+                                    Some(&pkt_payload[..fec_payload_len]),
+                                    &mut decoded_pcm,
+                                )
                                 .is_ok(),
                             PopOutcome::MissingNoFec => {
                                 decoder.conceal_loss(None, &mut decoded_pcm).is_ok()
@@ -182,11 +198,15 @@ impl AudioReceiverWorker {
                                 .ringbuffer_capacity_samples
                                 .saturating_sub(producer.slots());
                             let rtrb_queued_frames = rtrb_queued_samples / ch.max(1);
-                            let jb_queued_frames =
+                            let jb_frames_48k =
                                 jitter.occupied_count() * current_frame_dur.samples_per_channel();
+                            let jb_queued_frames = (jb_frames_48k
+                                * (config.output_sample_rate as usize))
+                                / (STANDARD_SAMPLE_RATE as usize);
                             let total_buffered_frames = rtrb_queued_frames + jb_queued_frames;
 
                             let rel_ratio = drift_ctrl.update(total_buffered_frames);
+                            current_rel_ratio = rel_ratio;
 
                             if resampler
                                 .process_interleaved(&decoded_pcm, rel_ratio, &mut resampled_pcm)
@@ -222,6 +242,9 @@ impl AudioReceiverWorker {
                             metrics_clone
                                 .plc_frames
                                 .store(jb_stats.plc_frames, Ordering::Relaxed);
+                            metrics_clone
+                                .jitter_us
+                                .store(jb_stats.jitter_estimate_us as u64, Ordering::Relaxed);
 
                             let level_ms = (drift_ctrl.smoothed_frames() as f32 * 1000.0)
                                 / (config.output_sample_rate as f32);
@@ -234,7 +257,7 @@ impl AudioReceiverWorker {
                         }
                     } else {
                         let sleep_dur =
-                            (next_deadline - now).min(Duration::from_micros(1_000));
+                            (next_deadline - now).min(Duration::from_micros(500));
                         thread::sleep(sleep_dur);
                     }
                 }
@@ -257,6 +280,7 @@ impl AudioReceiverWorker {
             packets_lost: self.metrics.packets_lost.load(Ordering::Relaxed),
             fec_recovered: self.metrics.fec_recovered.load(Ordering::Relaxed),
             plc_frames: self.metrics.plc_frames.load(Ordering::Relaxed),
+            jitter_us: self.metrics.jitter_us.load(Ordering::Relaxed),
             buffer_level_ms: f32::from_bits(
                 self.metrics.buffer_level_ms_bits.load(Ordering::Relaxed),
             ),

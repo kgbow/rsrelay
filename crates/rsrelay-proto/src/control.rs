@@ -16,6 +16,17 @@ pub const DEFAULT_UPLINK_CONTROL_PORT: u16 = 49154;
 /// Default UDP audio port for full-duplex return microphone uplink.
 pub const DEFAULT_UPLINK_UDP_PORT: u16 = 49155;
 
+/// Compute the companion TCP control port for a given UDP audio stream port.
+#[inline]
+pub const fn companion_control_port(audio_udp_port: u16) -> u16 {
+    match audio_udp_port {
+        DEFAULT_AUDIO_UDP_PORT => DEFAULT_CONTROL_PORT,
+        DEFAULT_UPLINK_UDP_PORT => DEFAULT_UPLINK_CONTROL_PORT,
+        p if p > 1024 => p - 1,
+        p => p.saturating_add(1),
+    }
+}
+
 /// Role in a full-duplex bidirectional session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

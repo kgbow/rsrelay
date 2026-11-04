@@ -9,6 +9,8 @@ use rsrelay_net::{
     SenderSnapshot,
 };
 
+use rsrelay_proto::companion_control_port;
+
 use crate::config::{ReceiverSessionConfig, SenderSessionConfig};
 
 /// Live status snapshot for an active `SenderSession`.
@@ -56,10 +58,9 @@ impl SenderSession {
 
         let worker = AudioSenderWorker::spawn(sender_cfg, consumer)?;
 
-        // Companion TCP control port is `audio_udp_port - 1` (e.g. UDP 49153 -> TCP 49152)
         let ctrl_addr = std::net::SocketAddr::new(
             cfg.target_addr.ip(),
-            cfg.target_addr.port().wrapping_sub(1),
+            companion_control_port(cfg.target_addr.port()),
         );
         let control_client = ControlClient::spawn(ctrl_addr).ok();
 
@@ -76,6 +77,10 @@ impl SenderSession {
 
     pub fn is_muted(&self) -> bool {
         self.worker.is_muted()
+    }
+
+    pub fn set_noise_gate_db(&self, threshold_db: Option<f32>) {
+        self.worker.set_noise_gate_db(threshold_db);
     }
 
     pub fn status(&self) -> SenderSessionStatus {
@@ -135,7 +140,7 @@ impl ReceiverSession {
 
         let ctrl_bind = std::net::SocketAddr::new(
             cfg.bind_addr.ip(),
-            cfg.bind_addr.port().wrapping_sub(1),
+            companion_control_port(cfg.bind_addr.port()),
         );
         let control_server =
             ControlServer::spawn(ctrl_bind, cfg.bind_addr.port(), worker.metrics_arc()).ok();

@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use rsrelay_audio::CaptureSource;
 use rsrelay_proto::{
@@ -93,8 +93,14 @@ impl DuplexSession {
             ),
         };
 
+        let unspecified_ip = if cfg.peer_ip.is_ipv6() {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        };
+
         let rx_cfg = ReceiverSessionConfig {
-            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), rx_bind_port),
+            bind_addr: SocketAddr::new(unspecified_ip, rx_bind_port),
             device_name: cfg.rx_device_name,
             channels: ChannelLayout::Stereo,
             target_buffer_ms: cfg.profile.default_target_buffer_ms(),
@@ -140,6 +146,11 @@ impl DuplexSession {
     /// Adjust the incoming RX playback volume (`0.0..=2.0`).
     pub fn set_rx_volume(&self, gain: f32) {
         self.rx_session.set_volume(gain);
+    }
+
+    /// Dynamically adjust the outgoing microphone noise gate threshold in dBFS.
+    pub fn set_tx_noise_gate_db(&self, threshold_db: Option<f32>) {
+        self.tx_session.set_noise_gate_db(threshold_db);
     }
 
     pub fn status(&self) -> DuplexSessionStatus {

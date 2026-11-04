@@ -68,17 +68,17 @@ cargo run --release -p rsrelay-cli -- duplex --role host --peer 192.168.1.105
 cargo run --release -p rsrelay-cli -- duplex --role headset --peer 192.168.1.100 --gate-db -45.0
 ```
 
-### 3. Start Receiver (Speaker Output + mDNS Broadcast)
+### 5. Start Receiver (Speaker Output + mDNS Broadcast)
 ```bash
 cargo run --release -p rsrelay-cli -- recv --bind 0.0.0.0:49153 --buffer-ms 20
 ```
 
-### 4. Discover Receivers on LAN
+### 6. Discover Receivers on LAN
 ```bash
 cargo run --release -p rsrelay-cli -- discover
 ```
 
-### 5. Start Sender (System Audio Loopback -> Receiver IP)
+### 7. Start Sender (System Audio Loopback -> Receiver IP)
 ```bash
 # Stream system loopback using Balanced profile (5ms Opus + FEC)
 cargo run --release -p rsrelay-cli -- send --target 192.168.1.100:49153 --source loopback --profile balanced

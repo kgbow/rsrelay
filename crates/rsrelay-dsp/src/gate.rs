@@ -64,12 +64,23 @@ impl NoiseGate {
     /// a 12-byte `FLAG_SILENCE` heartbeat instead of encoding audio payload).
     #[inline]
     pub fn process_interleaved(&mut self, samples: &mut [f32], force_mute: bool) -> bool {
+        let frames = samples.len() / self.channels;
+
         if force_mute {
-            for s in samples.iter_mut() {
+            let mut max_out = 0.0f32;
+            for f in 0..frames {
                 self.current_gain *= self.release_coeff;
-                *s *= self.current_gain;
+                let base = f * self.channels;
+                for c in 0..self.channels {
+                    let out = samples[base + c] * self.current_gain;
+                    samples[base + c] = out;
+                    let a = out.abs();
+                    if a > max_out {
+                        max_out = a;
+                    }
+                }
             }
-            return self.current_gain < 1e-4;
+            return max_out < 1e-4;
         }
 
         if !self.enabled {
@@ -84,7 +95,6 @@ impl NoiseGate {
             return max_abs < 1e-5;
         }
 
-        let frames = samples.len() / self.channels;
         let mut max_out = 0.0f32;
 
         for f in 0..frames {
@@ -160,5 +170,15 @@ mod tests {
         let is_silent = gate.process_interleaved(&mut speech, false);
         assert!(!is_silent, "active speech should open the noise gate");
         assert!(speech.last().unwrap().abs() > 0.20);
+
+        // Force-muting a stereo stream should apply identical attenuation to Left and Right channels
+        let mut muted_frame = vec![0.5f32; 480];
+        let _ = gate.process_interleaved(&mut muted_frame, true);
+        for pair in muted_frame.chunks_exact(2) {
+            assert!(
+                (pair[0] - pair[1]).abs() < 1e-7,
+                "left and right channels must receive identical gain during force_mute"
+            );
+        }
     }
 }

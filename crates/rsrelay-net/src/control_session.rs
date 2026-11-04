@@ -14,7 +14,9 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rsrelay_proto::{ControlMessage, NodeCapabilities, PROTOCOL_VERSION};
+use rsrelay_proto::{
+    ChannelLayout, CodecType, ControlMessage, FrameDuration, NodeCapabilities, PROTOCOL_VERSION,
+};
 
 use crate::receiver::ReceiverMetrics;
 
@@ -44,6 +46,13 @@ pub fn read_control_message(stream: &mut TcpStream) -> std::io::Result<ControlMe
     stream.read_exact(&mut buf)?;
     serde_json::from_slice(&buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn configure_control_stream(stream: &TcpStream) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
 }
 
 /// Receiver-side TCP control server responding to `Ping` and streaming `ReceiverTelemetry`.
@@ -78,10 +87,7 @@ impl ControlServer {
                 while !stop_clone.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, _peer)) => {
-                            let _ = stream.set_nonblocking(false);
-                            let _ = stream.set_nodelay(true);
-                            let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-                            let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+                            configure_control_stream(&stream);
 
                             let hello = ControlMessage::Hello {
                                 protocol_version: PROTOCOL_VERSION,
@@ -94,12 +100,28 @@ impl ControlServer {
                             let _ = write_control_message(&mut stream, &hello);
 
                             let mut last_telemetry = Instant::now() - Duration::from_secs(1);
+                            let mut last_client_activity = Instant::now();
+
                             while !stop_clone.load(Ordering::Relaxed) {
+                                // Supersede stale connection if a new client connects
+                                if let Ok((new_stream, _new_peer)) = listener.accept() {
+                                    configure_control_stream(&new_stream);
+                                    stream = new_stream;
+                                    let _ = write_control_message(&mut stream, &hello);
+                                    last_client_activity = Instant::now();
+                                }
+
+                                // Drop dead half-open connections after 3s of silence
+                                if last_client_activity.elapsed() > Duration::from_secs(3) {
+                                    break;
+                                }
+
                                 match read_control_message(&mut stream) {
                                     Ok(ControlMessage::Ping {
                                         seq,
                                         client_send_us,
                                     }) => {
+                                        last_client_activity = Instant::now();
                                         let now_us = start_epoch.elapsed().as_micros() as u64;
                                         let pong = ControlMessage::Pong {
                                             seq,
@@ -111,6 +133,10 @@ impl ControlServer {
                                         if write_control_message(&mut stream, &pong).is_err() {
                                             break;
                                         }
+                                    }
+                                    Ok(ControlMessage::StartStream { .. })
+                                    | Ok(ControlMessage::Hello { .. }) => {
+                                        last_client_activity = Instant::now();
                                     }
                                     Ok(ControlMessage::StopStream { .. }) => break,
                                     Ok(_) => {}
@@ -124,7 +150,7 @@ impl ControlServer {
                                     last_telemetry = Instant::now();
                                     let telem = ControlMessage::ReceiverTelemetry {
                                         rtt_us: 0,
-                                        jitter_us: 0,
+                                        jitter_us: rx_metrics.jitter_us.load(Ordering::Relaxed),
                                         packets_received: rx_metrics
                                             .packets_received
                                             .load(Ordering::Relaxed),
@@ -183,6 +209,7 @@ impl Drop for ControlServer {
 pub struct ControlClientTelemetry {
     pub connected: AtomicBool,
     pub rtt_us: AtomicU64,
+    pub remote_jitter_us: AtomicU64,
     pub remote_packets_lost: AtomicU64,
     pub remote_buffer_ms_bits: AtomicU32,
     pub remote_resample_ratio_bits: AtomicU64,
@@ -192,6 +219,7 @@ pub struct ControlClientTelemetry {
 pub struct ControlTelemetrySnapshot {
     pub connected: bool,
     pub rtt_us: u64,
+    pub remote_jitter_us: u64,
     pub remote_packets_lost: u64,
     pub remote_buffer_ms: f32,
     pub remote_resample_ratio: f64,
@@ -223,13 +251,21 @@ impl ControlClient {
 
                 while !stop_clone.load(Ordering::Relaxed) {
                     if let Ok(mut stream) =
-                        TcpStream::connect_timeout(&target_control_addr, Duration::from_millis(400))
+                        TcpStream::connect_timeout(&target_control_addr, Duration::from_millis(250))
                     {
-                        let _ = stream.set_nonblocking(false);
-                        let _ = stream.set_nodelay(true);
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+                        configure_control_stream(&stream);
                         telem_clone.connected.store(true, Ordering::Relaxed);
+
+                        // Announce active stream parameters
+                        let start_msg = ControlMessage::StartStream {
+                            codec: CodecType::Opus,
+                            channels: ChannelLayout::Stereo,
+                            frame_duration: FrameDuration::Ms5,
+                            opus_bitrate_bps: 128_000,
+                            receiver_udp_port: target_control_addr.port().wrapping_add(1),
+                            target_buffer_ms: 20,
+                        };
+                        let _ = write_control_message(&mut stream, &start_msg);
 
                         let mut last_ping = Instant::now() - Duration::from_secs(1);
 
@@ -260,11 +296,15 @@ impl ControlClient {
                                     telem_clone.rtt_us.store(rtt, Ordering::Relaxed);
                                 }
                                 Ok(ControlMessage::ReceiverTelemetry {
+                                    jitter_us,
                                     packets_lost,
                                     buffer_level_ms,
                                     resample_ratio,
                                     ..
                                 }) => {
+                                    telem_clone
+                                        .remote_jitter_us
+                                        .store(jitter_us, Ordering::Relaxed);
                                     telem_clone
                                         .remote_packets_lost
                                         .store(packets_lost, Ordering::Relaxed);
@@ -282,10 +322,17 @@ impl ControlClient {
                                 Err(_) => break,
                             }
                         }
+
+                        if stop_clone.load(Ordering::Relaxed) {
+                            let stop_msg = ControlMessage::StopStream {
+                                reason: "sender session stopped".to_string(),
+                            };
+                            let _ = write_control_message(&mut stream, &stop_msg);
+                        }
                         telem_clone.connected.store(false, Ordering::Relaxed);
                     }
 
-                    for _ in 0..10 {
+                    for _ in 0..6 {
                         if stop_clone.load(Ordering::Relaxed) {
                             break;
                         }
@@ -305,6 +352,7 @@ impl ControlClient {
         ControlTelemetrySnapshot {
             connected: self.telemetry.connected.load(Ordering::Relaxed),
             rtt_us: self.telemetry.rtt_us.load(Ordering::Relaxed),
+            remote_jitter_us: self.telemetry.remote_jitter_us.load(Ordering::Relaxed),
             remote_packets_lost: self.telemetry.remote_packets_lost.load(Ordering::Relaxed),
             remote_buffer_ms: f32::from_bits(
                 self.telemetry.remote_buffer_ms_bits.load(Ordering::Relaxed),

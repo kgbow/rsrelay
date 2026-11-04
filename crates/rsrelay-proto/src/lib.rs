@@ -9,8 +9,8 @@ pub mod control;
 pub mod header;
 
 pub use control::{
-    ControlMessage, DuplexRole, NodeCapabilities, DEFAULT_AUDIO_UDP_PORT, DEFAULT_CONTROL_PORT,
-    DEFAULT_UPLINK_CONTROL_PORT, DEFAULT_UPLINK_UDP_PORT, MDNS_SERVICE_TYPE,
+    companion_control_port, ControlMessage, DuplexRole, NodeCapabilities, DEFAULT_AUDIO_UDP_PORT,
+    DEFAULT_CONTROL_PORT, DEFAULT_UPLINK_CONTROL_PORT, DEFAULT_UPLINK_UDP_PORT, MDNS_SERVICE_TYPE,
 };
 pub use header::{
     seq_diff, ChannelLayout, CodecType, FormatFlags, FrameDuration, PacketHeader, ProtoError,

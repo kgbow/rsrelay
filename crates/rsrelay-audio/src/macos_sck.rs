@@ -39,8 +39,12 @@ pub fn interleave_planar_to_ringbuffer(
 
         for frame_idx in 0..frames_to_write {
             for ch in 0..target_channels {
-                let src_ch = ch.min(planar_channels.len() - 1);
-                let sample = planar_channels[src_ch][frame_idx];
+                let sample = if target_channels == 1 && planar_channels.len() >= 2 {
+                    (planar_channels[0][frame_idx] + planar_channels[1][frame_idx]) * 0.5
+                } else {
+                    let src_ch = ch.min(planar_channels.len() - 1);
+                    planar_channels[src_ch][frame_idx]
+                };
                 let abs = sample.abs();
                 if abs > max_abs {
                     max_abs = abs;
@@ -101,7 +105,7 @@ mod native {
         if user_ctx.is_null() || ch0.is_null() || num_frames == 0 {
             return;
         }
-        unsafe {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let ctx = &mut *(user_ctx as *mut SckCallbackContext);
             let slice0 = std::slice::from_raw_parts(ch0, num_frames);
             let slice1 = if num_channels > 1 && !ch1.is_null() {
@@ -113,7 +117,7 @@ mod native {
             let (_written, peak) =
                 interleave_planar_to_ringbuffer(&planar, ctx.target_channels, &mut ctx.producer);
             ctx.peak_bits.store(peak.to_bits(), Ordering::Relaxed);
-        }
+        }));
     }
 
     /// Check whether macOS Screen/Audio Capture TCC permission is currently granted.

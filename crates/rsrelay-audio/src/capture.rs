@@ -344,7 +344,11 @@ fn push_converted_samples(
         for f in 0..frames_to_write {
             let base = f * hw_ch;
             for c in 0..tgt_ch {
-                let sample = data[base + c.min(hw_ch - 1)];
+                let sample = if tgt_ch == 1 && hw_ch >= 2 {
+                    (data[base] + data[base + 1]) * 0.5
+                } else {
+                    data[base + c.min(hw_ch - 1)]
+                };
                 let abs = sample.abs();
                 if abs > max_abs {
                     max_abs = abs;
@@ -387,7 +391,11 @@ fn push_converted_i16(
         for f in 0..frames_to_write {
             let base = f * hw_ch;
             for c in 0..tgt_ch {
-                let sample = (data[base + c.min(hw_ch - 1)] as f32) / 32768.0;
+                let sample = if tgt_ch == 1 && hw_ch >= 2 {
+                    ((data[base] as f32) + (data[base + 1] as f32)) / 65536.0
+                } else {
+                    (data[base + c.min(hw_ch - 1)] as f32) / 32768.0
+                };
                 let abs = sample.abs();
                 if abs > max_abs {
                     max_abs = abs;
@@ -430,7 +438,13 @@ fn push_converted_u16(
         for f in 0..frames_to_write {
             let base = f * hw_ch;
             for c in 0..tgt_ch {
-                let sample = ((data[base + c.min(hw_ch - 1)] as f32) - 32768.0) / 32768.0;
+                let sample = if tgt_ch == 1 && hw_ch >= 2 {
+                    let s0 = ((data[base] as f32) - 32768.0) / 32768.0;
+                    let s1 = ((data[base + 1] as f32) - 32768.0) / 32768.0;
+                    (s0 + s1) * 0.5
+                } else {
+                    ((data[base + c.min(hw_ch - 1)] as f32) - 32768.0) / 32768.0
+                };
                 let abs = sample.abs();
                 if abs > max_abs {
                     max_abs = abs;

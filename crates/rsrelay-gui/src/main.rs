@@ -95,6 +95,8 @@ fn init_system_tray() -> anyhow::Result<SystemTrayHandles> {
 
 pub struct RsRelayGuiApp {
     pub devices: Vec<AudioDeviceInfo>,
+    pending_devices: Arc<Mutex<Option<(Vec<AudioDeviceInfo>, bool)>>>,
+    polling_devices: Arc<AtomicBool>,
     pub discovered_peers: Arc<Mutex<Vec<DiscoveredPeer>>>,
     pub scanning_lan: Arc<AtomicBool>,
 
@@ -137,6 +139,8 @@ impl RsRelayGuiApp {
 
         Ok(Self {
             devices,
+            pending_devices: Arc::new(Mutex::new(None)),
+            polling_devices: Arc::new(AtomicBool::new(false)),
             discovered_peers: Arc::new(Mutex::new(Vec::new())),
             scanning_lan: Arc::new(AtomicBool::new(false)),
             target_addr_input: format!("127.0.0.1:{DEFAULT_AUDIO_UDP_PORT}"),
@@ -165,10 +169,34 @@ impl RsRelayGuiApp {
         })
     }
 
-    /// Manually or periodically refresh the local hardware audio port list and optionally
-    /// hot-rebind active streams if a newly plugged-in device became the OS default.
+    /// Trigger an asynchronous hardware audio device enumeration on a background thread
+    /// so the UI render thread never blocks on OS audio driver queries.
     pub fn refresh_audio_devices(&mut self, manual: bool) {
-        let new_devices = list_audio_devices().unwrap_or_default();
+        if self.polling_devices.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let pending = Arc::clone(&self.pending_devices);
+        let polling = Arc::clone(&self.polling_devices);
+        thread::spawn(move || {
+            let new_devices = list_audio_devices().unwrap_or_default();
+            if let Ok(mut guard) = pending.lock() {
+                *guard = Some((new_devices, manual));
+            }
+            polling.store(false, Ordering::Relaxed);
+        });
+    }
+
+    /// Apply any completed background audio device enumeration result.
+    fn apply_pending_device_updates(&mut self) {
+        let maybe_update = self
+            .pending_devices
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let Some((new_devices, manual)) = maybe_update else {
+            return;
+        };
+
         let in_count = new_devices.iter().filter(|d| d.is_input).count();
         let out_count = new_devices.iter().filter(|d| d.is_output).count();
 
@@ -247,6 +275,9 @@ impl RsRelayGuiApp {
             return;
         }
 
+        // Stop Full-Duplex session if active to avoid device/port conflicts
+        self.active_duplex = None;
+
         let target_addr: SocketAddr = match self.target_addr_input.trim().parse() {
             Ok(addr) => addr,
             Err(e) => {
@@ -288,6 +319,9 @@ impl RsRelayGuiApp {
             self.last_status_msg = "Receiver stopped.".to_string();
             return;
         }
+
+        // Stop Full-Duplex session if active to avoid UDP bind port conflicts
+        self.active_duplex = None;
 
         let bind_addr: SocketAddr = match self.bind_addr_input.trim().parse() {
             Ok(addr) => addr,
@@ -395,11 +429,12 @@ impl eframe::App for RsRelayGuiApp {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
-        // Periodically poll for hot-plugged audio devices every 2.5 seconds
+        // Periodically poll for hot-plugged audio devices every 2.5 seconds on a background thread
         if self.last_device_poll.elapsed() >= Duration::from_millis(2500) {
             self.last_device_poll = std::time::Instant::now();
             self.refresh_audio_devices(false);
         }
+        self.apply_pending_device_updates();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -561,6 +596,16 @@ impl eframe::App for RsRelayGuiApp {
                             });
                     });
 
+                    if self.selected_profile != LatencyProfile::LosslessPcm {
+                        ui.horizontal(|ui| {
+                            ui.label("Opus Bitrate:");
+                            ui.add(
+                                egui::Slider::new(&mut self.opus_bitrate_kbps, 32..=256)
+                                    .suffix(" kbps"),
+                            );
+                        });
+                    }
+
                     ui.add_space(6.0);
                     let tx_running = self.active_sender.is_some();
                     let btn_text = if tx_running {
@@ -660,6 +705,9 @@ impl eframe::App for RsRelayGuiApp {
                             if let Some(ref rx) = self.active_receiver {
                                 rx.set_volume(self.volume);
                             }
+                            if let Some(ref dpx) = self.active_duplex {
+                                dpx.set_rx_volume(self.volume);
+                            }
                         }
                     });
 
@@ -733,7 +781,14 @@ impl eframe::App for RsRelayGuiApp {
                     ui.add(egui::DragValue::new(&mut self.duplex_uplink_port).range(1024..=65535));
 
                     ui.label("Mic Gate:");
-                    ui.add(egui::Slider::new(&mut self.duplex_gate_db, -65.0..=-20.0).suffix(" dB"));
+                    if ui
+                        .add(egui::Slider::new(&mut self.duplex_gate_db, -65.0..=-20.0).suffix(" dB"))
+                        .changed()
+                    {
+                        if let Some(ref dpx) = self.active_duplex {
+                            dpx.set_tx_noise_gate_db(Some(self.duplex_gate_db));
+                        }
+                    }
 
                     if ui.checkbox(&mut self.duplex_mic_muted, "Mute Outgoing Mic").changed() {
                         if let Some(ref dpx) = self.active_duplex {

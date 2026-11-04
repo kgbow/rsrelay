@@ -9,7 +9,6 @@ rsrelay-proto.workspace = true
 rsrelay-dsp.workspace = true
 rsrelay-audio.workspace = true
 rtrb.workspace = true
-tokio.workspace = true
 mdns-sd.workspace = true
 socket2.workspace = true
 hostname.workspace = true

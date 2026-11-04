@@ -181,8 +181,16 @@ void rsrelay_sck_stream_stop(void *session_ptr) {
     }
     if (@available(macOS 13.0, *)) {
         RsRelaySckSession *session = (__bridge_transfer RsRelaySckSession *)session_ptr;
-        session.delegate.callback = NULL;
-        session.delegate.userCtx = NULL;
+        if (session.audioQueue != nil) {
+            // Synchronously drain any in-flight callback on the serial audio queue before clearing pointers
+            dispatch_sync(session.audioQueue, ^{
+                session.delegate.callback = NULL;
+                session.delegate.userCtx = NULL;
+            });
+        } else {
+            session.delegate.callback = NULL;
+            session.delegate.userCtx = NULL;
+        }
 
         dispatch_semaphore_t stopSem = dispatch_semaphore_create(0);
         [session.stream stopCaptureWithCompletionHandler:^(NSError * _Nullable error) {

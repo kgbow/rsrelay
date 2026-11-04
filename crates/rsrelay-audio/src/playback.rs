@@ -151,6 +151,32 @@ pub fn start_playback_stream(
 }
 
 #[inline]
+fn read_ring_sample(first: &[f32], second: &[f32], idx: usize) -> f32 {
+    if idx < first.len() {
+        first[idx]
+    } else {
+        second[idx - first.len()]
+    }
+}
+
+#[inline]
+fn sample_for_hw_channel(
+    first: &[f32],
+    second: &[f32],
+    frame: usize,
+    hw_c: usize,
+    hw_ch: usize,
+    src_ch: usize,
+) -> f32 {
+    let base = frame * src_ch;
+    if hw_ch == 1 && src_ch >= 2 {
+        (read_ring_sample(first, second, base) + read_ring_sample(first, second, base + 1)) * 0.5
+    } else {
+        read_ring_sample(first, second, base + hw_c.min(src_ch - 1))
+    }
+}
+
+#[inline]
 fn pull_samples_f32(
     out: &mut [f32],
     hw_channels: u16,
@@ -175,12 +201,7 @@ fn pull_samples_f32(
             let (first, second) = chunk.as_slices();
             for f in 0..frames_to_read {
                 for c in 0..hw_ch {
-                    let src_idx = f * src_ch + c.min(src_ch - 1);
-                    let raw = if src_idx < first.len() {
-                        first[src_idx]
-                    } else {
-                        second[src_idx - first.len()]
-                    };
+                    let raw = sample_for_hw_channel(first, second, f, c, hw_ch, src_ch);
                     let val = (raw * gain).clamp(-1.0, 1.0);
                     let abs = val.abs();
                     if abs > max_abs {
@@ -224,12 +245,7 @@ fn pull_samples_i16(
             let (first, second) = chunk.as_slices();
             for f in 0..frames_to_read {
                 for c in 0..hw_ch {
-                    let src_idx = f * src_ch + c.min(src_ch - 1);
-                    let raw = if src_idx < first.len() {
-                        first[src_idx]
-                    } else {
-                        second[src_idx - first.len()]
-                    };
+                    let raw = sample_for_hw_channel(first, second, f, c, hw_ch, src_ch);
                     let val = (raw * gain).clamp(-1.0, 1.0);
                     let abs = val.abs();
                     if abs > max_abs {
@@ -273,12 +289,7 @@ fn pull_samples_u16(
             let (first, second) = chunk.as_slices();
             for f in 0..frames_to_read {
                 for c in 0..hw_ch {
-                    let src_idx = f * src_ch + c.min(src_ch - 1);
-                    let raw = if src_idx < first.len() {
-                        first[src_idx]
-                    } else {
-                        second[src_idx - first.len()]
-                    };
+                    let raw = sample_for_hw_channel(first, second, f, c, hw_ch, src_ch);
                     let val = (raw * gain).clamp(-1.0, 1.0);
                     let abs = val.abs();
                     if abs > max_abs {

@@ -26,7 +26,7 @@ pub enum CaptureSource {
     SystemLoopback,
     /// Capture from a microphone or line-in input device.
     Microphone,
-    /// Generate a synthetic phase-continuous 440Hz/880Hz stereo sine wave (for zero-dependency E2E testing).
+    /// Generate a synthetic phase-continuous 440Hz/660Hz stereo sine wave (for zero-dependency E2E testing).
     SyntheticTone,
 }
 
