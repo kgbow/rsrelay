@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rsrelay_core::{
-    list_audio_devices, CaptureSource, ChannelLayout, DiscoveryService, DuplexRole, DuplexSession,
-    DuplexSessionConfig, LatencyProfile, ReceiverSession, ReceiverSessionConfig, SenderSession,
-    SenderSessionConfig, DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT,
+    detect_local_lan_ip, has_system_loopback_permission, list_audio_devices, CaptureSource,
+    ChannelLayout, DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig,
+    LatencyProfile, ReceiverSession, ReceiverSessionConfig, SenderSession, SenderSessionConfig,
+    DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT,
 };
 
 #[derive(Parser)]
@@ -214,6 +215,19 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Devices => {
+            let lan_ip = detect_local_lan_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1 (Offline)".to_string());
+            println!("Local LAN IPv4 : {lan_ip}");
+            #[cfg(target_os = "macos")]
+            println!(
+                "macOS ScreenCaptureKit System Audio Permission: {}",
+                if has_system_loopback_permission() {
+                    "GRANTED (Driverless 48kHz Stereo Loopback ready)"
+                } else {
+                    "NOT GRANTED (Will prompt on first Loopback capture)"
+                }
+            );
             let devices = list_audio_devices()?;
             println!("=== Local Audio Devices ({}) ===", devices.len());
             for dev in devices {
@@ -394,9 +408,12 @@ fn main() -> anyhow::Result<()> {
 
             let session = ReceiverSession::start(cfg)?;
             let init_status = session.status();
+            let lan_hint = detect_local_lan_ip()
+                .map(|ip| format!("{ip}:{}", bind.port()))
+                .unwrap_or_else(|| bind.to_string());
             println!(
-                "Started rsrelay Receiver on {} | Output: '{}' ({} Hz) | Target Buffer: {} ms",
-                bind, init_status.device_name, init_status.sample_rate, buffer_ms
+                "Started rsrelay Receiver on {} (LAN Endpoint: {}) | Output: '{}' ({} Hz) | Target Buffer: {} ms",
+                bind, lan_hint, init_status.device_name, init_status.sample_rate, buffer_ms
             );
             println!("Press Ctrl+C to stop.");
 

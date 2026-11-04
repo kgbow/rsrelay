@@ -1,2 +1,5 @@
 [env]
+# macOS Homebrew libopus pkg-config lookup path
 PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/opus/lib/pkgconfig:/usr/local/opt/opus/lib/pkgconfig", force = false }
+# Allow CMake 4.0+ (on Windows / macOS) to build bundled libopus (cmake_minimum_required 3.1) in audiopus_sys
+CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = false }

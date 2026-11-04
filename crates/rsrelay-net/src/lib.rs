@@ -7,6 +7,6 @@ pub mod receiver;
 pub mod sender;
 
 pub use control_session::{ControlClient, ControlServer, ControlTelemetrySnapshot};
-pub use discovery::{DiscoveredPeer, DiscoveryError, DiscoveryService};
+pub use discovery::{detect_local_lan_ip, DiscoveredPeer, DiscoveryError, DiscoveryService};
 pub use receiver::{AudioReceiverWorker, ReceiverConfig, ReceiverMetrics, ReceiverSnapshot};
 pub use sender::{AudioSenderWorker, SenderConfig, SenderMetrics, SenderSnapshot};

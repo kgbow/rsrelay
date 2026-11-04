@@ -1,11 +1,27 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rsrelay_proto::{MDNS_SERVICE_TYPE, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Probe the OS routing table via a non-transmitting UDP socket to determine the primary
+/// local LAN IPv4 address (e.g. `192.168.x.x` or `10.x.x.x`). Sends zero network packets.
+pub fn detect_local_lan_ip() -> Option<IpAddr> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // Connect on a UDP socket only queries the local OS routing table; no packets are sent.
+    sock.connect("192.0.2.1:80")
+        .or_else(|_| sock.connect("8.8.8.8:80"))
+        .ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() {
+        None
+    } else {
+        Some(ip)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DiscoveryError {

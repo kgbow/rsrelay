@@ -42,7 +42,12 @@ rsrelay/
 
 ### 1. Launch Native Desktop GUI & System Tray
 ```bash
+# Auto-detects system language (English / 简体中文); switch anytime via top-bar button
 cargo run --release -p rsrelay-gui
+
+# Or explicitly start in Chinese / English:
+cargo run --release -p rsrelay-gui -- --lang zh
+cargo run --release -p rsrelay-gui -- --lang en
 ```
 
 ### 2. List Local Audio Devices (CLI)

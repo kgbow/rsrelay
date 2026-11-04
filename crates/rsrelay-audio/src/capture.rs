@@ -124,7 +124,9 @@ pub fn start_capture_stream(
     // On macOS 13+, prefer native driverless ScreenCaptureKit for SystemLoopback when no explicit device filter is set
     #[cfg(target_os = "macos")]
     if source == CaptureSource::SystemLoopback && device_name_filter.is_none() {
-        if crate::macos_sck::has_screen_capture_permission() {
+        let permitted = crate::macos_sck::has_screen_capture_permission()
+            || crate::macos_sck::request_screen_capture_permission();
+        if permitted {
             match crate::macos_sck::MacosSckStream::start(
                 48_000,
                 target_channels,
@@ -153,8 +155,8 @@ pub fn start_capture_stream(
                 }
             }
         } else {
-            tracing::info!(
-                "macOS Screen/Audio Capture TCC permission not yet granted; falling back to CoreAudio input (grant permission in System Settings > Privacy & Security > Screen & System Audio Recording)"
+            tracing::warn!(
+                "macOS Screen/Audio Capture TCC permission not yet granted; falling back to CoreAudio loopback/input (grant permission in System Settings > Privacy & Security > Screen & System Audio Recording)"
             );
         }
     }

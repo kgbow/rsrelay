@@ -1,3 +1,9 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+pub mod i18n;
+pub mod theme;
+pub mod widgets;
+
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -6,17 +12,36 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use eframe::egui;
+use eframe::egui::{self, Align, Color32, FontFamily, RichText, Rounding, Sense, Stroke, Vec2};
 use rsrelay_core::{
-    list_audio_devices, AudioDeviceInfo, CaptureSource, ChannelLayout, DiscoveredPeer,
-    DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig, LatencyProfile,
-    ReceiverSession, ReceiverSessionConfig, SenderSession, SenderSessionConfig,
+    detect_local_lan_ip, has_system_loopback_permission, list_audio_devices,
+    request_system_loopback_permission, AudioDeviceInfo, CaptureSource, ChannelLayout,
+    DiscoveredPeer, DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig,
+    LatencyProfile, ReceiverSession, ReceiverSessionConfig, SenderSession, SenderSessionConfig,
     DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT,
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     Icon, TrayIcon, TrayIconBuilder,
 };
+
+use crate::i18n::Language;
+use crate::theme::{metrics, palette};
+use crate::widgets::{
+    draw_sparkline, draw_vu_meter, latency_profile_selector, metric_tile, status_pill,
+    transport_cta_button, SparklineBuffer, VuMeterState,
+};
+
+/// Top-level studio workspace view tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceTab {
+    /// Side-by-side independent Transmitter (TX) and Receiver (RX) studio consoles.
+    DualConsole,
+    /// Simultaneous bidirectional Wireless Headset mode (System Audio Downlink + Mic Uplink).
+    FullDuplex,
+    /// Local CoreAudio / WASAPI hardware device matrix and mDNS LAN discovery inspector.
+    HardwareMatrix,
+}
 
 /// Generate a crisp 32x32 RGBA waveform icon in memory (zero external asset files needed).
 pub fn build_app_icon_rgba() -> (Vec<u8>, u32, u32) {
@@ -34,10 +59,18 @@ pub fn build_app_icon_rgba() -> (Vec<u8>, u32, u32) {
 
             if dist_sq <= 15 * 15 {
                 // Dark indigo circular badge background
-                rgba[idx] = 28;
-                rgba[idx + 1] = 33;
-                rgba[idx + 2] = 53;
+                rgba[idx] = 18;
+                rgba[idx + 1] = 23;
+                rgba[idx + 2] = 34;
                 rgba[idx + 3] = 255;
+
+                // Subtle outer ring highlight
+                if dist_sq >= 14 * 14 {
+                    rgba[idx] = 0;
+                    rgba[idx + 1] = 212;
+                    rgba[idx + 2] = 170;
+                    rgba[idx + 3] = 180;
+                }
 
                 // Equalizer bars inside badge
                 if (4..28).contains(&x) && (x - 4) % 3 != 2 {
@@ -60,18 +93,31 @@ pub fn build_app_icon_rgba() -> (Vec<u8>, u32, u32) {
 
 struct SystemTrayHandles {
     _tray: TrayIcon,
+    title_item: MenuItem,
+    stop_all_item: MenuItem,
+    quit_item: MenuItem,
     stop_all_id: tray_icon::menu::MenuId,
     quit_id: tray_icon::menu::MenuId,
 }
 
-fn init_system_tray() -> anyhow::Result<SystemTrayHandles> {
+impl SystemTrayHandles {
+    fn set_language(&self, lang: Language) {
+        let t = lang.texts();
+        self.title_item.set_text(t.tray_title);
+        self.stop_all_item.set_text(t.tray_stop_all);
+        self.quit_item.set_text(t.tray_quit);
+    }
+}
+
+fn init_system_tray(lang: Language) -> anyhow::Result<SystemTrayHandles> {
     let (rgba, w, h) = build_app_icon_rgba();
     let icon = Icon::from_rgba(rgba, w, h)?;
+    let t = lang.texts();
 
     let menu = Menu::new();
-    let title_item = MenuItem::new("rsrelay — Ultra-Low-Latency Audio Relay", false, None);
-    let stop_all_item = MenuItem::new("Stop All Audio Streams", true, None);
-    let quit_item = MenuItem::new("Quit rsrelay", true, None);
+    let title_item = MenuItem::new(t.tray_title, false, None);
+    let stop_all_item = MenuItem::new(t.tray_stop_all, true, None);
+    let quit_item = MenuItem::new(t.tray_quit, true, None);
 
     let stop_all_id = stop_all_item.id().clone();
     let quit_id = quit_item.id().clone();
@@ -82,18 +128,27 @@ fn init_system_tray() -> anyhow::Result<SystemTrayHandles> {
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("rsrelay — Audio Relay")
+        .with_tooltip("rsrelay — Studio Audio Relay")
         .with_icon(icon)
         .build()?;
 
     Ok(SystemTrayHandles {
         _tray: tray,
+        title_item,
+        stop_all_item,
+        quit_item,
         stop_all_id,
         quit_id,
     })
 }
 
 pub struct RsRelayGuiApp {
+    pub lang: Language,
+    pub active_tab: WorkspaceTab,
+    theme_initialized: bool,
+    pub local_lan_ip: Option<IpAddr>,
+    pub sck_permission_granted: bool,
+
     pub devices: Vec<AudioDeviceInfo>,
     pending_devices: Arc<Mutex<Option<(Vec<AudioDeviceInfo>, bool)>>>,
     polling_devices: Arc<AtomicBool>,
@@ -125,6 +180,14 @@ pub struct RsRelayGuiApp {
     pub duplex_mic_muted: bool,
     pub active_duplex: Option<DuplexSession>,
 
+    // Real-time studio VU meters & telemetry sparklines
+    tx_vu_meter: VuMeterState,
+    rx_vu_meter: VuMeterState,
+    duplex_tx_vu_meter: VuMeterState,
+    duplex_rx_vu_meter: VuMeterState,
+    rx_buffer_sparkline: SparklineBuffer,
+    duplex_buffer_sparkline: SparklineBuffer,
+
     // Status message & tray
     pub auto_follow_default_device: bool,
     last_device_poll: std::time::Instant,
@@ -134,10 +197,26 @@ pub struct RsRelayGuiApp {
 
 impl RsRelayGuiApp {
     pub fn new() -> anyhow::Result<Self> {
+        Self::new_with_tray(true)
+    }
+
+    pub fn new_with_tray(enable_tray: bool) -> anyhow::Result<Self> {
+        let lang = Language::detect_system();
         let devices = list_audio_devices().unwrap_or_default();
-        let tray = init_system_tray().ok();
+        let tray = if enable_tray {
+            init_system_tray(lang).ok()
+        } else {
+            None
+        };
+        let local_lan_ip = detect_local_lan_ip();
+        let sck_permission_granted = has_system_loopback_permission();
 
         Ok(Self {
+            lang,
+            active_tab: WorkspaceTab::DualConsole,
+            theme_initialized: false,
+            local_lan_ip,
+            sck_permission_granted,
             devices,
             pending_devices: Arc::new(Mutex::new(None)),
             polling_devices: Arc::new(AtomicBool::new(false)),
@@ -162,11 +241,26 @@ impl RsRelayGuiApp {
             duplex_gate_db: -45.0,
             duplex_mic_muted: false,
             active_duplex: None,
+            tx_vu_meter: VuMeterState::default(),
+            rx_vu_meter: VuMeterState::default(),
+            duplex_tx_vu_meter: VuMeterState::default(),
+            duplex_rx_vu_meter: VuMeterState::default(),
+            rx_buffer_sparkline: SparklineBuffer::new(64),
+            duplex_buffer_sparkline: SparklineBuffer::new(64),
             auto_follow_default_device: true,
             last_device_poll: std::time::Instant::now(),
-            last_status_msg: "Ready. Select a mode below to start streaming.".to_string(),
+            last_status_msg: lang.status_ready(),
             tray,
         })
+    }
+
+    /// Switch the UI language and update system tray items & status message.
+    pub fn set_language(&mut self, lang: Language) {
+        self.lang = lang;
+        if let Some(ref tray) = self.tray {
+            tray.set_language(lang);
+        }
+        self.last_status_msg = lang.status_language_switched();
     }
 
     /// Trigger an asynchronous hardware audio device enumeration on a background thread
@@ -210,16 +304,13 @@ impl RsRelayGuiApp {
             .map(|d| d.name.clone());
 
         self.devices = new_devices;
+        self.local_lan_ip = detect_local_lan_ip();
+        self.sck_permission_granted = has_system_loopback_permission();
 
         if manual {
-            self.last_status_msg = format!(
-                "Refreshed audio ports: {} input(s), {} output(s) detected.",
-                in_count, out_count
-            );
+            self.last_status_msg = self.lang.status_refreshed_ports(in_count, out_count);
         }
 
-        // If Auto-Follow Default is enabled (or user clicked manual Refresh while on System Default),
-        // check if the OS default playback/capture device changed (e.g. newly plugged-in USB/3.5mm headset)
         if self.auto_follow_default_device || manual {
             if self.selected_rx_device.is_none() {
                 if let (Some(ref rx), Some(ref def_out)) = (&self.active_receiver, &new_default_out)
@@ -227,8 +318,7 @@ impl RsRelayGuiApp {
                     if &rx.status().device_name != def_out {
                         self.active_receiver = None;
                         self.toggle_receiver();
-                        self.last_status_msg =
-                            format!("Hot-swapped output to newly connected default: '{def_out}'");
+                        self.last_status_msg = self.lang.status_hotswapped_output(def_out);
                     }
                 }
             }
@@ -240,8 +330,7 @@ impl RsRelayGuiApp {
                     if &tx.status().device_name != def_in {
                         self.active_sender = None;
                         self.toggle_sender();
-                        self.last_status_msg =
-                            format!("Hot-swapped input to newly connected default: '{def_in}'");
+                        self.last_status_msg = self.lang.status_hotswapped_input(def_in);
                     }
                 }
             }
@@ -253,6 +342,7 @@ impl RsRelayGuiApp {
             return;
         }
         self.scanning_lan.store(true, Ordering::Relaxed);
+        self.last_status_msg = self.lang.status_scanning_lan();
         let peers_arc = Arc::clone(&self.discovered_peers);
         let scanning_flag = Arc::clone(&self.scanning_lan);
 
@@ -268,10 +358,19 @@ impl RsRelayGuiApp {
         });
     }
 
+    pub fn stop_all_streams(&mut self) {
+        self.active_sender = None;
+        self.active_receiver = None;
+        self.active_duplex = None;
+        self.rx_buffer_sparkline.clear();
+        self.duplex_buffer_sparkline.clear();
+        self.last_status_msg = self.lang.status_all_stopped();
+    }
+
     pub fn toggle_sender(&mut self) {
         if self.active_sender.is_some() {
             self.active_sender = None;
-            self.last_status_msg = "Sender stopped.".to_string();
+            self.last_status_msg = self.lang.status_sender_stopped();
             return;
         }
 
@@ -281,7 +380,7 @@ impl RsRelayGuiApp {
         let target_addr: SocketAddr = match self.target_addr_input.trim().parse() {
             Ok(addr) => addr,
             Err(e) => {
-                self.last_status_msg = format!("Invalid Target IP:Port: {e}");
+                self.last_status_msg = self.lang.status_invalid_target_addr(&e);
                 return;
             }
         };
@@ -300,15 +399,18 @@ impl RsRelayGuiApp {
 
         match SenderSession::start(cfg) {
             Ok(session) => {
+                self.sck_permission_granted = has_system_loopback_permission();
                 let st = session.status();
-                self.last_status_msg = format!(
-                    "Streaming '{}' ({} Hz) -> {}",
-                    st.device_name, st.sample_rate, target_addr
+                self.last_status_msg = self.lang.status_sender_streaming(
+                    &st.device_name,
+                    st.sample_rate,
+                    target_addr,
                 );
                 self.active_sender = Some(session);
             }
             Err(e) => {
-                self.last_status_msg = format!("Failed to start sender: {e}");
+                self.sck_permission_granted = has_system_loopback_permission();
+                self.last_status_msg = self.lang.status_sender_failed(&e);
             }
         }
     }
@@ -316,7 +418,8 @@ impl RsRelayGuiApp {
     pub fn toggle_receiver(&mut self) {
         if self.active_receiver.is_some() {
             self.active_receiver = None;
-            self.last_status_msg = "Receiver stopped.".to_string();
+            self.rx_buffer_sparkline.clear();
+            self.last_status_msg = self.lang.status_receiver_stopped();
             return;
         }
 
@@ -326,7 +429,7 @@ impl RsRelayGuiApp {
         let bind_addr: SocketAddr = match self.bind_addr_input.trim().parse() {
             Ok(addr) => addr,
             Err(e) => {
-                self.last_status_msg = format!("Invalid Bind IP:Port: {e}");
+                self.last_status_msg = self.lang.status_invalid_bind_addr(&e);
                 return;
             }
         };
@@ -344,14 +447,16 @@ impl RsRelayGuiApp {
         match ReceiverSession::start(cfg) {
             Ok(session) => {
                 let st = session.status();
-                self.last_status_msg = format!(
-                    "Listening on {} -> Output '{}' ({} Hz)",
-                    bind_addr, st.device_name, st.sample_rate
+                self.rx_buffer_sparkline.clear();
+                self.last_status_msg = self.lang.status_receiver_listening(
+                    bind_addr,
+                    &st.device_name,
+                    st.sample_rate,
                 );
                 self.active_receiver = Some(session);
             }
             Err(e) => {
-                self.last_status_msg = format!("Failed to start receiver: {e}");
+                self.last_status_msg = self.lang.status_receiver_failed(&e);
             }
         }
     }
@@ -359,7 +464,8 @@ impl RsRelayGuiApp {
     pub fn toggle_duplex(&mut self) {
         if self.active_duplex.is_some() {
             self.active_duplex = None;
-            self.last_status_msg = "Full-Duplex session stopped.".to_string();
+            self.duplex_buffer_sparkline.clear();
+            self.last_status_msg = self.lang.status_duplex_stopped();
             return;
         }
 
@@ -370,7 +476,7 @@ impl RsRelayGuiApp {
         let peer_ip: IpAddr = match self.duplex_peer_ip_input.trim().parse() {
             Ok(ip) => ip,
             Err(e) => {
-                self.last_status_msg = format!("Invalid Peer IP address: {e}");
+                self.last_status_msg = self.lang.status_invalid_peer_ip(&e);
                 return;
             }
         };
@@ -388,39 +494,1488 @@ impl RsRelayGuiApp {
             Ok(session) => {
                 session.set_tx_muted(self.duplex_mic_muted);
                 let st = session.status();
-                self.last_status_msg = format!(
-                    "Full-Duplex [{:?}] active <-> {} (TX: '{}', RX: '{}')",
-                    self.duplex_role, peer_ip, st.tx.device_name, st.rx.device_name
+                self.duplex_buffer_sparkline.clear();
+                self.last_status_msg = self.lang.status_duplex_active(
+                    self.duplex_role,
+                    peer_ip,
+                    &st.tx.device_name,
+                    &st.rx.device_name,
                 );
                 self.active_duplex = Some(session);
             }
             Err(e) => {
-                self.last_status_msg = format!("Failed to start Full-Duplex session: {e}");
+                self.last_status_msg = self.lang.status_duplex_failed(&e);
             }
         }
     }
-}
 
-impl eframe::App for RsRelayGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// Sample live audio meters and sparklines on each UI frame.
+    fn update_live_telemetry(&mut self) {
+        if let Some(ref tx) = self.active_sender {
+            let st = tx.status();
+            self.tx_vu_meter.update(st.peak_level, true);
+        } else {
+            self.tx_vu_meter.update(0.0, false);
+        }
+
+        if let Some(ref rx) = self.active_receiver {
+            let st = rx.status();
+            self.rx_vu_meter.update(st.peak_level, true);
+            if st.net.packets_received > 0 {
+                self.rx_buffer_sparkline.push(st.net.buffer_level_ms);
+            }
+        } else {
+            self.rx_vu_meter.update(0.0, false);
+        }
+
+        if let Some(ref dpx) = self.active_duplex {
+            let st = dpx.status();
+            self.duplex_tx_vu_meter.update(st.tx.peak_level, true);
+            self.duplex_rx_vu_meter.update(st.rx.peak_level, true);
+            if st.rx.net.packets_received > 0 {
+                self.duplex_buffer_sparkline.push(st.rx.net.buffer_level_ms);
+            }
+        } else {
+            self.duplex_tx_vu_meter.update(0.0, false);
+            self.duplex_rx_vu_meter.update(0.0, false);
+        }
+    }
+
+    fn render_top_header(&mut self, ctx: &egui::Context) {
+        let t = self.lang.texts();
+        egui::TopBottomPanel::top("studio_header_bar")
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::BG_SURFACE)
+                    .stroke(Stroke::new(1.0_f32, palette::BORDER_SUBTLE))
+                    .inner_margin(egui::Margin::symmetric(18.0, 11.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Left: Brand Logo Badge + Title
+                    let (logo_rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                    if ui.is_rect_visible(logo_rect) {
+                        let p = ui.painter();
+                        p.circle(
+                            logo_rect.center(),
+                            13.5,
+                            palette::BG_TRENCH,
+                            Stroke::new(1.5_f32, palette::ACCENT_MINT),
+                        );
+                        let bars = [5.0f32, 11.0, 16.0, 10.0, 14.0];
+                        for (i, &bh) in bars.iter().enumerate() {
+                            let bx = logo_rect.center().x - 6.0 + (i as f32) * 3.0;
+                            let by0 = logo_rect.center().y - bh * 0.5;
+                            let by1 = logo_rect.center().y + bh * 0.5;
+                            p.line_segment(
+                                [egui::pos2(bx, by0), egui::pos2(bx, by1)],
+                                Stroke::new(1.8_f32, palette::ACCENT_MINT),
+                            );
+                        }
+                    }
+
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("rsrelay")
+                                    .size(16.5)
+                                    .color(palette::TEXT_PRIMARY)
+                                    .strong(),
+                            );
+                            egui::Frame::none()
+                                .fill(palette::ACCENT_MINT_GLOW)
+                                .stroke(Stroke::new(1.0_f32, palette::ACCENT_MINT))
+                                .rounding(Rounding::same(4.0))
+                                .inner_margin(egui::Margin::symmetric(5.0, 1.0))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("STUDIO DSP")
+                                            .size(9.0)
+                                            .family(FontFamily::Monospace)
+                                            .color(palette::ACCENT_MINT)
+                                            .strong(),
+                                    );
+                                });
+                        });
+                        ui.label(
+                            RichText::new(t.app_subtitle)
+                                .size(10.5)
+                                .color(palette::TEXT_MUTED),
+                        );
+                    });
+
+                    ui.add_space(16.0);
+
+                    // Center: Segmented Workspace Mode Switcher
+                    egui::Frame::none()
+                        .fill(palette::BG_TRENCH)
+                        .stroke(Stroke::new(1.0_f32, palette::BORDER_SUBTLE))
+                        .rounding(Rounding::same(metrics::RADIUS_WIDGET))
+                        .inner_margin(egui::Margin::same(3.0))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let tabs = [
+                                (WorkspaceTab::DualConsole, t.tab_dual_console),
+                                (WorkspaceTab::FullDuplex, t.tab_full_duplex),
+                                (WorkspaceTab::HardwareMatrix, t.tab_hardware_matrix),
+                            ];
+                            for (tab, label) in tabs {
+                                let selected = self.active_tab == tab;
+                                let fill = if selected {
+                                    palette::BG_ACTIVE
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                let fg = if selected {
+                                    palette::ACCENT_MINT
+                                } else {
+                                    palette::TEXT_SECONDARY
+                                };
+                                let stroke = if selected {
+                                    Stroke::new(1.0_f32, palette::ACCENT_MINT)
+                                } else {
+                                    Stroke::NONE
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(label).size(12.0).color(fg).strong(),
+                                        )
+                                        .fill(fill)
+                                        .stroke(stroke)
+                                        .rounding(Rounding::same(5.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.active_tab = tab;
+                                }
+                            }
+                        });
+
+                    // Right: Language Switcher, Quick LAN Scan & Refresh actions + Live Stream Indicators
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .button(
+                                RichText::new(t.lang_toggle_btn)
+                                    .size(11.5)
+                                    .color(palette::ACCENT_MINT)
+                                    .strong(),
+                            )
+                            .on_hover_text(t.lang_toggle_hover)
+                            .clicked()
+                        {
+                            self.set_language(self.lang.toggle());
+                        }
+
+                        if ui
+                            .button(RichText::new(t.btn_refresh_ports).size(12.0))
+                            .on_hover_text(t.btn_refresh_ports_hover)
+                            .clicked()
+                        {
+                            self.refresh_audio_devices(true);
+                        }
+
+                        let scanning = self.scanning_lan.load(Ordering::Relaxed);
+                        let scan_label = if scanning {
+                            t.btn_scanning_lan
+                        } else {
+                            t.btn_scan_lan
+                        };
+                        if ui
+                            .add_enabled(
+                                !scanning,
+                                egui::Button::new(RichText::new(scan_label).size(12.0)),
+                            )
+                            .on_hover_text(t.btn_scan_lan_hover)
+                            .clicked()
+                        {
+                            self.trigger_lan_scan();
+                        }
+
+                        if self.active_duplex.is_some() {
+                            status_pill(ui, "DUPLEX LIVE", true, palette::ACCENT_INDIGO);
+                        } else {
+                            if self.active_receiver.is_some() {
+                                status_pill(ui, "RX LIVE", true, palette::ACCENT_CYAN);
+                            }
+                            if self.active_sender.is_some() {
+                                status_pill(ui, "TX LIVE", true, palette::ACCENT_MINT);
+                            }
+                        }
+
+                        if let Some(ip) = self.local_lan_ip {
+                            let ip_label = format!("LAN: {ip}");
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(ip_label)
+                                            .size(11.0)
+                                            .family(FontFamily::Monospace)
+                                            .color(palette::ACCENT_CYAN),
+                                    )
+                                    .fill(palette::BG_TRENCH)
+                                    .stroke(Stroke::new(1.0_f32, palette::BORDER_SUBTLE))
+                                    .rounding(Rounding::same(metrics::RADIUS_PILL)),
+                                )
+                                .on_hover_text(t.lan_ip_hover)
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(ip.to_string());
+                                self.last_status_msg = self.lang.status_copied_lan_ip(ip);
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    fn render_bottom_footer(&mut self, ctx: &egui::Context) {
+        let t = self.lang.texts();
+        egui::TopBottomPanel::bottom("studio_footer_bar")
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::BG_SURFACE)
+                    .stroke(Stroke::new(1.0_f32, palette::BORDER_SUBTLE))
+                    .inner_margin(egui::Margin::symmetric(18.0, 7.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let any_active = self.active_sender.is_some()
+                        || self.active_receiver.is_some()
+                        || self.active_duplex.is_some();
+                    let dot_color = if any_active {
+                        palette::ACCENT_MINT
+                    } else {
+                        palette::TEXT_MUTED
+                    };
+                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                    ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
+
+                    ui.label(
+                        RichText::new(&self.last_status_msg)
+                            .size(11.5)
+                            .color(palette::TEXT_SECONDARY),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if any_active
+                            && ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(t.btn_stop_all)
+                                            .size(11.0)
+                                            .color(Color32::WHITE)
+                                            .strong(),
+                                    )
+                                    .fill(palette::STATUS_DANGER_DIM)
+                                    .stroke(Stroke::new(1.0_f32, palette::STATUS_DANGER)),
+                                )
+                                .clicked()
+                        {
+                            self.stop_all_streams();
+                        }
+
+                        ui.checkbox(
+                            &mut self.auto_follow_default_device,
+                            RichText::new(t.chk_auto_follow_hotplug)
+                                .size(11.5)
+                                .color(palette::TEXT_SECONDARY),
+                        );
+
+                        let in_cnt = self.devices.iter().filter(|d| d.is_input).count();
+                        let out_cnt = self.devices.iter().filter(|d| d.is_output).count();
+                        ui.label(
+                            RichText::new(format!("{in_cnt} IN / {out_cnt} OUT"))
+                                .size(11.0)
+                                .family(FontFamily::Monospace)
+                                .color(palette::TEXT_MUTED),
+                        );
+                    });
+                });
+            });
+    }
+
+    fn render_lan_discovery_strip(&mut self, ui: &mut egui::Ui) {
+        let peers_snapshot = self
+            .discovered_peers
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        if peers_snapshot.is_empty() {
+            return;
+        }
+
+        let t = self.lang.texts();
+        theme::trench_frame().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(t.discovered_lan_peers)
+                        .size(10.5)
+                        .family(FontFamily::Monospace)
+                        .color(palette::ACCENT_CYAN)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                for peer in &peers_snapshot {
+                    if let Some(ip) = peer.addresses.first() {
+                        let addr_str = format!("{ip}:{}", peer.udp_port);
+                        let is_selected = self.target_addr_input == addr_str
+                            || self.duplex_peer_ip_input == ip.to_string();
+                        let chip_label =
+                            format!("{} ({}) • {}", peer.hostname, peer.os, addr_str);
+                        let stroke_col = if is_selected {
+                            palette::ACCENT_MINT
+                        } else {
+                            palette::BORDER_WIDGET
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(chip_label)
+                                        .size(11.5)
+                                        .family(FontFamily::Monospace)
+                                        .color(if is_selected {
+                                            palette::ACCENT_MINT
+                                        } else {
+                                            palette::TEXT_PRIMARY
+                                        }),
+                                )
+                                .stroke(Stroke::new(1.0_f32, stroke_col))
+                                .rounding(Rounding::same(metrics::RADIUS_PILL)),
+                            )
+                            .on_hover_text(t.discovered_peer_hover)
+                            .clicked()
+                        {
+                            self.target_addr_input = addr_str.clone();
+                            self.duplex_peer_ip_input = ip.to_string();
+                            self.last_status_msg =
+                                self.lang.status_selected_lan_peer(&peer.hostname, &addr_str);
+                        }
+                    }
+                }
+            });
+        });
+        ui.add_space(metrics::SPACE_SM);
+    }
+
+    fn render_dual_console_tab(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        let t = lang.texts();
+        ui.columns(2, |columns| {
+            // =========================================================================
+            // LEFT COLUMN: 01 // TRANSMITTER (SENDER)
+            // =========================================================================
+            let tx_running = self.active_sender.is_some();
+            theme::studio_card_frame(tx_running, palette::ACCENT_MINT).show(
+                &mut columns[0],
+                |ui| {
+                    // Card Header
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(
+                                RichText::new(t.tx_card_title)
+                                    .size(13.5)
+                                    .family(FontFamily::Monospace)
+                                    .color(palette::TEXT_PRIMARY)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new(t.tx_card_subtitle)
+                                    .size(11.0)
+                                    .color(palette::TEXT_MUTED),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            status_pill(
+                                ui,
+                                if tx_running {
+                                    t.status_streaming
+                                } else {
+                                    t.status_standby
+                                },
+                                tx_running,
+                                palette::ACCENT_MINT,
+                            );
+                        });
+                    });
+
+                    ui.add_space(metrics::SPACE_SM);
+                    ui.separator();
+                    ui.add_space(metrics::SPACE_XS);
+
+                    // Aligned Form Grid
+                    egui::Grid::new("sender_form_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 9.0])
+                        .min_col_width(metrics::LABEL_COL_WIDTH)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(t.label_target_ip_port)
+                                    .color(palette::TEXT_SECONDARY),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.target_addr_input)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(ui.available_width()),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                RichText::new(t.label_audio_source)
+                                    .color(palette::TEXT_SECONDARY),
+                            );
+                            egui::ComboBox::from_id_salt("source_combo")
+                                .width(ui.available_width())
+                                .selected_text(match self.selected_source {
+                                    CaptureSource::SystemLoopback => t.source_system_loopback,
+                                    CaptureSource::Microphone => t.source_microphone,
+                                    CaptureSource::SyntheticTone => t.source_synthetic_tone,
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.selected_source,
+                                        CaptureSource::SystemLoopback,
+                                        t.source_system_loopback,
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.selected_source,
+                                        CaptureSource::Microphone,
+                                        t.source_microphone,
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.selected_source,
+                                        CaptureSource::SyntheticTone,
+                                        t.source_synthetic_tone,
+                                    );
+                                });
+                            ui.end_row();
+
+                            ui.label(
+                                RichText::new(t.label_input_device)
+                                    .color(palette::TEXT_SECONDARY),
+                            );
+                            ui.horizontal(|ui| {
+                                let current_label = self
+                                    .selected_tx_device
+                                    .as_deref()
+                                    .unwrap_or(t.device_system_default);
+                                let prev_dev = self.selected_tx_device.clone();
+                                egui::ComboBox::from_id_salt("tx_device_combo")
+                                    .width((ui.available_width() - 32.0).max(120.0))
+                                    .selected_text(current_label)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.selected_tx_device,
+                                            None,
+                                            t.device_system_default,
+                                        );
+                                        for dev in &self.devices {
+                                            let eligible = dev.is_input
+                                                || (cfg!(target_os = "windows")
+                                                    && self.selected_source
+                                                        == CaptureSource::SystemLoopback
+                                                    && dev.is_output);
+                                            if eligible {
+                                                let label = format!(
+                                                    "{} ({} Hz)",
+                                                    dev.name,
+                                                    dev.default_sample_rate.unwrap_or(48_000)
+                                                );
+                                                ui.selectable_value(
+                                                    &mut self.selected_tx_device,
+                                                    Some(dev.name.clone()),
+                                                    label,
+                                                );
+                                            }
+                                        }
+                                    });
+                                if self.selected_tx_device != prev_dev
+                                    && self.active_sender.is_some()
+                                {
+                                    self.active_sender = None;
+                                    self.toggle_sender();
+                                }
+                                if ui
+                                    .small_button("↻")
+                                    .on_hover_text(t.hover_refresh_input_ports)
+                                    .clicked()
+                                {
+                                    self.refresh_audio_devices(true);
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label(
+                                RichText::new(t.label_opus_bitrate)
+                                    .color(palette::TEXT_SECONDARY),
+                            );
+                            ui.add_enabled(
+                                self.selected_profile != LatencyProfile::LosslessPcm,
+                                egui::Slider::new(&mut self.opus_bitrate_kbps, 32..=256)
+                                    .suffix(" kbps"),
+                            );
+                            ui.end_row();
+                        });
+
+                    if cfg!(target_os = "macos")
+                        && self.selected_source == CaptureSource::SystemLoopback
+                        && self.selected_tx_device.is_none()
+                    {
+                        ui.add_space(metrics::SPACE_XS);
+                        ui.horizontal(|ui| {
+                            if self.sck_permission_granted {
+                                status_pill(
+                                    ui,
+                                    t.macos_sck_ready,
+                                    true,
+                                    palette::ACCENT_MINT,
+                                );
+                            } else {
+                                status_pill(
+                                    ui,
+                                    t.macos_perm_required,
+                                    true,
+                                    palette::STATUS_WARN,
+                                );
+                                if ui
+                                    .button(
+                                        RichText::new(t.btn_grant_perm)
+                                            .size(11.5)
+                                            .color(palette::ACCENT_MINT)
+                                            .strong(),
+                                    )
+                                    .on_hover_text(t.hover_grant_perm)
+                                    .clicked()
+                                {
+                                    self.sck_permission_granted =
+                                        request_system_loopback_permission();
+                                    self.last_status_msg = if self.sck_permission_granted {
+                                        lang.status_sck_granted()
+                                    } else {
+                                        lang.status_sck_prompted()
+                                    };
+                                }
+                            }
+                        });
+                    }
+
+                    ui.add_space(metrics::SPACE_SM);
+                    ui.label(
+                        RichText::new(t.section_latency_profile)
+                            .size(10.5)
+                            .family(FontFamily::Monospace)
+                            .color(palette::TEXT_MUTED)
+                            .strong(),
+                    );
+                    latency_profile_selector(ui, &mut self.selected_profile, lang);
+
+                    ui.add_space(metrics::SPACE_SM);
+                    if transport_cta_button(
+                        ui,
+                        t.btn_start_tx,
+                        t.btn_stop_tx,
+                        tx_running,
+                        palette::ACCENT_MINT,
+                    ) {
+                        self.toggle_sender();
+                    }
+
+                    ui.add_space(metrics::SPACE_SM);
+                    ui.separator();
+                    ui.add_space(metrics::SPACE_XS);
+
+                    // Studio VU Meter
+                    draw_vu_meter(
+                        ui,
+                        t.vu_input_capture,
+                        &self.tx_vu_meter,
+                        tx_running,
+                        false,
+                        None,
+                    );
+
+                    ui.add_space(metrics::SPACE_SM);
+
+                    // 3-Column Bento Telemetry Grid
+                    let (pkts_str, kb_str, hb_str, rtt_str, rbuf_str, rtt_col) =
+                        if let Some(ref sender) = self.active_sender {
+                            let st = sender.status();
+                            let pkts = format!("{}", st.net.packets_sent);
+                            let kb = format!("{:.1} KB sent", (st.net.bytes_sent as f64) / 1024.0);
+                            let hb = format!("{} frames", st.net.silence_heartbeats_sent);
+                            if st.control.connected {
+                                (
+                                    pkts,
+                                    kb,
+                                    hb,
+                                    format!("{:.2} ms", (st.control.rtt_us as f64) / 1000.0),
+                                    format!("Remote Buf: {:.1} ms", st.control.remote_buffer_ms),
+                                    palette::ACCENT_CYAN,
+                                )
+                            } else {
+                                (
+                                    pkts,
+                                    kb,
+                                    hb,
+                                    "UDP Direct".to_string(),
+                                    format!("{} Hz Stereo", st.sample_rate),
+                                    palette::TEXT_PRIMARY,
+                                )
+                            }
+                        } else {
+                            (
+                                "0".to_string(),
+                                "0.0 KB sent".to_string(),
+                                "0 frames".to_string(),
+                                "Offline".to_string(),
+                                t.awaiting_tx.to_string(),
+                                palette::TEXT_MUTED,
+                            )
+                        };
+
+                    ui.columns(3, |cols| {
+                        metric_tile(
+                            &mut cols[0],
+                            t.tile_packets_tx,
+                            &pkts_str,
+                            &kb_str,
+                            if tx_running {
+                                palette::ACCENT_MINT
+                            } else {
+                                palette::TEXT_MUTED
+                            },
+                        );
+                        metric_tile(
+                            &mut cols[1],
+                            t.tile_silence_heartbeat,
+                            &hb_str,
+                            t.tile_silence_sub,
+                            if tx_running {
+                                palette::TEXT_PRIMARY
+                            } else {
+                                palette::TEXT_MUTED
+                            },
+                        );
+                        metric_tile(
+                            &mut cols[2],
+                            t.tile_control_telemetry,
+                            &rtt_str,
+                            &rbuf_str,
+                            rtt_col,
+                        );
+                    });
+                },
+            );
+
+            // =========================================================================
+            // RIGHT COLUMN: 02 // RECEIVER (LISTENER)
+            // =========================================================================
+            let rx_running = self.active_receiver.is_some();
+            theme::studio_card_frame(rx_running, palette::ACCENT_CYAN).show(
+                &mut columns[1],
+                |ui| {
+                    // Card Header
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(
+                                RichText::new(t.rx_card_title)
+                                    .size(13.5)
+                                    .family(FontFamily::Monospace)
+                                    .color(palette::TEXT_PRIMARY)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new(t.rx_card_subtitle)
+                                    .size(11.0)
+                                    .color(palette::TEXT_MUTED),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            status_pill(
+                                ui,
+                                if rx_running {
+                                    t.status_listening
+                                } else {
+                                    t.status_standby
+                                },
+                                rx_running,
+                                palette::ACCENT_CYAN,
+                            );
+                        });
+                    });
+
+                    ui.add_space(metrics::SPACE_SM);
+                    ui.separator();
+                    ui.add_space(metrics::SPACE_XS);
+
+                    // Aligned Form Grid
+                    egui::Grid::new("receiver_form_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 9.0])
+                        .min_col_width(metrics::LABEL_COL_WIDTH)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(t.label_bind_ip_port).color(palette::TEXT_SECONDARY),
+                            );
+                            ui.horizontal(|ui| {
+                                let lan_ip = self.local_lan_ip;
+                                let text_w = if lan_ip.is_some() {
+                                    (ui.available_width() - 92.0).max(110.0)
+                                } else {
+                                    ui.available_width()
+                                };
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.bind_addr_input)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(text_w),
+                                );
+                                if let Some(ip) = lan_ip {
+                                    let port = self
+                                        .bind_addr_input
+                                        .trim()
+                                        .parse::<SocketAddr>()
+                                        .map(|a| a.port())
+                                        .unwrap_or(DEFAULT_AUDIO_UDP_PORT);
+                                    let endpoint = format!("{ip}:{port}");
+                                    if ui
+                                        .small_button(
+                                            RichText::new(t.btn_copy_lan)
+                                                .size(11.0)
+                                                .color(palette::ACCENT_CYAN),
+                                        )
+                                        .on_hover_text(lang.hover_copy_rx_endpoint(&endpoint))
+                                        .clicked()
+                                    {
+                                        ui.ctx().copy_text(endpoint.clone());
+                                        self.last_status_msg =
+                                            lang.status_copied_rx_endpoint(&endpoint);
+                                    }
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label(
+                                RichText::new(t.label_output_device).color(palette::TEXT_SECONDARY),
+                            );
+                            ui.horizontal(|ui| {
+                                let current_label = self
+                                    .selected_rx_device
+                                    .as_deref()
+                                    .unwrap_or(t.device_system_default);
+                                let prev_dev = self.selected_rx_device.clone();
+                                egui::ComboBox::from_id_salt("rx_device_combo")
+                                    .width((ui.available_width() - 32.0).max(120.0))
+                                    .selected_text(current_label)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.selected_rx_device,
+                                            None,
+                                            t.device_system_default,
+                                        );
+                                        for dev in &self.devices {
+                                            if dev.is_output {
+                                                let label = format!(
+                                                    "{} ({} Hz)",
+                                                    dev.name,
+                                                    dev.default_sample_rate.unwrap_or(48_000)
+                                                );
+                                                ui.selectable_value(
+                                                    &mut self.selected_rx_device,
+                                                    Some(dev.name.clone()),
+                                                    label,
+                                                );
+                                            }
+                                        }
+                                    });
+                                if self.selected_rx_device != prev_dev
+                                    && self.active_receiver.is_some()
+                                {
+                                    self.active_receiver = None;
+                                    self.toggle_receiver();
+                                }
+                                if ui
+                                    .small_button("↻")
+                                    .on_hover_text(t.hover_refresh_output_ports)
+                                    .clicked()
+                                {
+                                    self.refresh_audio_devices(true);
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label(
+                                RichText::new(t.label_target_buffer).color(palette::TEXT_SECONDARY),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut self.target_buffer_ms, 5..=80)
+                                    .suffix(" ms"),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                RichText::new(t.label_output_gain).color(palette::TEXT_SECONDARY),
+                            );
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut self.volume, 0.0..=2.0)
+                                        .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
+                                )
+                                .changed()
+                            {
+                                if let Some(ref rx) = self.active_receiver {
+                                    rx.set_volume(self.volume);
+                                }
+                                if let Some(ref dpx) = self.active_duplex {
+                                    dpx.set_rx_volume(self.volume);
+                                }
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.add_space(metrics::SPACE_XS);
+                    ui.checkbox(
+                        &mut self.advertise_mdns,
+                        RichText::new(t.chk_advertise_mdns)
+                            .size(12.0)
+                            .color(palette::TEXT_SECONDARY),
+                    );
+
+                    ui.add_space(metrics::SPACE_SM);
+                    if transport_cta_button(
+                        ui,
+                        t.btn_start_rx,
+                        t.btn_stop_rx,
+                        rx_running,
+                        palette::ACCENT_CYAN,
+                    ) {
+                        self.toggle_receiver();
+                    }
+
+                    ui.add_space(metrics::SPACE_SM);
+                    ui.separator();
+                    ui.add_space(metrics::SPACE_XS);
+
+                    // Studio VU Meter
+                    draw_vu_meter(
+                        ui,
+                        t.vu_output_playback,
+                        &self.rx_vu_meter,
+                        rx_running,
+                        false,
+                        None,
+                    );
+
+                    ui.add_space(metrics::SPACE_XS);
+
+                    // Real-time Jitter Buffer Sparkline
+                    let (buf_summary, pkts_rx, jitter_str, loss_str, fec_plc_str, asrc_str, buf_str, loss_col) =
+                        if let Some(ref receiver) = self.active_receiver {
+                            let st = receiver.status();
+                            let loss_c = if st.net.packets_lost > 0 {
+                                palette::STATUS_WARN
+                            } else {
+                                palette::ACCENT_MINT
+                            };
+                            (
+                                lang.format_buffer_summary(
+                                    Some(st.net.buffer_level_ms),
+                                    self.target_buffer_ms,
+                                ),
+                                format!("{}", st.net.packets_received),
+                                format!("Jitter: {} µs", st.net.jitter_us),
+                                format!("Lost: {}", st.net.packets_lost),
+                                format!("FEC: {} | PLC: {}", st.net.fec_recovered, st.net.plc_frames),
+                                format!("{:.5}x", st.net.resample_ratio),
+                                format!("Watermark: {:.1} ms", st.net.buffer_level_ms),
+                                loss_c,
+                            )
+                        } else {
+                            (
+                                lang.format_buffer_summary(None, self.target_buffer_ms),
+                                "0".to_string(),
+                                "Jitter: 0 µs".to_string(),
+                                "Lost: 0".to_string(),
+                                "FEC: 0 | PLC: 0".to_string(),
+                                "1.00000x".to_string(),
+                                "Watermark: 0.0 ms".to_string(),
+                                palette::TEXT_MUTED,
+                            )
+                        };
+
+                    draw_sparkline(
+                        ui,
+                        t.sparkline_jitter_watermark,
+                        &buf_summary,
+                        t.sparkline_awaiting,
+                        &self.rx_buffer_sparkline,
+                        0.0,
+                        (self.target_buffer_ms as f32 * 2.2).max(40.0),
+                        Some(self.target_buffer_ms as f32),
+                        palette::ACCENT_CYAN,
+                    );
+
+                    ui.add_space(metrics::SPACE_XS);
+
+                    ui.columns(3, |cols| {
+                        metric_tile(
+                            &mut cols[0],
+                            t.tile_packets_rx,
+                            &pkts_rx,
+                            &jitter_str,
+                            if rx_running {
+                                palette::ACCENT_CYAN
+                            } else {
+                                palette::TEXT_MUTED
+                            },
+                        );
+                        metric_tile(
+                            &mut cols[1],
+                            t.tile_loss_fec_plc,
+                            &loss_str,
+                            &fec_plc_str,
+                            loss_col,
+                        );
+                        metric_tile(
+                            &mut cols[2],
+                            t.tile_pi_clock_asrc,
+                            &asrc_str,
+                            &buf_str,
+                            if rx_running {
+                                palette::ACCENT_MINT
+                            } else {
+                                palette::TEXT_MUTED
+                            },
+                        );
+                    });
+                },
+            );
+        });
+    }
+
+    fn render_full_duplex_tab(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        let t = lang.texts();
+        let dpx_running = self.active_duplex.is_some();
+
+        theme::studio_card_frame(dpx_running, palette::ACCENT_INDIGO).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(
+                        RichText::new(t.duplex_card_title)
+                            .size(14.0)
+                            .family(FontFamily::Monospace)
+                            .color(palette::TEXT_PRIMARY)
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(t.duplex_card_subtitle)
+                            .size(11.5)
+                            .color(palette::TEXT_MUTED),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    status_pill(
+                        ui,
+                        if dpx_running {
+                            t.status_duplex_active
+                        } else {
+                            t.status_standby
+                        },
+                        dpx_running,
+                        palette::ACCENT_INDIGO,
+                    );
+                });
+            });
+
+            ui.add_space(metrics::SPACE_SM);
+            ui.separator();
+            ui.add_space(metrics::SPACE_SM);
+
+            // Role Selector Cards (Host PC vs Wireless Headset)
+            ui.columns(2, |cols| {
+                let roles = [
+                    (DuplexRole::Host, t.role_host_title, t.role_host_desc),
+                    (DuplexRole::Headset, t.role_headset_title, t.role_headset_desc),
+                ];
+                for (idx, (role, title, desc)) in roles.iter().enumerate() {
+                    let selected = self.duplex_role == *role;
+                    let fill = if selected {
+                        palette::BG_ACTIVE
+                    } else {
+                        palette::BG_TRENCH
+                    };
+                    let border = if selected {
+                        palette::ACCENT_INDIGO
+                    } else {
+                        palette::BORDER_SUBTLE
+                    };
+                    let stroke_w: f32 = if selected { 1.5 } else { 1.0 };
+                    let resp = egui::Frame::none()
+                        .fill(fill)
+                        .stroke(Stroke::new(stroke_w, border))
+                        .rounding(Rounding::same(metrics::RADIUS_WIDGET))
+                        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                        .show(&mut cols[idx], |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.label(
+                                    RichText::new(*title)
+                                        .size(12.0)
+                                        .color(if selected {
+                                            palette::ACCENT_INDIGO
+                                        } else {
+                                            palette::TEXT_PRIMARY
+                                        })
+                                        .strong(),
+                                );
+                                ui.label(
+                                    RichText::new(*desc)
+                                        .size(10.5)
+                                        .family(FontFamily::Monospace)
+                                        .color(palette::TEXT_SECONDARY),
+                                );
+                            });
+                        })
+                        .response
+                        .interact(Sense::click());
+                    if resp.clicked() {
+                        self.duplex_role = *role;
+                    }
+                    if resp.hovered() {
+                        cols[idx].ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+            });
+
+            ui.add_space(metrics::SPACE_SM);
+
+            // 2-Column Parameter Grid
+            ui.columns(2, |cols| {
+                egui::Grid::new("duplex_left_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .min_col_width(110.0)
+                    .show(&mut cols[0], |ui| {
+                        ui.label(RichText::new(t.label_peer_ip).color(palette::TEXT_SECONDARY));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.duplex_peer_ip_input)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.end_row();
+
+                        ui.label(
+                            RichText::new(t.label_udp_ports_dl_ul).color(palette::TEXT_SECONDARY),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("DL:").size(11.0).color(palette::TEXT_MUTED));
+                            ui.add(
+                                egui::DragValue::new(&mut self.duplex_downlink_port)
+                                    .range(1024..=65535),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("UL:").size(11.0).color(palette::TEXT_MUTED));
+                            ui.add(
+                                egui::DragValue::new(&mut self.duplex_uplink_port)
+                                    .range(1024..=65535),
+                            );
+                        });
+                        ui.end_row();
+
+                        ui.label(
+                            RichText::new(t.label_tx_input_device).color(palette::TEXT_SECONDARY),
+                        );
+                        ui.horizontal(|ui| {
+                            let current_tx = self
+                                .selected_tx_device
+                                .as_deref()
+                                .unwrap_or(t.device_system_default);
+                            let prev_tx = self.selected_tx_device.clone();
+                            egui::ComboBox::from_id_salt("duplex_tx_device_combo")
+                                .width((ui.available_width() - 32.0).max(120.0))
+                                .selected_text(current_tx)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.selected_tx_device,
+                                        None,
+                                        t.device_system_default,
+                                    );
+                                    for dev in &self.devices {
+                                        let eligible = dev.is_input
+                                            || (cfg!(target_os = "windows")
+                                                && self.duplex_role == DuplexRole::Host
+                                                && dev.is_output);
+                                        if eligible {
+                                            let label = format!(
+                                                "{} ({} Hz)",
+                                                dev.name,
+                                                dev.default_sample_rate.unwrap_or(48_000)
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.selected_tx_device,
+                                                Some(dev.name.clone()),
+                                                label,
+                                            );
+                                        }
+                                    }
+                                });
+                            if self.selected_tx_device != prev_tx && self.active_duplex.is_some() {
+                                self.active_duplex = None;
+                                self.toggle_duplex();
+                            }
+                            if ui
+                                .small_button("↻")
+                                .on_hover_text(t.btn_refresh_ports_hover)
+                                .clicked()
+                            {
+                                self.refresh_audio_devices(true);
+                            }
+                        });
+                        ui.end_row();
+                    });
+
+                egui::Grid::new("duplex_right_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .min_col_width(110.0)
+                    .show(&mut cols[1], |ui| {
+                        ui.label(
+                            RichText::new(t.label_rx_output_device).color(palette::TEXT_SECONDARY),
+                        );
+                        ui.horizontal(|ui| {
+                            let current_rx = self
+                                .selected_rx_device
+                                .as_deref()
+                                .unwrap_or(t.device_system_default);
+                            let prev_rx = self.selected_rx_device.clone();
+                            egui::ComboBox::from_id_salt("duplex_rx_device_combo")
+                                .width((ui.available_width() - 32.0).max(120.0))
+                                .selected_text(current_rx)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.selected_rx_device,
+                                        None,
+                                        t.device_system_default,
+                                    );
+                                    for dev in &self.devices {
+                                        if dev.is_output {
+                                            let label = format!(
+                                                "{} ({} Hz)",
+                                                dev.name,
+                                                dev.default_sample_rate.unwrap_or(48_000)
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.selected_rx_device,
+                                                Some(dev.name.clone()),
+                                                label,
+                                            );
+                                        }
+                                    }
+                                });
+                            if self.selected_rx_device != prev_rx && self.active_duplex.is_some() {
+                                self.active_duplex = None;
+                                self.toggle_duplex();
+                            }
+                            if ui
+                                .small_button("↻")
+                                .on_hover_text(t.btn_refresh_ports_hover)
+                                .clicked()
+                            {
+                                self.refresh_audio_devices(true);
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label(
+                            RichText::new(t.label_mic_noise_gate).color(palette::TEXT_SECONDARY),
+                        );
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.duplex_gate_db, -65.0..=-20.0)
+                                    .suffix(" dBFS"),
+                            )
+                            .changed()
+                        {
+                            if let Some(ref dpx) = self.active_duplex {
+                                dpx.set_tx_noise_gate_db(Some(self.duplex_gate_db));
+                            }
+                        }
+                        ui.end_row();
+
+                        ui.label(
+                            RichText::new(t.label_output_gain_mic).color(palette::TEXT_SECONDARY),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut self.volume, 0.0..=2.0)
+                                        .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
+                                )
+                                .changed()
+                            {
+                                if let Some(ref rx) = self.active_receiver {
+                                    rx.set_volume(self.volume);
+                                }
+                                if let Some(ref dpx) = self.active_duplex {
+                                    dpx.set_rx_volume(self.volume);
+                                }
+                            }
+                            let mute_label_col = if self.duplex_mic_muted {
+                                palette::STATUS_WARN
+                            } else {
+                                palette::TEXT_PRIMARY
+                            };
+                            if ui
+                                .checkbox(
+                                    &mut self.duplex_mic_muted,
+                                    RichText::new(t.chk_mute_mic).color(mute_label_col),
+                                )
+                                .changed()
+                            {
+                                if let Some(ref dpx) = self.active_duplex {
+                                    dpx.set_tx_muted(self.duplex_mic_muted);
+                                }
+                            }
+                        });
+                        ui.end_row();
+                    });
+            });
+
+            ui.add_space(metrics::SPACE_SM);
+            latency_profile_selector(ui, &mut self.selected_profile, lang);
+
+            ui.add_space(metrics::SPACE_SM);
+            if transport_cta_button(
+                ui,
+                t.btn_start_duplex,
+                t.btn_stop_duplex,
+                dpx_running,
+                palette::ACCENT_INDIGO,
+            ) {
+                self.toggle_duplex();
+            }
+
+            ui.add_space(metrics::SPACE_SM);
+            ui.separator();
+            ui.add_space(metrics::SPACE_SM);
+
+            // Bidirectional TX & RX Telemetry Racks
+            let st_opt = self.active_duplex.as_ref().map(|d| d.status());
+            ui.columns(2, |cols| {
+                // Left: Outgoing TX Pipeline
+                theme::trench_frame().show(&mut cols[0], |ui| {
+                    let gate_marker = if self.duplex_role == DuplexRole::Headset {
+                        Some(self.duplex_gate_db)
+                    } else {
+                        None
+                    };
+                    draw_vu_meter(
+                        ui,
+                        t.vu_duplex_tx,
+                        &self.duplex_tx_vu_meter,
+                        dpx_running,
+                        self.duplex_mic_muted,
+                        gate_marker,
+                    );
+                    ui.add_space(metrics::SPACE_XS);
+                    let (dev_str, pkts_str, dtx_str) = if let Some(ref st) = st_opt {
+                        (
+                            format!("{} ({} Hz)", st.tx.device_name, st.tx.sample_rate),
+                            format!("{} pkts", st.tx.net.packets_sent),
+                            format!("Gated DTX: {}", st.tx.net.gated_dtx_frames),
+                        )
+                    } else {
+                        (
+                            t.status_standby.to_string(),
+                            "0 pkts".to_string(),
+                            "Gated DTX: 0".to_string(),
+                        )
+                    };
+                    ui.columns(2, |mc| {
+                        metric_tile(
+                            &mut mc[0],
+                            t.tile_tx_capture_device,
+                            &dev_str,
+                            "48kHz Opus Low-Delay",
+                            palette::ACCENT_MINT,
+                        );
+                        metric_tile(
+                            &mut mc[1],
+                            t.tile_uplink_telemetry,
+                            &pkts_str,
+                            &dtx_str,
+                            palette::TEXT_PRIMARY,
+                        );
+                    });
+                });
+
+                // Right: Incoming RX Pipeline
+                theme::trench_frame().show(&mut cols[1], |ui| {
+                    draw_vu_meter(
+                        ui,
+                        t.vu_duplex_rx,
+                        &self.duplex_rx_vu_meter,
+                        dpx_running,
+                        false,
+                        None,
+                    );
+                    ui.add_space(metrics::SPACE_XS);
+                    let (buf_str, asrc_str, rx_pkts) = if let Some(ref st) = st_opt {
+                        (
+                            format!("Buf: {:.1} ms", st.rx.net.buffer_level_ms),
+                            format!("{:.5}x", st.rx.net.resample_ratio),
+                            format!(
+                                "{} pkts (Lost: {})",
+                                st.rx.net.packets_received, st.rx.net.packets_lost
+                            ),
+                        )
+                    } else {
+                        (
+                            "Buf: 0.0 ms".to_string(),
+                            "1.00000x".to_string(),
+                            "0 pkts (Lost: 0)".to_string(),
+                        )
+                    };
+                    ui.columns(2, |mc| {
+                        metric_tile(
+                            &mut mc[0],
+                            t.tile_downlink_packets,
+                            &rx_pkts,
+                            &buf_str,
+                            palette::ACCENT_CYAN,
+                        );
+                        metric_tile(
+                            &mut mc[1],
+                            t.tile_pi_clock_asrc,
+                            &asrc_str,
+                            t.tile_drift_comp,
+                            palette::ACCENT_MINT,
+                        );
+                    });
+                });
+            });
+        });
+    }
+
+    fn render_hardware_matrix_tab(&mut self, ui: &mut egui::Ui) {
+        let t = self.lang.texts();
+        ui.columns(2, |cols| {
+            // Left: Input Capture Hardware
+            theme::studio_card_frame(false, palette::BORDER_SUBTLE).show(&mut cols[0], |ui| {
+                ui.label(
+                    RichText::new(t.hw_input_title)
+                        .size(13.0)
+                        .family(FontFamily::Monospace)
+                        .color(palette::ACCENT_MINT)
+                        .strong(),
+                );
+                ui.add_space(metrics::SPACE_XS);
+                ui.separator();
+                ui.add_space(metrics::SPACE_XS);
+
+                for dev in self.devices.iter().filter(|d| d.is_input) {
+                    theme::trench_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&dev.name)
+                                    .color(palette::TEXT_PRIMARY)
+                                    .strong(),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if dev.is_default_input {
+                                    status_pill(ui, t.badge_default_in, true, palette::ACCENT_MINT);
+                                }
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} Hz • {} ch",
+                                        dev.default_sample_rate.unwrap_or(48_000),
+                                        dev.default_channels.unwrap_or(2)
+                                    ))
+                                    .size(11.0)
+                                    .family(FontFamily::Monospace)
+                                    .color(palette::TEXT_SECONDARY),
+                                );
+                            });
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+
+            // Right: Output Playback Hardware
+            theme::studio_card_frame(false, palette::BORDER_SUBTLE).show(&mut cols[1], |ui| {
+                ui.label(
+                    RichText::new(t.hw_output_title)
+                        .size(13.0)
+                        .family(FontFamily::Monospace)
+                        .color(palette::ACCENT_CYAN)
+                        .strong(),
+                );
+                ui.add_space(metrics::SPACE_XS);
+                ui.separator();
+                ui.add_space(metrics::SPACE_XS);
+
+                for dev in self.devices.iter().filter(|d| d.is_output) {
+                    theme::trench_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&dev.name)
+                                    .color(palette::TEXT_PRIMARY)
+                                    .strong(),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if dev.is_default_output {
+                                    status_pill(ui, t.badge_default_out, true, palette::ACCENT_CYAN);
+                                }
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} Hz • {} ch",
+                                        dev.default_sample_rate.unwrap_or(48_000),
+                                        dev.default_channels.unwrap_or(2)
+                                    ))
+                                    .size(11.0)
+                                    .family(FontFamily::Monospace)
+                                    .color(palette::TEXT_SECONDARY),
+                                );
+                            });
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+        });
+    }
+    pub fn render_ui(&mut self, ctx: &egui::Context) {
+        if !self.theme_initialized {
+            theme::apply_studio_theme(ctx);
+            self.theme_initialized = true;
+        }
+
         // Poll system tray menu events
-        if let Some(ref tray) = self.tray {
+        let tray_ids = self
+            .tray
+            .as_ref()
+            .map(|t| (t.stop_all_id.clone(), t.quit_id.clone()));
+        if let Some((stop_all_id, quit_id)) = tray_ids {
             while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if event.id == tray.stop_all_id {
-                    self.active_sender = None;
-                    self.active_receiver = None;
-                    self.active_duplex = None;
-                    self.last_status_msg = "All streams stopped from System Tray.".to_string();
-                } else if event.id == tray.quit_id {
-                    self.active_sender = None;
-                    self.active_receiver = None;
-                    self.active_duplex = None;
+                if event.id == stop_all_id {
+                    self.stop_all_streams();
+                    self.last_status_msg = self.lang.status_all_stopped_tray();
+                } else if event.id == quit_id {
+                    self.stop_all_streams();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
         }
 
-        // Request continuous repaint at ~30 Hz when a stream is active so VU meters and telemetry animate smoothly
+        // Request continuous repaint at ~30 Hz when a stream is active so VU meters and sparklines animate smoothly
         if self.active_sender.is_some()
             || self.active_receiver.is_some()
             || self.active_duplex.is_some()
@@ -435,420 +1990,36 @@ impl eframe::App for RsRelayGuiApp {
             self.refresh_audio_devices(false);
         }
         self.apply_pending_device_updates();
+        self.update_live_telemetry();
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("rsrelay — Ultra-Low-Latency Audio Relay");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Refresh Audio Ports").clicked() {
-                        self.refresh_audio_devices(true);
-                    }
-                    ui.checkbox(&mut self.auto_follow_default_device, "Auto-Follow Hot-Plug");
-                    let scanning = self.scanning_lan.load(Ordering::Relaxed);
-                    if ui
-                        .add_enabled(!scanning, egui::Button::new(if scanning { "Scanning LAN..." } else { "Scan LAN (mDNS)" }))
-                        .clicked()
-                    {
-                        self.trigger_lan_scan();
-                    }
-                });
+        self.render_top_header(ctx);
+        self.render_bottom_footer(ctx);
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::BG_CANVAS)
+                    .inner_margin(egui::Margin::symmetric(18.0, 14.0)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.render_lan_discovery_strip(ui);
+
+                        match self.active_tab {
+                            WorkspaceTab::DualConsole => self.render_dual_console_tab(ui),
+                            WorkspaceTab::FullDuplex => self.render_full_duplex_tab(ui),
+                            WorkspaceTab::HardwareMatrix => self.render_hardware_matrix_tab(ui),
+                        }
+                    });
             });
+    }
+}
 
-            ui.label(egui::RichText::new(&self.last_status_msg).small().weak());
-            ui.separator();
-
-            // Discovered LAN Peers section
-            if let Ok(peers) = self.discovered_peers.lock() {
-                if !peers.is_empty() {
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new("Discovered LAN Receivers (Click to select target):").strong());
-                        ui.horizontal_wrapped(|ui| {
-                            for peer in peers.iter() {
-                                if let Some(ip) = peer.addresses.first() {
-                                    let addr_str = format!("{ip}:{}", peer.udp_port);
-                                    let btn_label = format!("{} ({}) [{}]", peer.hostname, peer.os, addr_str);
-                                    if ui.button(btn_label).clicked() {
-                                        self.target_addr_input = addr_str;
-                                        self.duplex_peer_ip_input = ip.to_string();
-                                    }
-                                }
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                }
-            }
-
-            ui.columns(2, |columns| {
-                // === LEFT COLUMN: SENDER ===
-                columns[0].group(|ui| {
-                    ui.heading("1. Sender (Transmit Audio)");
-                    ui.add_space(4.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("Target IP:Port:");
-                        ui.text_edit_singleline(&mut self.target_addr_input);
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Audio Source:");
-                        egui::ComboBox::from_id_salt("source_combo")
-                            .selected_text(match self.selected_source {
-                                CaptureSource::SystemLoopback => "System Loopback (SCK / WASAPI)",
-                                CaptureSource::Microphone => "Microphone Input",
-                                CaptureSource::SyntheticTone => "Synthetic 440Hz/660Hz Tone",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.selected_source,
-                                    CaptureSource::SystemLoopback,
-                                    "System Loopback (SCK / WASAPI)",
-                                );
-                                ui.selectable_value(
-                                    &mut self.selected_source,
-                                    CaptureSource::Microphone,
-                                    "Microphone Input",
-                                );
-                                ui.selectable_value(
-                                    &mut self.selected_source,
-                                    CaptureSource::SyntheticTone,
-                                    "Synthetic 440Hz/660Hz Tone",
-                                );
-                            });
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Input Device:");
-                        let current_label = self
-                            .selected_tx_device
-                            .as_deref()
-                            .unwrap_or("System Default (Auto)");
-                        let prev_dev = self.selected_tx_device.clone();
-                        egui::ComboBox::from_id_salt("tx_device_combo")
-                            .selected_text(current_label)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.selected_tx_device,
-                                    None,
-                                    "System Default (Auto)",
-                                );
-                                for dev in &self.devices {
-                                    // Show input devices (or output devices for Windows WASAPI Loopback)
-                                    let eligible = dev.is_input
-                                        || (cfg!(target_os = "windows")
-                                            && self.selected_source
-                                                == CaptureSource::SystemLoopback
-                                            && dev.is_output);
-                                    if eligible {
-                                        let label = format!(
-                                            "{} ({} Hz)",
-                                            dev.name,
-                                            dev.default_sample_rate.unwrap_or(48_000)
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.selected_tx_device,
-                                            Some(dev.name.clone()),
-                                            label,
-                                        );
-                                    }
-                                }
-                            });
-                        if self.selected_tx_device != prev_dev && self.active_sender.is_some() {
-                            // Live hot-swap input device when changed while running
-                            self.active_sender = None;
-                            self.toggle_sender();
-                        }
-                        if ui.small_button("↻").on_hover_text("Refresh input ports").clicked() {
-                            self.refresh_audio_devices(true);
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Latency Profile:");
-                        egui::ComboBox::from_id_salt("profile_combo")
-                            .selected_text(match self.selected_profile {
-                                LatencyProfile::UltraLow => "Ultra-Low (5ms Opus, 10ms Buf)",
-                                LatencyProfile::Balanced => "Balanced (5ms Opus + FEC, 20ms Buf)",
-                                LatencyProfile::Stable => "Stable (10ms Opus + FEC, 40ms Buf)",
-                                LatencyProfile::LosslessPcm => "Lossless (5ms 16-bit PCM, 15ms Buf)",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.selected_profile,
-                                    LatencyProfile::UltraLow,
-                                    "Ultra-Low (5ms Opus, 10ms Buf)",
-                                );
-                                ui.selectable_value(
-                                    &mut self.selected_profile,
-                                    LatencyProfile::Balanced,
-                                    "Balanced (5ms Opus + FEC, 20ms Buf)",
-                                );
-                                ui.selectable_value(
-                                    &mut self.selected_profile,
-                                    LatencyProfile::Stable,
-                                    "Stable (10ms Opus + FEC, 40ms Buf)",
-                                );
-                                ui.selectable_value(
-                                    &mut self.selected_profile,
-                                    LatencyProfile::LosslessPcm,
-                                    "Lossless (5ms 16-bit PCM, 15ms Buf)",
-                                );
-                            });
-                    });
-
-                    if self.selected_profile != LatencyProfile::LosslessPcm {
-                        ui.horizontal(|ui| {
-                            ui.label("Opus Bitrate:");
-                            ui.add(
-                                egui::Slider::new(&mut self.opus_bitrate_kbps, 32..=256)
-                                    .suffix(" kbps"),
-                            );
-                        });
-                    }
-
-                    ui.add_space(6.0);
-                    let tx_running = self.active_sender.is_some();
-                    let btn_text = if tx_running {
-                        "Stop Sender"
-                    } else {
-                        "Start Sender"
-                    };
-                    if ui.button(egui::RichText::new(btn_text).strong()).clicked() {
-                        self.toggle_sender();
-                    }
-
-                    if let Some(ref sender) = self.active_sender {
-                        let st = sender.status();
-                        ui.separator();
-                        ui.label(format!("Source: {} ({} Hz)", st.device_name, st.sample_rate));
-                        ui.add(
-                            egui::ProgressBar::new(st.peak_level.clamp(0.0, 1.0))
-                                .text(format!("Input Level: {:.1}%", st.peak_level * 100.0)),
-                        );
-                        ui.label(format!(
-                            "Packets Sent: {} ({:.1} KB)",
-                            st.net.packets_sent,
-                            (st.net.bytes_sent as f64) / 1024.0
-                        ));
-                        ui.label(format!("Silence Heartbeats: {}", st.net.silence_heartbeats_sent));
-                        if st.control.connected {
-                            ui.label(format!(
-                                "Control RTT: {:.2} ms | Remote Buf: {:.1} ms",
-                                (st.control.rtt_us as f64) / 1000.0,
-                                st.control.remote_buffer_ms
-                            ));
-                        }
-                    }
-                });
-
-                // === RIGHT COLUMN: RECEIVER ===
-                columns[1].group(|ui| {
-                    ui.heading("2. Receiver (Listen & Play)");
-                    ui.add_space(4.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("Bind IP:Port:");
-                        ui.text_edit_singleline(&mut self.bind_addr_input);
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Output Device:");
-                        let current_label = self
-                            .selected_rx_device
-                            .as_deref()
-                            .unwrap_or("System Default (Auto)");
-                        let prev_dev = self.selected_rx_device.clone();
-                        egui::ComboBox::from_id_salt("rx_device_combo")
-                            .selected_text(current_label)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.selected_rx_device,
-                                    None,
-                                    "System Default (Auto)",
-                                );
-                                for dev in &self.devices {
-                                    if dev.is_output {
-                                        let label = format!(
-                                            "{} ({} Hz)",
-                                            dev.name,
-                                            dev.default_sample_rate.unwrap_or(48_000)
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.selected_rx_device,
-                                            Some(dev.name.clone()),
-                                            label,
-                                        );
-                                    }
-                                }
-                            });
-                        if self.selected_rx_device != prev_dev && self.active_receiver.is_some() {
-                            // Live hot-swap output playback device when changed while running
-                            self.active_receiver = None;
-                            self.toggle_receiver();
-                        }
-                        if ui.small_button("↻").on_hover_text("Refresh output ports").clicked() {
-                            self.refresh_audio_devices(true);
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Target Buffer:");
-                        ui.add(egui::Slider::new(&mut self.target_buffer_ms, 5..=80).suffix(" ms"));
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Output Volume:");
-                        if ui
-                            .add(egui::Slider::new(&mut self.volume, 0.0..=2.0))
-                            .changed()
-                        {
-                            if let Some(ref rx) = self.active_receiver {
-                                rx.set_volume(self.volume);
-                            }
-                            if let Some(ref dpx) = self.active_duplex {
-                                dpx.set_rx_volume(self.volume);
-                            }
-                        }
-                    });
-
-                    ui.checkbox(&mut self.advertise_mdns, "Advertise on LAN via mDNS");
-
-                    ui.add_space(6.0);
-                    let rx_running = self.active_receiver.is_some();
-                    let btn_text = if rx_running {
-                        "Stop Receiver"
-                    } else {
-                        "Start Receiver"
-                    };
-                    if ui.button(egui::RichText::new(btn_text).strong()).clicked() {
-                        self.toggle_receiver();
-                    }
-
-                    if let Some(ref receiver) = self.active_receiver {
-                        let st = receiver.status();
-                        ui.separator();
-                        ui.label(format!("Output: {} ({} Hz)", st.device_name, st.sample_rate));
-                        ui.add(
-                            egui::ProgressBar::new(st.peak_level.clamp(0.0, 1.0))
-                                .text(format!("Output Level: {:.1}%", st.peak_level * 100.0)),
-                        );
-                        ui.label(format!(
-                            "Recv: {} pkts | Lost: {} | FEC: {} | PLC: {}",
-                            st.net.packets_received,
-                            st.net.packets_lost,
-                            st.net.fec_recovered,
-                            st.net.plc_frames
-                        ));
-                        ui.label(format!(
-                            "Smoothed Buffer: {:.1} ms | Clock Drift ASRC: {:.5}x",
-                            st.net.buffer_level_ms, st.net.resample_ratio
-                        ));
-                    }
-                });
-            });
-
-            ui.add_space(6.0);
-            // === FULL-DUPLEX WIRELESS HEADSET SECTION ===
-            ui.group(|ui| {
-                ui.heading("3. Full-Duplex Wireless Headset Mode (Simultaneous System Audio + Mic)");
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Role:");
-                    egui::ComboBox::from_id_salt("duplex_role_combo")
-                        .selected_text(match self.duplex_role {
-                            DuplexRole::Host => "Host PC (Send System Audio :49153 + Recv Mic :49155)",
-                            DuplexRole::Headset => "Wireless Headset (Recv System Audio :49153 + Send Mic :49155)",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.duplex_role,
-                                DuplexRole::Host,
-                                "Host PC (Send System Audio :49153 + Recv Mic :49155)",
-                            );
-                            ui.selectable_value(
-                                &mut self.duplex_role,
-                                DuplexRole::Headset,
-                                "Wireless Headset (Recv System Audio :49153 + Send Mic :49155)",
-                            );
-                        });
-
-                    ui.label("Peer IP:");
-                    ui.add(egui::TextEdit::singleline(&mut self.duplex_peer_ip_input).desired_width(110.0));
-
-                    ui.label("Downlink Port:");
-                    ui.add(egui::DragValue::new(&mut self.duplex_downlink_port).range(1024..=65535));
-
-                    ui.label("Uplink Port:");
-                    ui.add(egui::DragValue::new(&mut self.duplex_uplink_port).range(1024..=65535));
-
-                    ui.label("Mic Gate:");
-                    if ui
-                        .add(egui::Slider::new(&mut self.duplex_gate_db, -65.0..=-20.0).suffix(" dB"))
-                        .changed()
-                    {
-                        if let Some(ref dpx) = self.active_duplex {
-                            dpx.set_tx_noise_gate_db(Some(self.duplex_gate_db));
-                        }
-                    }
-
-                    if ui.checkbox(&mut self.duplex_mic_muted, "Mute Outgoing Mic").changed() {
-                        if let Some(ref dpx) = self.active_duplex {
-                            dpx.set_tx_muted(self.duplex_mic_muted);
-                        }
-                    }
-
-                    let dpx_running = self.active_duplex.is_some();
-                    let btn_label = if dpx_running {
-                        "Stop Full-Duplex"
-                    } else {
-                        "Start Full-Duplex Headset"
-                    };
-                    if ui.button(egui::RichText::new(btn_label).strong()).clicked() {
-                        self.toggle_duplex();
-                    }
-                });
-
-                if let Some(ref duplex) = self.active_duplex {
-                    let st = duplex.status();
-                    ui.separator();
-                    ui.columns(2, |cols| {
-                        cols[0].add(
-                            egui::ProgressBar::new(st.tx.peak_level.clamp(0.0, 1.0)).text(format!(
-                                "TX ({}) Sent: {} pkts (Gated DTX: {})",
-                                st.tx.device_name, st.tx.net.packets_sent, st.tx.net.gated_dtx_frames
-                            )),
-                        );
-                        cols[1].add(
-                            egui::ProgressBar::new(st.rx.peak_level.clamp(0.0, 1.0)).text(format!(
-                                "RX ({}) Recv: {} pkts (Buf: {:.1}ms, ASRC: {:.5}x)",
-                                st.rx.device_name,
-                                st.rx.net.packets_received,
-                                st.rx.net.buffer_level_ms,
-                                st.rx.net.resample_ratio
-                            )),
-                        );
-                    });
-                }
-            });
-
-            ui.separator();
-            ui.collapsing(
-                format!("Detected Local Audio Hardware ({} devices)", self.devices.len()),
-                |ui| {
-                    for dev in &self.devices {
-                        let dir = if dev.is_input { "IN " } else { "OUT" };
-                        let def = if dev.is_default_input || dev.is_default_output {
-                            " [DEFAULT]"
-                        } else {
-                            ""
-                        };
-                        ui.label(format!(
-                            "[{}] {} ({:?} Hz, {:?} ch){}",
-                            dir, dev.name, dev.default_sample_rate, dev.default_channels, def
-                        ));
-                    }
-                },
-            );
-        });
+impl eframe::App for RsRelayGuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_ui(ctx);
     }
 }
 
@@ -876,8 +2047,9 @@ fn main() -> anyhow::Result<()> {
 
     let (icon_rgba, icon_w, icon_h) = build_app_icon_rgba();
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([780.0, 460.0])
-        .with_min_inner_size([640.0, 380.0])
+        .with_title("rsrelay — Studio Audio Relay")
+        .with_inner_size([960.0, 650.0])
+        .with_min_inner_size([820.0, 540.0])
         .with_icon(egui::IconData {
             rgba: icon_rgba,
             width: icon_w,
@@ -889,9 +2061,22 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let app = RsRelayGuiApp::new()?;
+    let mut app = RsRelayGuiApp::new()?;
+    let args: Vec<String> = std::env::args().collect();
+    for (idx, arg) in args.iter().enumerate() {
+        if (arg == "--lang" || arg == "-l") && idx + 1 < args.len() {
+            if let Some(lang) = Language::from_locale_str(&args[idx + 1]) {
+                app.set_language(lang);
+            }
+        } else if let Some(val) = arg.strip_prefix("--lang=") {
+            if let Some(lang) = Language::from_locale_str(val) {
+                app.set_language(lang);
+            }
+        }
+    }
+
     eframe::run_native(
-        "rsrelay — Audio Relay",
+        "rsrelay — Studio Audio Relay",
         native_options,
         Box::new(|_cc| Ok(Box::new(app))),
     )
@@ -899,3 +2084,31 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_headless_render_all_workspace_tabs_bilingual() {
+        let mut app = RsRelayGuiApp::new_with_tray(false).expect("init app");
+        let ctx = egui::Context::default();
+
+        for lang in [Language::En, Language::Zh] {
+            app.set_language(lang);
+            assert_eq!(app.lang, lang);
+
+            for tab in [
+                WorkspaceTab::DualConsole,
+                WorkspaceTab::FullDuplex,
+                WorkspaceTab::HardwareMatrix,
+            ] {
+                app.active_tab = tab;
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    app.render_ui(ctx);
+                });
+            }
+        }
+    }
+}
+
