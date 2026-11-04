@@ -124,6 +124,8 @@ pub struct RsRelayGuiApp {
     pub active_duplex: Option<DuplexSession>,
 
     // Status message & tray
+    pub auto_follow_default_device: bool,
+    last_device_poll: std::time::Instant,
     pub last_status_msg: String,
     tray: Option<SystemTrayHandles>,
 }
@@ -156,9 +158,66 @@ impl RsRelayGuiApp {
             duplex_gate_db: -45.0,
             duplex_mic_muted: false,
             active_duplex: None,
+            auto_follow_default_device: true,
+            last_device_poll: std::time::Instant::now(),
             last_status_msg: "Ready. Select a mode below to start streaming.".to_string(),
             tray,
         })
+    }
+
+    /// Manually or periodically refresh the local hardware audio port list and optionally
+    /// hot-rebind active streams if a newly plugged-in device became the OS default.
+    pub fn refresh_audio_devices(&mut self, manual: bool) {
+        let new_devices = list_audio_devices().unwrap_or_default();
+        let in_count = new_devices.iter().filter(|d| d.is_input).count();
+        let out_count = new_devices.iter().filter(|d| d.is_output).count();
+
+        let new_default_in = new_devices
+            .iter()
+            .find(|d| d.is_default_input)
+            .map(|d| d.name.clone());
+        let new_default_out = new_devices
+            .iter()
+            .find(|d| d.is_default_output)
+            .map(|d| d.name.clone());
+
+        self.devices = new_devices;
+
+        if manual {
+            self.last_status_msg = format!(
+                "Refreshed audio ports: {} input(s), {} output(s) detected.",
+                in_count, out_count
+            );
+        }
+
+        // If Auto-Follow Default is enabled (or user clicked manual Refresh while on System Default),
+        // check if the OS default playback/capture device changed (e.g. newly plugged-in USB/3.5mm headset)
+        if self.auto_follow_default_device || manual {
+            if self.selected_rx_device.is_none() {
+                if let (Some(ref rx), Some(ref def_out)) = (&self.active_receiver, &new_default_out)
+                {
+                    if &rx.status().device_name != def_out {
+                        self.active_receiver = None;
+                        self.toggle_receiver();
+                        self.last_status_msg =
+                            format!("Hot-swapped output to newly connected default: '{def_out}'");
+                    }
+                }
+            }
+
+            if self.selected_tx_device.is_none()
+                && self.selected_source == CaptureSource::Microphone
+            {
+                if let (Some(ref tx), Some(ref def_in)) = (&self.active_sender, &new_default_in) {
+                    if &tx.status().device_name != def_in {
+                        self.active_sender = None;
+                        self.toggle_sender();
+                        self.last_status_msg =
+                            format!("Hot-swapped input to newly connected default: '{def_in}'");
+                    }
+                }
+            }
+        }
     }
 
     pub fn trigger_lan_scan(&mut self) {
@@ -336,13 +395,20 @@ impl eframe::App for RsRelayGuiApp {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
+        // Periodically poll for hot-plugged audio devices every 2.5 seconds
+        if self.last_device_poll.elapsed() >= Duration::from_millis(2500) {
+            self.last_device_poll = std::time::Instant::now();
+            self.refresh_audio_devices(false);
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("rsrelay — Ultra-Low-Latency Audio Relay");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Refresh Devices").clicked() {
-                        self.devices = list_audio_devices().unwrap_or_default();
+                    if ui.button("Refresh Audio Ports").clicked() {
+                        self.refresh_audio_devices(true);
                     }
+                    ui.checkbox(&mut self.auto_follow_default_device, "Auto-Follow Hot-Plug");
                     let scanning = self.scanning_lan.load(Ordering::Relaxed);
                     if ui
                         .add_enabled(!scanning, egui::Button::new(if scanning { "Scanning LAN..." } else { "Scan LAN (mDNS)" }))
@@ -456,6 +522,9 @@ impl eframe::App for RsRelayGuiApp {
                             // Live hot-swap input device when changed while running
                             self.active_sender = None;
                             self.toggle_sender();
+                        }
+                        if ui.small_button("↻").on_hover_text("Refresh input ports").clicked() {
+                            self.refresh_audio_devices(true);
                         }
                     });
 
@@ -571,6 +640,9 @@ impl eframe::App for RsRelayGuiApp {
                             // Live hot-swap output playback device when changed while running
                             self.active_receiver = None;
                             self.toggle_receiver();
+                        }
+                        if ui.small_button("↻").on_hover_text("Refresh output ports").clicked() {
+                            self.refresh_audio_devices(true);
                         }
                     });
 
