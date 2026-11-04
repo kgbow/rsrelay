@@ -28,13 +28,20 @@ pub fn has_system_loopback_permission() -> bool {
 
 /// Request OS-level permission for native system audio loopback if not yet granted.
 ///
-/// - **macOS 13+**: Triggers the system TCC prompt (`CGRequestScreenCaptureAccess`) for
-///   *System Settings > Privacy & Security > Screen & System Audio Recording*.
+/// - **macOS 13+**: Triggers the system TCC prompt (`CGRequestScreenCaptureAccess`) and opens
+///   *System Settings > Privacy & Security > Screen & System Audio Recording* so the user can
+///   toggle the switch directly.
 /// - **Windows 10/11**: Always returns `true`.
 pub fn request_system_loopback_permission() -> bool {
     #[cfg(target_os = "macos")]
     {
-        macos_sck::request_screen_capture_permission()
+        let granted = macos_sck::request_screen_capture_permission();
+        if !granted {
+            let _ = std::process::Command::new("open")
+                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+                .spawn();
+        }
+        granted
     }
     #[cfg(not(target_os = "macos"))]
     {

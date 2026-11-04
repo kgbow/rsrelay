@@ -327,8 +327,19 @@ impl Language {
 
     pub fn status_sck_prompted(self) -> String {
         match self {
-            Self::En => "Prompted macOS Screen & System Audio Recording permission. Enable in System Settings and restart if needed.".to_string(),
-            Self::Zh => "已请求 macOS 录屏与系统录音权限，请在系统设置中开启授权（必要时重启应用）。".to_string(),
+            Self::En => "Opened macOS Screen & System Audio Recording settings. Toggle 'rsrelay' (or drag /Applications/rsrelay.app into the list) and restart.".to_string(),
+            Self::Zh => "已打开 macOS『录屏与系统录音』设置。请勾选 rsrelay（或在『应用程序』中选择 / 拖入 /Applications/rsrelay.app）后重启应用。".to_string(),
+        }
+    }
+
+    pub fn status_installed_macos_app(self, path: &str) -> String {
+        match self {
+            Self::En => format!(
+                "Installed '{path}' and revealed in Finder. Select '/Applications/rsrelay.app' in System Settings (or drag it into the list)!"
+            ),
+            Self::Zh => format!(
+                "已安装 '{path}' 并在 Finder 中打开！请在系统设置点『+』选择『应用程序 -> rsrelay.app』（或直接从 Finder 拖入列表）。"
+            ),
         }
     }
 
@@ -336,6 +347,23 @@ impl Language {
         match self {
             Self::En => "Switched language to English.".to_string(),
             Self::Zh => "界面语言已切换为中文。".to_string(),
+        }
+    }
+
+    pub fn status_entered_tray_mode(self) -> String {
+        match self {
+            Self::En => {
+                "Running in system tray background mode (GPU window framebuffers released)."
+                    .to_string()
+            }
+            Self::Zh => "已转入系统托盘后台模式运行（已释放 GUI 窗口显存）。".to_string(),
+        }
+    }
+
+    pub fn status_restored_from_tray(self) -> String {
+        match self {
+            Self::En => "Restored Studio Console window from system tray.".to_string(),
+            Self::Zh => "已从系统托盘恢复主控制台窗口。".to_string(),
         }
     }
 
@@ -353,6 +381,11 @@ impl Language {
 pub struct Texts {
     // Window & System Tray
     pub tray_title: &'static str,
+    pub tray_show_console: &'static str,
+    pub tray_hide_console: &'static str,
+    pub tray_toggle_tx: &'static str,
+    pub tray_toggle_rx: &'static str,
+    pub tray_toggle_duplex: &'static str,
     pub tray_stop_all: &'static str,
     pub tray_quit: &'static str,
 
@@ -363,6 +396,8 @@ pub struct Texts {
     pub tab_hardware_matrix: &'static str,
     pub lang_toggle_btn: &'static str,
     pub lang_toggle_hover: &'static str,
+    pub btn_minimize_tray: &'static str,
+    pub btn_minimize_tray_hover: &'static str,
     pub btn_refresh_ports: &'static str,
     pub btn_refresh_ports_hover: &'static str,
     pub btn_scanning_lan: &'static str,
@@ -400,6 +435,8 @@ pub struct Texts {
     pub macos_perm_required: &'static str,
     pub btn_grant_perm: &'static str,
     pub hover_grant_perm: &'static str,
+    pub btn_install_macos_app: &'static str,
+    pub hover_install_macos_app: &'static str,
     pub section_latency_profile: &'static str,
     pub profile_ultra_low: &'static str,
     pub profile_balanced: &'static str,
@@ -465,6 +502,11 @@ pub struct Texts {
 
 pub const TEXTS_EN: Texts = Texts {
     tray_title: "rsrelay — Ultra-Low-Latency Audio Relay",
+    tray_show_console: "Open Studio Console (打开主窗口)",
+    tray_hide_console: "Hide Window to Tray (Low Memory)",
+    tray_toggle_tx: "Start / Stop Transmitter (TX)",
+    tray_toggle_rx: "Start / Stop Receiver (RX)",
+    tray_toggle_duplex: "Start / Stop Full-Duplex Headset",
     tray_stop_all: "Stop All Audio Streams",
     tray_quit: "Quit rsrelay",
 
@@ -474,6 +516,9 @@ pub const TEXTS_EN: Texts = Texts {
     tab_hardware_matrix: "Audio Matrix & LAN",
     lang_toggle_btn: "🌐 中文",
     lang_toggle_hover: "Switch UI language to Chinese (切换为中文)",
+    btn_minimize_tray: "⬇ Tray",
+    btn_minimize_tray_hover:
+        "Close GUI window and run in the system tray (frees ~75 MB of Retina GPU framebuffer memory)",
     btn_refresh_ports: "↻ Ports",
     btn_refresh_ports_hover: "Re-enumerate OS audio input/output hardware",
     btn_scanning_lan: "◎ Scanning...",
@@ -508,6 +553,9 @@ pub const TEXTS_EN: Texts = Texts {
     btn_grant_perm: "Grant Permission",
     hover_grant_perm:
         "Trigger macOS System Settings > Privacy & Security > Screen & System Audio Recording prompt",
+    btn_install_macos_app: "Locate / Install rsrelay.app",
+    hover_install_macos_app:
+        "Install /Applications/rsrelay.app and reveal it in Finder so you can select or drag it into System Settings",
     section_latency_profile: "LATENCY & CODEC PROFILE",
     profile_ultra_low: "Ultra-Low",
     profile_balanced: "Balanced",
@@ -571,6 +619,11 @@ pub const TEXTS_EN: Texts = Texts {
 
 pub const TEXTS_ZH: Texts = Texts {
     tray_title: "rsrelay — 超低延迟实时音频中继",
+    tray_show_console: "打开主控制台窗口 (Open Console)",
+    tray_hide_console: "隐藏窗口至后台托盘 (释放显存)",
+    tray_toggle_tx: "启动 / 停止发送端 (TX)",
+    tray_toggle_rx: "启动 / 停止接收端 (RX)",
+    tray_toggle_duplex: "启动 / 停止 Full-Duplex 耳麦",
     tray_stop_all: "停止所有音频流 (Stop All)",
     tray_quit: "退出 rsrelay (Quit)",
 
@@ -580,6 +633,8 @@ pub const TEXTS_ZH: Texts = Texts {
     tab_hardware_matrix: "音频设备 & LAN",
     lang_toggle_btn: "🌐 EN",
     lang_toggle_hover: "切换界面语言为英文 (Switch to English)",
+    btn_minimize_tray: "⬇ 后台托盘",
+    btn_minimize_tray_hover: "关闭 GUI 窗口转入系统托盘后台运行，立即释放 ~75 MB Retina 窗口显存",
     btn_refresh_ports: "↻ 刷新设备",
     btn_refresh_ports_hover: "重新扫描系统音频输入/输出硬件设备",
     btn_scanning_lan: "◎ 扫描中...",
@@ -611,8 +666,10 @@ pub const TEXTS_ZH: Texts = Texts {
     label_opus_bitrate: "Opus 码率 (Bitrate)",
     macos_sck_ready: "macOS SCK 免驱内录已就绪",
     macos_perm_required: "需要 macOS 系统录音权限",
-    btn_grant_perm: "授权权限",
+    btn_grant_perm: "授权权限 (打开设置)",
     hover_grant_perm: "打开 macOS 系统设置 > 隐私与安全性 > 录屏与系统录音授权提示",
+    btn_install_macos_app: "定位 / 安装到应用程序 (rsrelay.app)",
+    hover_install_macos_app: "将 rsrelay.app 安装到『/Applications (应用程序)』并在 Finder 中打开，方便在系统设置中选择或拖入授权",
     section_latency_profile: "延迟与编码档位 (LATENCY PROFILE)",
     profile_ultra_low: "极低延迟 (Ultra)",
     profile_balanced: "均衡 (Balanced)",

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 pub mod i18n;
+pub mod macos_bundle;
 pub mod theme;
 pub mod widgets;
 
@@ -91,19 +92,127 @@ pub fn build_app_icon_rgba() -> (Vec<u8>, u32, u32) {
     (rgba, width, height)
 }
 
+/// Window visibility & GPU framebuffer lifecycle state for System Tray mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayWindowState {
+    /// Normal studio GUI window (`960x650`) with full GPU Retina swapchain.
+    Visible,
+    /// Intermediate multi-frame transition that shrinks the viewport to `1x1` and swaps buffers
+    /// so macOS `WindowServer` / Metal / OpenGL deallocates the ~75 MB Retina `IOSurface`
+    /// backbuffers before the window is ordered out.
+    ShrinkingToTray { frames_remaining: u8 },
+    /// Window is hidden (`Visible(false)` at `1x1` size) and running silently in the system tray
+    /// with zero UI widget rendering and minimal RAM/GPU footprint.
+    HiddenInTray,
+}
+
+fn global_tray_event_queue() -> &'static (
+    std::sync::mpsc::Sender<tray_icon::menu::MenuId>,
+    Mutex<std::sync::mpsc::Receiver<tray_icon::menu::MenuId>>,
+) {
+    static QUEUE: std::sync::OnceLock<(
+        std::sync::mpsc::Sender<tray_icon::menu::MenuId>,
+        Mutex<std::sync::mpsc::Receiver<tray_icon::menu::MenuId>>,
+    )> = std::sync::OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (tx, Mutex::new(rx))
+    })
+}
+
+fn global_egui_wakeup_ctx() -> &'static Mutex<Option<egui::Context>> {
+    static CTX: std::sync::OnceLock<Mutex<Option<egui::Context>>> = std::sync::OnceLock::new();
+    CTX.get_or_init(|| Mutex::new(None))
+}
+
+/// Release unused heap pages back to the OS kernel and toggle macOS Accessory (menu-bar-only)
+/// activation policy when running headless in the system tray.
+fn apply_os_background_tray_mode(in_tray_only: bool) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use std::ffi::{c_char, c_void};
+
+        extern "C" {
+            fn pthread_main_np() -> i32;
+            fn objc_getClass(name: *const c_char) -> *mut c_void;
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
+            fn objc_msgSend();
+            fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
+        }
+
+        if pthread_main_np() == 1 {
+            let ns_app_cls = objc_getClass(c"NSApplication".as_ptr());
+            if !ns_app_cls.is_null() {
+                let shared_sel = sel_registerName(c"sharedApplication".as_ptr());
+                let msg_send_id: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let ns_app = msg_send_id(ns_app_cls, shared_sel);
+                if !ns_app.is_null() {
+                    // 0 = NSApplicationActivationPolicyRegular, 1 = NSApplicationActivationPolicyAccessory
+                    let policy: isize = if in_tray_only { 1 } else { 0 };
+                    let policy_sel = sel_registerName(c"setActivationPolicy:".as_ptr());
+                    let msg_send_policy: unsafe extern "C" fn(
+                        *mut c_void,
+                        *mut c_void,
+                        isize,
+                    ) -> bool = std::mem::transmute(objc_msgSend as *const ());
+                    let _ = msg_send_policy(ns_app, policy_sel, policy);
+
+                    if !in_tray_only {
+                        let act_sel = sel_registerName(c"activateIgnoringOtherApps:".as_ptr());
+                        let msg_send_act: unsafe extern "C" fn(*mut c_void, *mut c_void, bool) =
+                            std::mem::transmute(objc_msgSend as *const ());
+                        msg_send_act(ns_app, act_sel, true);
+                    }
+                }
+            }
+        }
+
+        if in_tray_only {
+            let _ = malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if in_tray_only {
+        extern "C" {
+            fn _heapmin() -> i32;
+        }
+        unsafe {
+            let _ = _heapmin();
+        }
+    }
+}
+
 struct SystemTrayHandles {
     _tray: TrayIcon,
     title_item: MenuItem,
+    toggle_window_item: MenuItem,
+    toggle_tx_item: MenuItem,
+    toggle_rx_item: MenuItem,
+    toggle_duplex_item: MenuItem,
     stop_all_item: MenuItem,
     quit_item: MenuItem,
+    toggle_window_id: tray_icon::menu::MenuId,
+    toggle_tx_id: tray_icon::menu::MenuId,
+    toggle_rx_id: tray_icon::menu::MenuId,
+    toggle_duplex_id: tray_icon::menu::MenuId,
     stop_all_id: tray_icon::menu::MenuId,
     quit_id: tray_icon::menu::MenuId,
 }
 
 impl SystemTrayHandles {
-    fn set_language(&self, lang: Language) {
+    fn set_language(&self, lang: Language, window_hidden: bool) {
         let t = lang.texts();
         self.title_item.set_text(t.tray_title);
+        self.toggle_window_item.set_text(if window_hidden {
+            t.tray_show_console
+        } else {
+            t.tray_hide_console
+        });
+        self.toggle_tx_item.set_text(t.tray_toggle_tx);
+        self.toggle_rx_item.set_text(t.tray_toggle_rx);
+        self.toggle_duplex_item.set_text(t.tray_toggle_duplex);
         self.stop_all_item.set_text(t.tray_stop_all);
         self.quit_item.set_text(t.tray_quit);
     }
@@ -116,15 +225,41 @@ fn init_system_tray(lang: Language) -> anyhow::Result<SystemTrayHandles> {
 
     let menu = Menu::new();
     let title_item = MenuItem::new(t.tray_title, false, None);
+    let toggle_window_item = MenuItem::new(t.tray_hide_console, true, None);
+    let toggle_tx_item = MenuItem::new(t.tray_toggle_tx, true, None);
+    let toggle_rx_item = MenuItem::new(t.tray_toggle_rx, true, None);
+    let toggle_duplex_item = MenuItem::new(t.tray_toggle_duplex, true, None);
     let stop_all_item = MenuItem::new(t.tray_stop_all, true, None);
     let quit_item = MenuItem::new(t.tray_quit, true, None);
 
+    let toggle_window_id = toggle_window_item.id().clone();
+    let toggle_tx_id = toggle_tx_item.id().clone();
+    let toggle_rx_id = toggle_rx_item.id().clone();
+    let toggle_duplex_id = toggle_duplex_item.id().clone();
     let stop_all_id = stop_all_item.id().clone();
     let quit_id = quit_item.id().clone();
 
     menu.append(&title_item)?;
+    menu.append(&toggle_window_item)?;
+    menu.append(&toggle_tx_item)?;
+    menu.append(&toggle_rx_item)?;
+    menu.append(&toggle_duplex_item)?;
     menu.append(&stop_all_item)?;
     menu.append(&quit_item)?;
+
+    // Install event handler that forwards tray menu clicks and immediately wakes up egui even when hidden
+    static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+    if !HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+        MenuEvent::set_event_handler(Some(|event: MenuEvent| {
+            let (tx, _) = global_tray_event_queue();
+            let _ = tx.send(event.id);
+            if let Ok(guard) = global_egui_wakeup_ctx().lock() {
+                if let Some(ref ctx) = *guard {
+                    ctx.request_repaint();
+                }
+            }
+        }));
+    }
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -135,8 +270,16 @@ fn init_system_tray(lang: Language) -> anyhow::Result<SystemTrayHandles> {
     Ok(SystemTrayHandles {
         _tray: tray,
         title_item,
+        toggle_window_item,
+        toggle_tx_item,
+        toggle_rx_item,
+        toggle_duplex_item,
         stop_all_item,
         quit_item,
+        toggle_window_id,
+        toggle_tx_id,
+        toggle_rx_id,
+        toggle_duplex_id,
         stop_all_id,
         quit_id,
     })
@@ -192,6 +335,8 @@ pub struct RsRelayGuiApp {
     pub auto_follow_default_device: bool,
     last_device_poll: std::time::Instant,
     pub last_status_msg: String,
+    pub tray_window_state: TrayWindowState,
+    pub quit_requested: bool,
     tray: Option<SystemTrayHandles>,
 }
 
@@ -250,6 +395,8 @@ impl RsRelayGuiApp {
             auto_follow_default_device: true,
             last_device_poll: std::time::Instant::now(),
             last_status_msg: lang.status_ready(),
+            tray_window_state: TrayWindowState::Visible,
+            quit_requested: false,
             tray,
         })
     }
@@ -257,10 +404,84 @@ impl RsRelayGuiApp {
     /// Switch the UI language and update system tray items & status message.
     pub fn set_language(&mut self, lang: Language) {
         self.lang = lang;
+        let hidden = self.tray_window_state != TrayWindowState::Visible;
         if let Some(ref tray) = self.tray {
-            tray.set_language(lang);
+            tray.set_language(lang, hidden);
         }
         self.last_status_msg = lang.status_language_switched();
+    }
+
+    /// Shrink the window to `1x1` to flush the ~75 MB Retina `IOSurface` swapchain and hide
+    /// into the OS system tray for ultra-low-memory background operation.
+    pub fn enter_tray_background_mode(&mut self, ctx: &egui::Context) {
+        if self.tray_window_state == TrayWindowState::HiddenInTray {
+            return;
+        }
+        self.tray_window_state = TrayWindowState::ShrinkingToTray {
+            frames_remaining: 3,
+        };
+        if let Some(ref tray) = self.tray {
+            tray.toggle_window_item
+                .set_text(self.lang.texts().tray_show_console);
+        }
+        self.last_status_msg = self.lang.status_entered_tray_mode();
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(1.0, 1.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(1.0, 1.0)));
+        ctx.request_repaint();
+    }
+
+    /// Restore the full `960x650` Studio Console window from system tray background mode.
+    pub fn restore_from_tray(&mut self, ctx: &egui::Context) {
+        self.tray_window_state = TrayWindowState::Visible;
+        apply_os_background_tray_mode(false);
+        if let Some(ref tray) = self.tray {
+            tray.toggle_window_item
+                .set_text(self.lang.texts().tray_hide_console);
+        }
+        self.last_status_msg = self.lang.status_restored_from_tray();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(820.0, 540.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(960.0, 650.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    /// Update the top line of the system tray menu with real-time stream status.
+    fn sync_tray_status_title(&self) {
+        let Some(ref tray) = self.tray else {
+            return;
+        };
+        let status_line = if let Some(ref dpx) = self.active_duplex {
+            let st = dpx.status();
+            format!(
+                "● DUPLEX LIVE — TX: {} | RX Buf: {:.1} ms",
+                st.tx.net.packets_sent, st.rx.net.buffer_level_ms
+            )
+        } else if self.active_sender.is_some() && self.active_receiver.is_some() {
+            let tx_pkts = self
+                .active_sender
+                .as_ref()
+                .map(|s| s.status().net.packets_sent)
+                .unwrap_or(0);
+            let rx_buf = self
+                .active_receiver
+                .as_ref()
+                .map(|r| r.status().net.buffer_level_ms)
+                .unwrap_or(0.0);
+            format!("● TX+RX LIVE — Sent: {tx_pkts} | Buf: {rx_buf:.1} ms")
+        } else if let Some(ref tx) = self.active_sender {
+            let st = tx.status();
+            format!("● TX LIVE — {} pkts ({} Hz)", st.net.packets_sent, st.sample_rate)
+        } else if let Some(ref rx) = self.active_receiver {
+            let st = rx.status();
+            format!(
+                "● RX LIVE — Buf: {:.1} ms ({} pkts)",
+                st.net.buffer_level_ms, st.net.packets_received
+            )
+        } else {
+            self.lang.texts().tray_title.to_string()
+        };
+        tray.title_item.set_text(status_line);
     }
 
     /// Trigger an asynchronous hardware audio device enumeration on a background thread
@@ -653,8 +874,22 @@ impl RsRelayGuiApp {
                             }
                         });
 
-                    // Right: Language Switcher, Quick LAN Scan & Refresh actions + Live Stream Indicators
+                    // Right: Language Switcher, Tray Background Mode, Quick LAN Scan & Refresh actions + Live Stream Indicators
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if self.tray.is_some()
+                            && ui
+                                .button(
+                                    RichText::new(t.btn_minimize_tray)
+                                        .size(11.5)
+                                        .color(palette::ACCENT_CYAN)
+                                        .strong(),
+                                )
+                                .on_hover_text(t.btn_minimize_tray_hover)
+                                .clicked()
+                        {
+                            self.enter_tray_background_mode(ctx);
+                        }
+
                         if ui
                             .button(
                                 RichText::new(t.lang_toggle_btn)
@@ -1026,7 +1261,7 @@ impl RsRelayGuiApp {
                         && self.selected_tx_device.is_none()
                     {
                         ui.add_space(metrics::SPACE_XS);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if self.sck_permission_granted {
                                 status_pill(
                                     ui,
@@ -1051,6 +1286,7 @@ impl RsRelayGuiApp {
                                     .on_hover_text(t.hover_grant_perm)
                                     .clicked()
                                 {
+                                    let _ = macos_bundle::install_macos_app_bundle();
                                     self.sck_permission_granted =
                                         request_system_loopback_permission();
                                     self.last_status_msg = if self.sck_permission_granted {
@@ -1058,6 +1294,27 @@ impl RsRelayGuiApp {
                                     } else {
                                         lang.status_sck_prompted()
                                     };
+                                }
+                                if ui
+                                    .button(
+                                        RichText::new(t.btn_install_macos_app)
+                                            .size(11.5)
+                                            .color(palette::ACCENT_CYAN),
+                                    )
+                                    .on_hover_text(t.hover_install_macos_app)
+                                    .clicked()
+                                {
+                                    match macos_bundle::install_macos_app_bundle() {
+                                        Ok(path) => {
+                                            macos_bundle::reveal_in_finder(&path);
+                                            self.last_status_msg = lang
+                                                .status_installed_macos_app(&path.display().to_string());
+                                        }
+                                        Err(e) => {
+                                            self.last_status_msg =
+                                                format!("Failed to install rsrelay.app: {e}");
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -1748,6 +2005,59 @@ impl RsRelayGuiApp {
                     });
             });
 
+            if cfg!(target_os = "macos")
+                && self.duplex_role == DuplexRole::Host
+                && self.selected_tx_device.is_none()
+            {
+                ui.add_space(metrics::SPACE_XS);
+                ui.horizontal_wrapped(|ui| {
+                    if self.sck_permission_granted {
+                        status_pill(ui, t.macos_sck_ready, true, palette::ACCENT_MINT);
+                    } else {
+                        status_pill(ui, t.macos_perm_required, true, palette::STATUS_WARN);
+                        if ui
+                            .button(
+                                RichText::new(t.btn_grant_perm)
+                                    .size(11.5)
+                                    .color(palette::ACCENT_MINT)
+                                    .strong(),
+                            )
+                            .on_hover_text(t.hover_grant_perm)
+                            .clicked()
+                        {
+                            let _ = macos_bundle::install_macos_app_bundle();
+                            self.sck_permission_granted = request_system_loopback_permission();
+                            self.last_status_msg = if self.sck_permission_granted {
+                                lang.status_sck_granted()
+                            } else {
+                                lang.status_sck_prompted()
+                            };
+                        }
+                        if ui
+                            .button(
+                                RichText::new(t.btn_install_macos_app)
+                                    .size(11.5)
+                                    .color(palette::ACCENT_CYAN),
+                            )
+                            .on_hover_text(t.hover_install_macos_app)
+                            .clicked()
+                        {
+                            match macos_bundle::install_macos_app_bundle() {
+                                Ok(path) => {
+                                    macos_bundle::reveal_in_finder(&path);
+                                    self.last_status_msg =
+                                        lang.status_installed_macos_app(&path.display().to_string());
+                                }
+                                Err(e) => {
+                                    self.last_status_msg =
+                                        format!("Failed to install rsrelay.app: {e}");
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
             ui.add_space(metrics::SPACE_SM);
             latency_profile_selector(ui, &mut self.selected_profile, lang);
 
@@ -1955,24 +2265,100 @@ impl RsRelayGuiApp {
     pub fn render_ui(&mut self, ctx: &egui::Context) {
         if !self.theme_initialized {
             theme::apply_studio_theme(ctx);
+            if let Ok(mut guard) = global_egui_wakeup_ctx().lock() {
+                *guard = Some(ctx.clone());
+            }
             self.theme_initialized = true;
         }
 
+        // Intercept window [X] Close button to minimize into the system tray instead of killing active streams
+        if self.tray.is_some()
+            && !self.quit_requested
+            && ctx.input(|i| i.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.enter_tray_background_mode(ctx);
+        }
+
         // Poll system tray menu events
-        let tray_ids = self
-            .tray
-            .as_ref()
-            .map(|t| (t.stop_all_id.clone(), t.quit_id.clone()));
-        if let Some((stop_all_id, quit_id)) = tray_ids {
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if event.id == stop_all_id {
+        let tray_ids = self.tray.as_ref().map(|t| {
+            (
+                t.toggle_window_id.clone(),
+                t.toggle_tx_id.clone(),
+                t.toggle_rx_id.clone(),
+                t.toggle_duplex_id.clone(),
+                t.stop_all_id.clone(),
+                t.quit_id.clone(),
+            )
+        });
+        if let Some((
+            toggle_window_id,
+            toggle_tx_id,
+            toggle_rx_id,
+            toggle_duplex_id,
+            stop_all_id,
+            quit_id,
+        )) = tray_ids
+        {
+            let mut events = Vec::new();
+            if let Ok(rx_guard) = global_tray_event_queue().1.lock() {
+                while let Ok(id) = rx_guard.try_recv() {
+                    events.push(id);
+                }
+            }
+            for event_id in events {
+                if event_id == toggle_window_id {
+                    if self.tray_window_state == TrayWindowState::Visible {
+                        self.enter_tray_background_mode(ctx);
+                    } else {
+                        self.restore_from_tray(ctx);
+                    }
+                } else if event_id == toggle_tx_id {
+                    self.toggle_sender();
+                } else if event_id == toggle_rx_id {
+                    self.toggle_receiver();
+                } else if event_id == toggle_duplex_id {
+                    self.toggle_duplex();
+                } else if event_id == stop_all_id {
                     self.stop_all_streams();
                     self.last_status_msg = self.lang.status_all_stopped_tray();
-                } else if event.id == quit_id {
+                } else if event_id == quit_id {
+                    self.quit_requested = true;
                     self.stop_all_streams();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
+        }
+
+        // Periodically poll for hot-plugged audio devices every 2.5 seconds on a background thread
+        if self.last_device_poll.elapsed() >= Duration::from_millis(2500) {
+            self.last_device_poll = std::time::Instant::now();
+            self.refresh_audio_devices(false);
+        }
+        self.apply_pending_device_updates();
+        self.sync_tray_status_title();
+
+        // Handle System Tray Background Mode state transitions (purges ~75 MB Retina IOSurface swapchain)
+        match self.tray_window_state {
+            TrayWindowState::ShrinkingToTray { frames_remaining } => {
+                if frames_remaining > 1 {
+                    self.tray_window_state = TrayWindowState::ShrinkingToTray {
+                        frames_remaining: frames_remaining - 1,
+                    };
+                    ctx.request_repaint();
+                } else {
+                    self.tray_window_state = TrayWindowState::HiddenInTray;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    apply_os_background_tray_mode(true);
+                    ctx.request_repaint_after(Duration::from_millis(500));
+                }
+                return;
+            }
+            TrayWindowState::HiddenInTray => {
+                ctx.request_repaint_after(Duration::from_millis(500));
+                return;
+            }
+            TrayWindowState::Visible => {}
         }
 
         // Request continuous repaint at ~30 Hz when a stream is active so VU meters and sparklines animate smoothly
@@ -1984,12 +2370,6 @@ impl RsRelayGuiApp {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
-        // Periodically poll for hot-plugged audio devices every 2.5 seconds on a background thread
-        if self.last_device_poll.elapsed() >= Duration::from_millis(2500) {
-            self.last_device_poll = std::time::Instant::now();
-            self.refresh_audio_devices(false);
-        }
-        self.apply_pending_device_updates();
         self.update_live_telemetry();
 
         self.render_top_header(ctx);
@@ -2045,19 +2425,44 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Support `--install-app` flag on macOS to package and install `/Applications/rsrelay.app`
+    if std::env::args().any(|a| a == "--install-app") {
+        let path = macos_bundle::install_macos_app_bundle()?;
+        println!("Installed macOS app bundle at: {}", path.display());
+        return Ok(());
+    }
+
+    let start_in_tray = std::env::args().any(|a| a == "--tray" || a == "--background");
+
     let (icon_rgba, icon_w, icon_h) = build_app_icon_rgba();
-    let viewport = egui::ViewportBuilder::default()
-        .with_title("rsrelay — Studio Audio Relay")
-        .with_inner_size([960.0, 650.0])
-        .with_min_inner_size([820.0, 540.0])
-        .with_icon(egui::IconData {
-            rgba: icon_rgba,
-            width: icon_w,
-            height: icon_h,
-        });
+    let viewport = if start_in_tray {
+        egui::ViewportBuilder::default()
+            .with_title("rsrelay — Studio Audio Relay")
+            .with_inner_size([1.0, 1.0])
+            .with_min_inner_size([1.0, 1.0])
+            .with_visible(false)
+            .with_icon(egui::IconData {
+                rgba: icon_rgba,
+                width: icon_w,
+                height: icon_h,
+            })
+    } else {
+        egui::ViewportBuilder::default()
+            .with_title("rsrelay — Studio Audio Relay")
+            .with_inner_size([960.0, 650.0])
+            .with_min_inner_size([820.0, 540.0])
+            .with_icon(egui::IconData {
+                rgba: icon_rgba,
+                width: icon_w,
+                height: icon_h,
+            })
+    };
 
     let native_options = eframe::NativeOptions {
         viewport,
+        depth_buffer: 0,
+        stencil_buffer: 0,
+        multisampling: 0,
         ..Default::default()
     };
 
@@ -2078,7 +2483,17 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "rsrelay — Studio Audio Relay",
         native_options,
-        Box::new(|_cc| Ok(Box::new(app))),
+        Box::new(move |cc| {
+            theme::apply_studio_theme(&cc.egui_ctx);
+            if let Ok(mut guard) = global_egui_wakeup_ctx().lock() {
+                *guard = Some(cc.egui_ctx.clone());
+            }
+            app.theme_initialized = true;
+            if start_in_tray {
+                app.enter_tray_background_mode(&cc.egui_ctx);
+            }
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe GUI error: {e}"))?;
 
@@ -2109,6 +2524,37 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn test_tray_background_mode_state_machine() {
+        let mut app = RsRelayGuiApp::new_with_tray(false).expect("init app");
+        let ctx = egui::Context::default();
+        assert_eq!(app.tray_window_state, TrayWindowState::Visible);
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.enter_tray_background_mode(ctx);
+        });
+        assert_eq!(
+            app.tray_window_state,
+            TrayWindowState::ShrinkingToTray {
+                frames_remaining: 3
+            }
+        );
+
+        // Run 3 shrink frames -> transitions to HiddenInTray
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                app.render_ui(ctx);
+            });
+        }
+        assert_eq!(app.tray_window_state, TrayWindowState::HiddenInTray);
+
+        // Restore back to Visible
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.restore_from_tray(ctx);
+        });
+        assert_eq!(app.tray_window_state, TrayWindowState::Visible);
     }
 }
 

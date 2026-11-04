@@ -79,44 +79,108 @@ pub mod metrics {
     pub const LABEL_COL_WIDTH: f32 = 108.0;
 }
 
-/// Load native OS CJK fallback fonts (macOS `STHeiti` / `Hiragino` / `Arial Unicode`,
-/// Windows `Microsoft YaHei` / `SimHei`) so localized audio device names (e.g. `"外置麦克风"`,
-/// `"外置耳机"`, `"扬声器"`) render crisply without missing-glyph tofu boxes.
-pub fn configure_cjk_fallback_fonts(ctx: &egui::Context) {
-    let candidate_paths: &[&str] = &[
-        // macOS system CJK fonts
-        "/System/Library/Fonts/STHeiti Medium.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/System/Library/Fonts/PingFang.ttc",
-        // Windows 10/11 system CJK fonts
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\msyh.ttf",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\simsun.ttc",
-        // Linux CJK fallback fonts
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    ];
+#[cfg(unix)]
+fn map_font_file_readonly(path: &str) -> Option<&'static [u8]> {
+    use std::os::unix::io::AsRawFd;
 
-    for path in candidate_paths {
-        if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "system_cjk".to_owned(),
-                egui::FontData::from_owned(bytes),
-            );
-            if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional) {
-                prop.push("system_cjk".to_owned());
-            }
-            if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
-                mono.push("system_cjk".to_owned());
-            }
-            ctx.set_fonts(fonts);
-            tracing::debug!("Loaded native CJK fallback font from '{path}'");
-            break;
+    extern "C" {
+        fn mmap(
+            addr: *mut std::ffi::c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut std::ffi::c_void;
+    }
+
+    const PROT_READ: i32 = 0x01;
+    const MAP_PRIVATE: i32 = 0x02;
+
+    let file = std::fs::File::open(path).ok()?;
+    let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+    if len == 0 {
+        return None;
+    }
+
+    // SAFETY: Mapping a read-only system font file for the lifetime of the process.
+    // Because it is mapped `PROT_READ | MAP_PRIVATE`, pages are backed directly by
+    // the OS unified page cache (`Clean` file-backed memory) with 0 KB of dirty heap.
+    unsafe {
+        let ptr = mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ,
+            MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        );
+        if ptr.is_null() || ptr == usize::MAX as *mut std::ffi::c_void {
+            return None;
         }
+        Some(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
+    }
+}
+
+fn load_cjk_font_static_slice() -> Option<(&'static str, &'static [u8])> {
+    static CJK_FONT_CACHE: std::sync::OnceLock<Option<(&'static str, &'static [u8])>> =
+        std::sync::OnceLock::new();
+
+    *CJK_FONT_CACHE.get_or_init(|| {
+        let candidate_paths: &[&'static str] = &[
+            // macOS system CJK fonts (prefer compact 22MB Hiragino / Arial Unicode before 53MB STHeiti)
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            // Windows 10/11 system CJK fonts
+            r"C:\Windows\Fonts\msyh.ttc",
+            r"C:\Windows\Fonts\msyh.ttf",
+            r"C:\Windows\Fonts\simhei.ttf",
+            r"C:\Windows\Fonts\simsun.ttc",
+            // Linux CJK fallback fonts
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        ];
+
+        for &path in candidate_paths {
+            #[cfg(unix)]
+            if let Some(mapped) = map_font_file_readonly(path) {
+                return Some((path, mapped));
+            }
+
+            if let Ok(bytes) = std::fs::read(path) {
+                let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                return Some((path, leaked));
+            }
+        }
+        None
+    })
+}
+
+/// Load native OS CJK fallback fonts (macOS `Hiragino` / `STHeiti` / `Arial Unicode`,
+/// Windows `Microsoft YaHei` / `SimHei`) so localized audio device names (e.g. `"外置麦克风"`,
+/// `"外置耳机"`, `"扬声器"`) and Chinese UI text render crisply without missing-glyph tofu boxes.
+///
+/// Uses zero-copy `FontData::from_static` backed by read-only `mmap` on Unix so `epaint`
+/// borrows the OS page cache directly (`ab_glyph::FontRef`) without allocating or cloning
+/// multi-megabyte font buffers on the heap.
+pub fn configure_cjk_fallback_fonts(ctx: &egui::Context) {
+    if let Some((path, bytes)) = load_cjk_font_static_slice() {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "system_cjk".to_owned(),
+            egui::FontData::from_static(bytes),
+        );
+        if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional) {
+            prop.push("system_cjk".to_owned());
+        }
+        if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
+            mono.push("system_cjk".to_owned());
+        }
+        ctx.set_fonts(fonts);
+        tracing::debug!("Mapped native CJK fallback font zero-copy from '{path}'");
     }
 }
 
