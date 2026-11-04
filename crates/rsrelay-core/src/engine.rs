@@ -51,6 +51,7 @@ impl SenderSession {
             opus_bitrate_bps: cfg.opus_bitrate_bps,
             enable_fec: cfg.enable_fec,
             input_sample_rate: capture.sample_rate,
+            noise_gate_db: cfg.noise_gate_db,
         };
 
         let worker = AudioSenderWorker::spawn(sender_cfg, consumer)?;
@@ -67,6 +68,14 @@ impl SenderSession {
             worker,
             control_client,
         })
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.worker.set_muted(muted);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.worker.is_muted()
     }
 
     pub fn status(&self) -> SenderSessionStatus {

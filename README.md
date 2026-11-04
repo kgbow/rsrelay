@@ -50,9 +50,22 @@ cargo run --release -p rsrelay-gui
 cargo run --release -p rsrelay-cli -- devices
 ```
 
-### 2. Run Localhost End-to-End Pipeline Self-Test
+### 3. Run Localhost End-to-End Pipeline Self-Test
 ```bash
+# Single-direction pipeline test
 cargo run --release -p rsrelay-cli -- self-test --duration-secs 5 --profile balanced
+
+# Full-Duplex (Host <-> Wireless Headset) simultaneous bidirectional test
+cargo run --release -p rsrelay-cli -- self-test --duplex --duration-secs 5 --profile balanced
+```
+
+### 4. Full-Duplex Wireless Headset Mode (System Audio Downlink + Mic Uplink)
+```bash
+# On Main PC (Host): stream system audio to 192.168.1.105:49153 and receive remote Mic on :49155
+cargo run --release -p rsrelay-cli -- duplex --role host --peer 192.168.1.105
+
+# On Secondary Device (Headset): receive Host audio on :49153 and send Mic back to 192.168.1.100:49155 (with -45dB Noise Gate)
+cargo run --release -p rsrelay-cli -- duplex --role headset --peer 192.168.1.100 --gate-db -45.0
 ```
 
 ### 3. Start Receiver (Speaker Output + mDNS Broadcast)

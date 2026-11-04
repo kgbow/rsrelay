@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -9,8 +9,9 @@ use std::time::Duration;
 use eframe::egui;
 use rsrelay_core::{
     list_audio_devices, AudioDeviceInfo, CaptureSource, ChannelLayout, DiscoveredPeer,
-    DiscoveryService, LatencyProfile, ReceiverSession, ReceiverSessionConfig, SenderSession,
-    SenderSessionConfig, DEFAULT_AUDIO_UDP_PORT,
+    DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig, LatencyProfile,
+    ReceiverSession, ReceiverSessionConfig, SenderSession, SenderSessionConfig,
+    DEFAULT_AUDIO_UDP_PORT,
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
@@ -111,6 +112,13 @@ pub struct RsRelayGuiApp {
     pub advertise_mdns: bool,
     pub active_receiver: Option<ReceiverSession>,
 
+    // Full-Duplex Wireless Headset controls
+    pub duplex_role: DuplexRole,
+    pub duplex_peer_ip_input: String,
+    pub duplex_gate_db: f32,
+    pub duplex_mic_muted: bool,
+    pub active_duplex: Option<DuplexSession>,
+
     // Status message & tray
     pub last_status_msg: String,
     tray: Option<SystemTrayHandles>,
@@ -135,6 +143,11 @@ impl RsRelayGuiApp {
             volume: 1.0,
             advertise_mdns: true,
             active_receiver: None,
+            duplex_role: DuplexRole::Headset,
+            duplex_peer_ip_input: "127.0.0.1".to_string(),
+            duplex_gate_db: -45.0,
+            duplex_mic_muted: false,
+            active_duplex: None,
             last_status_msg: "Ready. Select a mode below to start streaming.".to_string(),
             tray,
         })
@@ -184,6 +197,7 @@ impl RsRelayGuiApp {
             frame_duration: self.selected_profile.default_frame_duration(),
             opus_bitrate_bps: self.opus_bitrate_kbps * 1000,
             enable_fec: self.selected_profile.default_fec(),
+            noise_gate_db: None,
         };
 
         match SenderSession::start(cfg) {
@@ -240,6 +254,46 @@ impl RsRelayGuiApp {
             }
         }
     }
+
+    pub fn toggle_duplex(&mut self) {
+        if self.active_duplex.is_some() {
+            self.active_duplex = None;
+            self.last_status_msg = "Full-Duplex session stopped.".to_string();
+            return;
+        }
+
+        // Stop standalone single-direction sessions before binding duplex ports
+        self.active_sender = None;
+        self.active_receiver = None;
+
+        let peer_ip: IpAddr = match self.duplex_peer_ip_input.trim().parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                self.last_status_msg = format!("Invalid Peer IP address: {e}");
+                return;
+            }
+        };
+
+        let mut cfg = DuplexSessionConfig::new(self.duplex_role, peer_ip);
+        cfg.profile = self.selected_profile;
+        cfg.mic_noise_gate_db = Some(self.duplex_gate_db);
+        cfg.initial_volume = self.volume;
+
+        match DuplexSession::start(cfg) {
+            Ok(session) => {
+                session.set_tx_muted(self.duplex_mic_muted);
+                let st = session.status();
+                self.last_status_msg = format!(
+                    "Full-Duplex [{:?}] active <-> {} (TX: '{}', RX: '{}')",
+                    self.duplex_role, peer_ip, st.tx.device_name, st.rx.device_name
+                );
+                self.active_duplex = Some(session);
+            }
+            Err(e) => {
+                self.last_status_msg = format!("Failed to start Full-Duplex session: {e}");
+            }
+        }
+    }
 }
 
 impl eframe::App for RsRelayGuiApp {
@@ -250,10 +304,12 @@ impl eframe::App for RsRelayGuiApp {
                 if event.id == tray.stop_all_id {
                     self.active_sender = None;
                     self.active_receiver = None;
+                    self.active_duplex = None;
                     self.last_status_msg = "All streams stopped from System Tray.".to_string();
                 } else if event.id == tray.quit_id {
                     self.active_sender = None;
                     self.active_receiver = None;
+                    self.active_duplex = None;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -262,6 +318,7 @@ impl eframe::App for RsRelayGuiApp {
         // Request continuous repaint at ~30 Hz when a stream is active so VU meters and telemetry animate smoothly
         if self.active_sender.is_some()
             || self.active_receiver.is_some()
+            || self.active_duplex.is_some()
             || self.scanning_lan.load(Ordering::Relaxed)
         {
             ctx.request_repaint_after(Duration::from_millis(33));
@@ -299,6 +356,7 @@ impl eframe::App for RsRelayGuiApp {
                                     let btn_label = format!("{} ({}) [{}]", peer.hostname, peer.os, addr_str);
                                     if ui.button(btn_label).clicked() {
                                         self.target_addr_input = addr_str;
+                                        self.duplex_peer_ip_input = ip.to_string();
                                     }
                                 }
                             }
@@ -475,6 +533,76 @@ impl eframe::App for RsRelayGuiApp {
                         ));
                     }
                 });
+            });
+
+            ui.add_space(6.0);
+            // === FULL-DUPLEX WIRELESS HEADSET SECTION ===
+            ui.group(|ui| {
+                ui.heading("3. Full-Duplex Wireless Headset Mode (Simultaneous System Audio + Mic)");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Role:");
+                    egui::ComboBox::from_id_salt("duplex_role_combo")
+                        .selected_text(match self.duplex_role {
+                            DuplexRole::Host => "Host PC (Send System Audio :49153 + Recv Mic :49155)",
+                            DuplexRole::Headset => "Wireless Headset (Recv System Audio :49153 + Send Mic :49155)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.duplex_role,
+                                DuplexRole::Host,
+                                "Host PC (Send System Audio :49153 + Recv Mic :49155)",
+                            );
+                            ui.selectable_value(
+                                &mut self.duplex_role,
+                                DuplexRole::Headset,
+                                "Wireless Headset (Recv System Audio :49153 + Send Mic :49155)",
+                            );
+                        });
+
+                    ui.label("Peer IP:");
+                    ui.add(egui::TextEdit::singleline(&mut self.duplex_peer_ip_input).desired_width(120.0));
+
+                    ui.label("Mic Gate:");
+                    ui.add(egui::Slider::new(&mut self.duplex_gate_db, -65.0..=-20.0).suffix(" dB"));
+
+                    if ui.checkbox(&mut self.duplex_mic_muted, "Mute Outgoing Mic").changed() {
+                        if let Some(ref dpx) = self.active_duplex {
+                            dpx.set_tx_muted(self.duplex_mic_muted);
+                        }
+                    }
+
+                    let dpx_running = self.active_duplex.is_some();
+                    let btn_label = if dpx_running {
+                        "Stop Full-Duplex"
+                    } else {
+                        "Start Full-Duplex Headset"
+                    };
+                    if ui.button(egui::RichText::new(btn_label).strong()).clicked() {
+                        self.toggle_duplex();
+                    }
+                });
+
+                if let Some(ref duplex) = self.active_duplex {
+                    let st = duplex.status();
+                    ui.separator();
+                    ui.columns(2, |cols| {
+                        cols[0].add(
+                            egui::ProgressBar::new(st.tx.peak_level.clamp(0.0, 1.0)).text(format!(
+                                "TX ({}) Sent: {} pkts (Gated DTX: {})",
+                                st.tx.device_name, st.tx.net.packets_sent, st.tx.net.gated_dtx_frames
+                            )),
+                        );
+                        cols[1].add(
+                            egui::ProgressBar::new(st.rx.peak_level.clamp(0.0, 1.0)).text(format!(
+                                "RX ({}) Recv: {} pkts (Buf: {:.1}ms, ASRC: {:.5}x)",
+                                st.rx.device_name,
+                                st.rx.net.packets_received,
+                                st.rx.net.buffer_level_ms,
+                                st.rx.net.resample_ratio
+                            )),
+                        );
+                    });
+                }
             });
 
             ui.separator();

@@ -10,7 +10,7 @@ use rtrb::Consumer;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use rsrelay_audio::promote_worker_thread_priority;
-use rsrelay_dsp::{AdaptiveResampler, AudioEncoder};
+use rsrelay_dsp::{AdaptiveResampler, AudioEncoder, NoiseGate};
 use rsrelay_proto::{
     ChannelLayout, CodecType, FormatFlags, FrameDuration, PacketHeader, HEADER_LEN,
     MAX_PACKET_SIZE, MAX_UDP_PAYLOAD, STANDARD_SAMPLE_RATE,
@@ -25,6 +25,7 @@ pub struct SenderConfig {
     pub opus_bitrate_bps: u32,
     pub enable_fec: bool,
     pub input_sample_rate: u32,
+    pub noise_gate_db: Option<f32>,
 }
 
 #[derive(Debug, Default)]
@@ -32,6 +33,7 @@ pub struct SenderMetrics {
     pub packets_sent: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub silence_heartbeats_sent: AtomicU64,
+    pub gated_dtx_frames: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -39,10 +41,13 @@ pub struct SenderSnapshot {
     pub packets_sent: u64,
     pub bytes_sent: u64,
     pub silence_heartbeats_sent: u64,
+    pub gated_dtx_frames: u64,
+    pub muted: bool,
 }
 
 pub struct AudioSenderWorker {
     stop_flag: Arc<AtomicBool>,
+    muted_flag: Arc<AtomicBool>,
     metrics: Arc<SenderMetrics>,
     join_handle: Option<JoinHandle<()>>,
 }
@@ -82,15 +87,20 @@ impl AudioSenderWorker {
             };
 
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let muted_flag = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(SenderMetrics::default());
 
         let stop_clone = Arc::clone(&stop_flag);
+        let muted_clone = Arc::clone(&muted_flag);
         let metrics_clone = Arc::clone(&metrics);
 
         let join_handle = thread::Builder::new()
             .name("rsrelay-tx-worker".to_string())
             .spawn(move || {
                 promote_worker_thread_priority(STANDARD_SAMPLE_RATE, target_frames_48k as u32);
+
+                let mut noise_gate =
+                    NoiseGate::new(config.noise_gate_db, STANDARD_SAMPLE_RATE, ch);
 
                 let hw_chunk_samples = hw_chunk_frames * ch;
                 let target_samples_48k = target_frames_48k * ch;
@@ -139,6 +149,46 @@ impl AudioSenderWorker {
                     while resampled_staging.len() >= target_samples_48k {
                         encode_in.copy_from_slice(&resampled_staging[..target_samples_48k]);
                         resampled_staging.drain(..target_samples_48k);
+
+                        let is_muted = muted_clone.load(Ordering::Relaxed);
+                        let is_gated_silent =
+                            noise_gate.process_interleaved(&mut encode_in, is_muted);
+
+                        if is_gated_silent && (is_muted || config.noise_gate_db.is_some()) {
+                            // Discontinuous Transmission (DTX): send 12B FLAG_SILENCE packet
+                            let mut flags = FormatFlags::new(
+                                config.codec,
+                                config.channels,
+                                config.frame_duration,
+                            );
+                            flags.is_silence = true;
+                            if is_first_packet {
+                                flags.is_reset = true;
+                                is_first_packet = false;
+                            }
+                            let hdr = PacketHeader {
+                                seq,
+                                timestamp,
+                                flags,
+                                payload_len: 0,
+                            };
+                            hdr.encode((&mut datagram_buf[..HEADER_LEN]).try_into().unwrap());
+                            if socket
+                                .send_to(&datagram_buf[..HEADER_LEN], config.target_addr)
+                                .is_ok()
+                            {
+                                metrics_clone.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                metrics_clone
+                                    .bytes_sent
+                                    .fetch_add(HEADER_LEN as u64, Ordering::Relaxed);
+                                metrics_clone
+                                    .gated_dtx_frames
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            seq = seq.wrapping_add(1);
+                            timestamp = timestamp.wrapping_add(target_frames_48k as u32);
+                            continue;
+                        }
 
                         if let Ok(payload_len) = encoder.encode(&encode_in, &mut payload_buf) {
                             let mut flags = FormatFlags::new(
@@ -223,9 +273,20 @@ impl AudioSenderWorker {
 
         Ok(Self {
             stop_flag,
+            muted_flag,
             metrics,
             join_handle: Some(join_handle),
         })
+    }
+
+    #[inline]
+    pub fn set_muted(&self, muted: bool) {
+        self.muted_flag.store(muted, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn is_muted(&self) -> bool {
+        self.muted_flag.load(Ordering::Relaxed)
     }
 
     pub fn snapshot(&self) -> SenderSnapshot {
@@ -233,6 +294,8 @@ impl AudioSenderWorker {
             packets_sent: self.metrics.packets_sent.load(Ordering::Relaxed),
             bytes_sent: self.metrics.bytes_sent.load(Ordering::Relaxed),
             silence_heartbeats_sent: self.metrics.silence_heartbeats_sent.load(Ordering::Relaxed),
+            gated_dtx_frames: self.metrics.gated_dtx_frames.load(Ordering::Relaxed),
+            muted: self.muted_flag.load(Ordering::Relaxed),
         }
     }
 }

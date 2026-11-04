@@ -3,10 +3,12 @@
 
 pub mod codec;
 pub mod drift;
+pub mod gate;
 pub mod jitter;
 pub mod resampler;
 
 pub use codec::{AudioDecoder, AudioEncoder, CodecError};
 pub use drift::ClockDriftController;
+pub use gate::{soft_limit, NoiseGate};
 pub use jitter::{JitterBuffer, JitterStats, PopOutcome, JB_CAPACITY};
 pub use resampler::{AdaptiveResampler, ResampleError};

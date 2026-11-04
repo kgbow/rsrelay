@@ -60,6 +60,7 @@ pub struct SenderSessionConfig {
     pub frame_duration: FrameDuration,
     pub opus_bitrate_bps: u32,
     pub enable_fec: bool,
+    pub noise_gate_db: Option<f32>,
 }
 
 #[derive(Debug, Clone)]

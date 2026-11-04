@@ -4,11 +4,27 @@ use crate::header::{ChannelLayout, CodecType, FrameDuration};
 /// mDNS-SD service type used for zero-configuration LAN discovery.
 pub const MDNS_SERVICE_TYPE: &str = "_rsrelay._udp.local.";
 
-/// Default TCP control port.
+/// Default TCP control port (downlink / primary stream).
 pub const DEFAULT_CONTROL_PORT: u16 = 49152;
 
-/// Default UDP audio stream port.
+/// Default UDP audio stream port (downlink / primary stream).
 pub const DEFAULT_AUDIO_UDP_PORT: u16 = 49153;
+
+/// Default TCP control port for full-duplex return microphone uplink.
+pub const DEFAULT_UPLINK_CONTROL_PORT: u16 = 49154;
+
+/// Default UDP audio port for full-duplex return microphone uplink.
+pub const DEFAULT_UPLINK_UDP_PORT: u16 = 49155;
+
+/// Role in a full-duplex bidirectional session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DuplexRole {
+    /// Main desktop/PC: sends System Loopback audio (downlink) and receives remote Microphone (uplink).
+    Host,
+    /// Secondary device acting as wireless headset: receives System Audio (downlink) and sends local Microphone (uplink).
+    Headset,
+}
 
 /// Node capabilities advertised via mDNS TXT records and TCP handshake.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
