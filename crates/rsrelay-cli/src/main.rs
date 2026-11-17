@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rsrelay_core::{
-    detect_local_lan_ip, has_system_loopback_permission, list_audio_devices, CaptureSource,
-    ChannelLayout, DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig,
+    detect_local_lan_ip, list_audio_devices, select_default_virtual_mic_output_device,
+    CaptureSource, ChannelLayout, DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig,
     LatencyProfile, ReceiverSession, ReceiverSessionConfig, SenderSession, SenderSessionConfig,
     DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT,
 };
@@ -19,7 +19,7 @@ use rsrelay_core::{
 #[command(
     name = "rsrelay",
     version,
-    about = "Ultra-low-latency cross-platform audio relay in pure Rust (Windows & macOS)"
+    about = "Ultra-low-latency cross-platform audio & microphone relay in pure Rust (Windows & macOS)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -28,7 +28,7 @@ struct Cli {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum SourceArg {
-    /// System audio loopback (WASAPI Loopback on Windows, Loopback/ScreenCaptureKit on macOS)
+    /// System audio loopback (WASAPI Loopback on Windows, ScreenCaptureKit on macOS)
     Loopback,
     /// Microphone / Line-In input
     Mic,
@@ -71,10 +71,12 @@ impl From<ProfileArg> for LatencyProfile {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum DuplexRoleArg {
-    /// Main PC: sends System Loopback audio (downlink :49153) & receives remote Microphone (uplink :49155)
+    /// Main PC: sends System Loopback audio (:49153) & receives remote Microphone into Virtual Mic (:49155)
     Host,
-    /// Wireless Headset: receives System Audio (downlink :49153) & sends local Microphone (uplink :49155)
+    /// Wireless Headset: receives System Audio (:49153) & sends local Microphone (:49155)
     Headset,
+    /// Symmetric Dual-Desktop (Win + Mac): simultaneous bidirectional Speaker + Virtual Mic sharing
+    Symmetric,
 }
 
 impl From<DuplexRoleArg> for DuplexRole {
@@ -82,14 +84,18 @@ impl From<DuplexRoleArg> for DuplexRole {
         match val {
             DuplexRoleArg::Host => DuplexRole::Host,
             DuplexRoleArg::Headset => DuplexRole::Headset,
+            DuplexRoleArg::Symmetric => DuplexRole::Symmetric,
         }
     }
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List all local input and output audio devices
+    /// List all local input, output, and virtual microphone audio devices
     Devices,
+
+    /// Install the virtual microphone driver (`rsrelayVirtualMic.driver` on macOS, or `VB-CABLE` via winget on Windows)
+    InstallDriver,
 
     /// Discover active rsrelay receivers on the LAN via mDNS (_rsrelay._udp.local.)
     Discover {
@@ -125,9 +131,9 @@ enum Commands {
         gate_db: Option<f32>,
     },
 
-    /// Full-Duplex Wireless Headset mode: simultaneous System Audio downlink + Microphone uplink
+    /// Full-Duplex / Cross-Machine Speaker & Microphone sharing (`host`, `headset`, or `symmetric`)
     Duplex {
-        /// Role of this machine (host = Main PC, headset = Secondary device with headphones & mic)
+        /// Role preset (`host`, `headset`, or `symmetric` for dual-desktop Win+Mac sharing)
         #[arg(short, long, value_enum, default_value_t = DuplexRoleArg::Host)]
         role: DuplexRoleArg,
 
@@ -139,7 +145,7 @@ enum Commands {
         #[arg(short = 'P', long, value_enum, default_value_t = ProfileArg::Balanced)]
         profile: ProfileArg,
 
-        /// Microphone noise gate threshold in dBFS (used in headset role; <= -90 disables)
+        /// Microphone noise gate threshold in dBFS (<= -90 disables)
         #[arg(long, default_value_t = -45.0)]
         gate_db: f32,
 
@@ -147,15 +153,15 @@ enum Commands {
         #[arg(long)]
         tx_device: Option<String>,
 
-        /// Optional RX playback device name substring filter (e.g. "BlackHole" or "CABLE Input" on Host)
+        /// Optional RX playback / Virtual Mic device name substring filter
         #[arg(long)]
         rx_device: Option<String>,
 
-        /// Downlink UDP port (Host -> Headset system audio)
+        /// Media / Speaker bus UDP port (default :49153)
         #[arg(long, default_value_t = DEFAULT_AUDIO_UDP_PORT)]
         downlink_port: u16,
 
-        /// Uplink UDP port (Headset -> Host microphone audio)
+        /// Microphone / Virtual Mic bus UDP port (default :49155)
         #[arg(long, default_value_t = DEFAULT_UPLINK_UDP_PORT)]
         uplink_port: u16,
 
@@ -222,11 +228,16 @@ fn main() -> anyhow::Result<()> {
             #[cfg(target_os = "macos")]
             println!(
                 "macOS ScreenCaptureKit System Audio Permission: {}",
-                if has_system_loopback_permission() {
+                if rsrelay_core::has_system_loopback_permission() {
                     "GRANTED (Driverless 48kHz Stereo Loopback ready)"
                 } else {
                     "NOT GRANTED (Will prompt on first Loopback capture)"
                 }
+            );
+            println!(
+                "Preferred Virtual Mic Sink: {}",
+                select_default_virtual_mic_output_device()
+                    .unwrap_or_else(|| "NONE (Run `rsrelay install-driver` to install)".to_string())
             );
             let devices = list_audio_devices()?;
             println!("=== Local Audio Devices ({}) ===", devices.len());
@@ -246,6 +257,32 @@ fn main() -> anyhow::Result<()> {
                     .map(|c| format!("{c} ch"))
                     .unwrap_or_else(|| "N/A".to_string());
                 println!("  [{role}] {:<42} ({rate}, {ch}){default_tag}", dev.name);
+            }
+        }
+
+        Commands::InstallDriver => {
+            #[cfg(target_os = "macos")]
+            {
+                println!("Building and installing `/Library/Audio/Plug-Ins/HAL/rsrelayVirtualMic.driver`...");
+                match rsrelay_core::install_macos_virtual_mic_driver() {
+                    Ok(path) => {
+                        println!("Successfully installed macOS Virtual Mic HAL driver at: {path}");
+                        println!("Select 'rsrelay Virtual Mic' as the microphone in Zoom, Chrome, WeChat, or Discord.");
+                    }
+                    Err(e) => anyhow::bail!("{e}"),
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                println!("Launching signed VB-CABLE Virtual Audio Driver installation via winget...");
+                match rsrelay_core::launch_windows_vbcable_install() {
+                    Ok(pkg) => println!("Launched winget installer for {pkg}."),
+                    Err(e) => anyhow::bail!("{e}"),
+                }
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                println!("On Linux, PipeWire/PulseAudio virtual sources can be created natively via `pactl load-module module-null-sink`.");
             }
         }
 
@@ -348,36 +385,55 @@ fn main() -> anyhow::Result<()> {
             let session = DuplexSession::start(cfg)?;
             let st = session.status();
             println!(
-                "Started Full-Duplex [{:?}] <-> Peer {} (Downlink :{}, Uplink :{})",
+                "Started Full-Duplex [{:?}] <-> Peer {} (Media Bus :{}, Mic Bus :{})",
                 duplex_role, peer, downlink_port, uplink_port
             );
-            println!(
-                "  TX Source : '{}' ({} Hz) | RX Output: '{}' ({} Hz)",
-                st.tx.device_name, st.tx.sample_rate, st.rx.device_name, st.rx.sample_rate
-            );
+            if let Some(ref mtx) = st.media_tx {
+                println!("  Media TX   : '{}' ({} Hz)", mtx.device_name, mtx.sample_rate);
+            }
+            if let Some(ref mrx) = st.media_rx {
+                println!("  Media RX   : '{}' ({} Hz)", mrx.device_name, mrx.sample_rate);
+            }
+            if let Some(ref vtx) = st.mic_tx {
+                println!("  Mic TX     : '{}' ({} Hz)", vtx.device_name, vtx.sample_rate);
+            }
+            if let Some(ref vrx) = st.mic_rx {
+                println!(
+                    "  VirtualMic : '{}' ({} Hz){}",
+                    vrx.device_name,
+                    vrx.sample_rate,
+                    if st.virtual_mic_ready {
+                        ""
+                    } else {
+                        " [ECHO-FREE GUARD: Run `rsrelay install-driver` to expose OS Virtual Mic]"
+                    }
+                );
+            }
             println!("Press Ctrl+C to stop.");
 
             let running = setup_ctrlc_flag();
             while running.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(250));
                 let st = session.status();
-                let tx_vu = render_vu_bar(st.tx.peak_level, 10);
-                let rx_vu = render_vu_bar(st.rx.peak_level, 10);
-                let rtt_str = if st.tx.control.connected {
-                    format!("{:.2}ms", (st.tx.control.rtt_us as f64) / 1000.0)
-                } else {
-                    "N/A".to_string()
-                };
+                let tx_pkts = st.primary_tx().map(|t| t.net.packets_sent).unwrap_or(0);
+                let tx_dtx = st.primary_tx().map(|t| t.net.gated_dtx_frames).unwrap_or(0);
+                let tx_peak = st.primary_tx().map(|t| t.peak_level).unwrap_or(0.0);
+                let rx_pkts = st.primary_rx().map(|r| r.net.packets_received).unwrap_or(0);
+                let rx_lost = st.primary_rx().map(|r| r.net.packets_lost).unwrap_or(0);
+                let rx_buf = st.primary_rx().map(|r| r.net.buffer_level_ms).unwrap_or(0.0);
+                let rx_asrc = st.primary_rx().map(|r| r.net.resample_ratio).unwrap_or(1.0);
+                let rx_peak = st.primary_rx().map(|r| r.peak_level).unwrap_or(0.0);
+
+                let tx_vu = render_vu_bar(tx_peak, 10);
+                let rx_vu = render_vu_bar(rx_peak, 10);
+                let rtt_str = st
+                    .best_rtt_us()
+                    .map(|us| format!("{:.2}ms", (us as f64) / 1000.0))
+                    .unwrap_or_else(|| "N/A".to_string());
+
                 print!(
                     "\r[DUPLEX {:?}] TX[{tx_vu}] {:>6} pkts (DTX:{:>4}) | RX[{rx_vu}] {:>6} pkts (Lost:{:>2}, Buf:{:>4.1}ms, ASRC:{:.5}x) | RTT:{:>7}   ",
-                    st.role,
-                    st.tx.net.packets_sent,
-                    st.tx.net.gated_dtx_frames,
-                    st.rx.net.packets_received,
-                    st.rx.net.packets_lost,
-                    st.rx.net.buffer_level_ms,
-                    st.rx.net.resample_ratio,
-                    rtt_str
+                    st.role, tx_pkts, tx_dtx, rx_pkts, rx_lost, rx_buf, rx_asrc, rtt_str
                 );
                 let _ = std::io::stdout().flush();
             }
@@ -472,23 +528,28 @@ fn main() -> anyhow::Result<()> {
                     thread::sleep(Duration::from_secs(1));
                     let h_st = host_session.status();
                     let hs_st = headset_session.status();
+                    let h_tx = h_st.media_tx.as_ref().unwrap();
+                    let h_rx = h_st.mic_rx.as_ref().unwrap();
+                    let hs_rx = hs_st.media_rx.as_ref().unwrap();
+                    let hs_tx = hs_st.mic_tx.as_ref().unwrap();
                     println!(
-                        "  [{sec}s/{duration_secs}s] Downlink (Host->Headset): TX {} / RX {} pkts (Buf {:.1}ms) | Uplink (Headset->Host): TX {} / RX {} pkts (Buf {:.1}ms, RTT {:.2}ms)",
-                        h_st.tx.net.packets_sent,
-                        hs_st.rx.net.packets_received,
-                        hs_st.rx.net.buffer_level_ms,
-                        hs_st.tx.net.packets_sent,
-                        h_st.rx.net.packets_received,
-                        h_st.rx.net.buffer_level_ms,
-                        (hs_st.tx.control.rtt_us as f64) / 1000.0
+                        "  [{sec}s/{duration_secs}s] Media Bus (Host->Headset): TX {} / RX {} pkts (Buf {:.1}ms) | Mic Bus (Headset->Host): TX {} / RX {} pkts (Buf {:.1}ms, RTT {:.2}ms)",
+                        h_tx.net.packets_sent,
+                        hs_rx.net.packets_received,
+                        hs_rx.net.buffer_level_ms,
+                        hs_tx.net.packets_sent,
+                        h_rx.net.packets_received,
+                        h_rx.net.buffer_level_ms,
+                        (hs_tx.control.rtt_us as f64) / 1000.0
                     );
                 }
 
                 let final_h = host_session.status();
                 let final_hs = headset_session.status();
+                let dl_pkts = final_hs.media_rx.as_ref().unwrap().net.packets_received;
+                let ul_pkts = final_h.mic_rx.as_ref().unwrap().net.packets_received;
                 println!(
-                    "Full-Duplex self-test complete: Downlink delivered {} pkts (0 lost), Uplink delivered {} pkts (0 lost).",
-                    final_hs.rx.net.packets_received, final_h.rx.net.packets_received
+                    "Full-Duplex self-test complete: Media Bus delivered {dl_pkts} pkts, Mic Bus delivered {ul_pkts} pkts."
                 );
                 return Ok(());
             }

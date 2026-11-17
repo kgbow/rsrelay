@@ -8,10 +8,17 @@ use cpal::SampleFormat;
 use rtrb::Consumer;
 
 use crate::device::AudioError;
+use crate::windows_virtual_mic::{
+    is_null_virtual_mic_filter, is_virtual_mic_device_filter, is_virtual_mic_driver_available,
+    NullVirtualMicStream, VirtualMicPlaybackStream, NULL_VIRTUAL_MIC_DEVICE_NAME,
+    VIRTUAL_MIC_OUTPUT_DEVICE_NAME,
+};
 
 /// Active audio playback stream handle.
 pub struct PlaybackStreamHandle {
-    _cpal_stream: cpal::Stream,
+    _cpal_stream: Option<cpal::Stream>,
+    _virtual_mic_stream: Option<VirtualMicPlaybackStream>,
+    _null_vmic_stream: Option<NullVirtualMicStream>,
     pub device_name: String,
     pub sample_rate: u32,
     pub channels: u16,
@@ -51,6 +58,58 @@ pub fn start_playback_stream(
     source_channels: u16,
     mut consumer: Consumer<f32>,
 ) -> Result<PlaybackStreamHandle, AudioError> {
+    let volume_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let peak_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+    let underrun_count = Arc::new(AtomicU64::new(0));
+
+    // 1. Echo-Free Guard Null Virtual Mic Sink (used when Mic RX is enabled on a host that
+    //    has not yet installed a virtual audio driver, preventing speaker loopback echo).
+    if let Some(filter) = device_name_filter {
+        if is_null_virtual_mic_filter(filter) {
+            let null_stream = NullVirtualMicStream::start(
+                source_channels,
+                consumer,
+                Arc::clone(&volume_bits),
+                Arc::clone(&peak_bits),
+                Arc::clone(&underrun_count),
+            );
+            return Ok(PlaybackStreamHandle {
+                _cpal_stream: None,
+                _virtual_mic_stream: None,
+                _null_vmic_stream: Some(null_stream),
+                device_name: NULL_VIRTUAL_MIC_DEVICE_NAME.to_string(),
+                sample_rate: 48_000,
+                channels: 2,
+                volume_bits,
+                peak_bits,
+                underrun_count,
+            });
+        }
+
+        // 2. On Windows, if the target device is `Virtual Mic` and the kernel driver is active,
+        //    write PCM frames directly into `\\.\AudioRelayVirtualMicDeviceLink` using high-res pacing.
+        if is_virtual_mic_device_filter(filter) && is_virtual_mic_driver_available() {
+            let vmic_stream = VirtualMicPlaybackStream::start(
+                source_channels,
+                consumer,
+                Arc::clone(&volume_bits),
+                Arc::clone(&peak_bits),
+                Arc::clone(&underrun_count),
+            )?;
+            return Ok(PlaybackStreamHandle {
+                _cpal_stream: None,
+                _virtual_mic_stream: Some(vmic_stream),
+                _null_vmic_stream: None,
+                device_name: VIRTUAL_MIC_OUTPUT_DEVICE_NAME.to_string(),
+                sample_rate: 48_000,
+                channels: 2,
+                volume_bits,
+                peak_bits,
+                underrun_count,
+            });
+        }
+    }
+
     let host = cpal::default_host();
     let device = if let Some(filter) = device_name_filter {
         let filter_lower = filter.to_lowercase();
@@ -72,10 +131,6 @@ pub fn start_playback_stream(
     let config: cpal::StreamConfig = supported_cfg.into();
     let hw_sample_rate = config.sample_rate.0;
     let hw_channels = config.channels;
-
-    let volume_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
-    let peak_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
-    let underrun_count = Arc::new(AtomicU64::new(0));
 
     let vol_clone = Arc::clone(&volume_bits);
     let peak_clone = Arc::clone(&peak_bits);
@@ -140,7 +195,9 @@ pub fn start_playback_stream(
     stream.play()?;
 
     Ok(PlaybackStreamHandle {
-        _cpal_stream: stream,
+        _cpal_stream: Some(stream),
+        _virtual_mic_stream: None,
+        _null_vmic_stream: None,
         device_name,
         sample_rate: hw_sample_rate,
         channels: hw_channels,

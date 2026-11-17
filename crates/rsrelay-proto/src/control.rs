@@ -30,14 +30,16 @@ pub const fn companion_control_port(audio_udp_port: u16) -> u16 {
     }
 }
 
-/// Role in a full-duplex bidirectional session.
+/// Role preset in a full-duplex / cross-machine audio sharing session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DuplexRole {
-    /// Main desktop/PC: sends System Loopback audio (downlink) and receives remote Microphone (uplink).
+    /// Main desktop/PC: sends System Loopback audio (downlink :49153) and receives remote Microphone into Virtual Mic (uplink :49155).
     Host,
-    /// Secondary device acting as wireless headset: receives System Audio (downlink) and sends local Microphone (uplink).
+    /// Secondary device acting as wireless headset: receives System Audio (downlink :49153) and sends local Microphone (uplink :49155).
     Headset,
+    /// Symmetric dual-desktop mode (Win + Mac): simultaneous or custom bidirectional Speaker & Virtual Mic sharing.
+    Symmetric,
 }
 
 /// Node capabilities advertised via mDNS TXT records and TCP handshake.
@@ -46,6 +48,8 @@ pub struct NodeCapabilities {
     pub can_send_loopback: bool,
     pub can_send_mic: bool,
     pub can_receive_speaker: bool,
+    #[serde(default)]
+    pub can_receive_virtual_mic: bool,
 }
 
 impl Default for NodeCapabilities {
@@ -54,6 +58,7 @@ impl Default for NodeCapabilities {
             can_send_loopback: true,
             can_send_mic: true,
             can_receive_speaker: true,
+            can_receive_virtual_mic: true,
         }
     }
 }

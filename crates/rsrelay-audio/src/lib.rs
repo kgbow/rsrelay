@@ -3,13 +3,26 @@
 pub mod capture;
 pub mod device;
 pub mod macos_sck;
+pub mod macos_virtual_mic;
 pub mod playback;
 pub mod windows_loopback;
+pub mod windows_virtual_mic;
 
 pub use capture::{start_capture_stream, CaptureStreamHandle};
-pub use device::{list_audio_devices, AudioDeviceInfo, AudioError, CaptureSource};
+pub use device::{
+    is_virtual_mic_input_device_name, is_virtual_mic_output_sink_name, list_audio_devices,
+    select_default_virtual_mic_output_device, AudioDeviceInfo, AudioError, CaptureSource,
+};
 pub use macos_sck::interleave_planar_to_ringbuffer;
+pub use macos_virtual_mic::{
+    install_macos_virtual_mic_driver, is_macos_rsrelay_driver_installed,
+    launch_windows_vbcable_install, MACOS_RSRELAY_VMIC_INPUT_NAME, MACOS_RSRELAY_VMIC_SINK_NAME,
+};
 pub use playback::{start_playback_stream, PlaybackStreamHandle};
+pub use windows_virtual_mic::{
+    is_audiorelay_backend_running, is_null_virtual_mic_filter, is_virtual_mic_driver_available,
+    NULL_VIRTUAL_MIC_DEVICE_NAME, VIRTUAL_MIC_OUTPUT_DEVICE_NAME,
+};
 
 /// Check whether OS-level permission for native system audio loopback is currently granted.
 ///

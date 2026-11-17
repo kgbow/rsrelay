@@ -18,10 +18,15 @@ use eframe::egui::{
 };
 use rsrelay_core::{
     detect_all_local_ipv4s, detect_local_lan_ip, has_system_loopback_permission,
-    list_audio_devices, request_system_loopback_permission, AudioDeviceInfo, CaptureSource,
-    ChannelLayout, DiscoveredPeer, DiscoveryService, DuplexRole, DuplexSession,
-    DuplexSessionConfig, LatencyProfile, ReceiverSession, ReceiverSessionConfig, SenderSession,
-    SenderSessionConfig, DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT,
+    install_macos_virtual_mic_driver, is_audiorelay_backend_running,
+    is_macos_rsrelay_driver_installed, is_virtual_mic_input_device_name,
+    is_virtual_mic_output_sink_name, launch_windows_vbcable_install, list_audio_devices,
+    preset_bus_modes_for_role, request_system_loopback_permission,
+    select_default_virtual_mic_output_device, AudioDeviceInfo, CaptureSource, ChannelLayout,
+    DiscoveredPeer, DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig,
+    LatencyProfile, MediaBusMode, MicBusMode, ReceiverSession, ReceiverSessionConfig,
+    SenderSession, SenderSessionConfig, DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT,
+    MACOS_RSRELAY_VMIC_INPUT_NAME,
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
@@ -535,8 +540,14 @@ pub struct RsRelayGuiApp {
     pub active_receiver: Option<ReceiverSession>,
     rx_started_at: Option<Instant>,
 
-    // Full-Duplex Wireless Headset controls
+    // Full-Duplex & Cross-Machine Speaker + Virtual Mic Sharing controls
     pub duplex_role: DuplexRole,
+    pub duplex_media_mode: MediaBusMode,
+    pub duplex_mic_mode: MicBusMode,
+    pub duplex_media_tx_device: Option<String>,
+    pub duplex_media_rx_device: Option<String>,
+    pub duplex_mic_tx_device: Option<String>,
+    pub duplex_mic_rx_device: Option<String>,
     pub duplex_peer_ip_input: String,
     pub duplex_downlink_port: u16,
     pub duplex_uplink_port: u16,
@@ -545,6 +556,9 @@ pub struct RsRelayGuiApp {
     pub duplex_rx_channels: ChannelLayout,
     pub active_duplex: Option<DuplexSession>,
     duplex_started_at: Option<Instant>,
+    pub installing_vmic_driver: Arc<AtomicBool>,
+    pending_vmic_install_result: Arc<Mutex<Option<Result<String, String>>>>,
+    pub audiorelay_conflict_cached: bool,
 
     // Real-time VU meters & chart sparkline buffers
     tx_vu_meter: VuMeterState,
@@ -594,6 +608,10 @@ impl RsRelayGuiApp {
             None
         };
 
+        let initial_duplex_role = DuplexRole::Headset;
+        let (init_media_mode, init_mic_mode) = preset_bus_modes_for_role(initial_duplex_role);
+        let audiorelay_conflict_cached = is_audiorelay_backend_running();
+
         let mut app = Self {
             lang,
             theme_mode: ThemeMode::System,
@@ -623,7 +641,13 @@ impl RsRelayGuiApp {
             advertise_mdns: true,
             active_receiver: None,
             rx_started_at: None,
-            duplex_role: DuplexRole::Headset,
+            duplex_role: initial_duplex_role,
+            duplex_media_mode: init_media_mode,
+            duplex_mic_mode: init_mic_mode,
+            duplex_media_tx_device: None,
+            duplex_media_rx_device: None,
+            duplex_mic_tx_device: None,
+            duplex_mic_rx_device: None,
             duplex_peer_ip_input: "127.0.0.1".to_string(),
             duplex_downlink_port: DEFAULT_AUDIO_UDP_PORT,
             duplex_uplink_port: DEFAULT_UPLINK_UDP_PORT,
@@ -632,6 +656,9 @@ impl RsRelayGuiApp {
             duplex_rx_channels: ChannelLayout::Stereo,
             active_duplex: None,
             duplex_started_at: None,
+            installing_vmic_driver: Arc::new(AtomicBool::new(false)),
+            pending_vmic_install_result: Arc::new(Mutex::new(None)),
+            audiorelay_conflict_cached,
             tx_vu_meter: VuMeterState::default(),
             rx_vu_meter: VuMeterState::default(),
             duplex_tx_vu_meter: VuMeterState::default(),
@@ -713,10 +740,9 @@ impl RsRelayGuiApp {
         };
         let status_line = if let Some(ref dpx) = self.active_duplex {
             let st = dpx.status();
-            format!(
-                "● DUPLEX LIVE — TX: {} | RX Buf: {:.1} ms",
-                st.tx.net.packets_sent, st.rx.net.buffer_level_ms
-            )
+            let tx_pkts = st.primary_tx().map(|t| t.net.packets_sent).unwrap_or(0);
+            let rx_buf = st.primary_rx().map(|r| r.net.buffer_level_ms).unwrap_or(0.0);
+            format!("● DUPLEX LIVE — TX: {tx_pkts} | RX Buf: {rx_buf:.1} ms")
         } else if self.active_sender.is_some() && self.active_receiver.is_some() {
             let tx_pkts = self
                 .active_sender
@@ -760,6 +786,27 @@ impl RsRelayGuiApp {
     }
 
     fn apply_pending_device_updates(&mut self) {
+        if let Some(install_res) = self
+            .pending_vmic_install_result
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
+            match install_res {
+                Ok(detail) => {
+                    self.last_status_msg = self.lang.status_vmic_driver_installed(&detail);
+                    self.devices = list_audio_devices().unwrap_or_default();
+                    if self.active_duplex.is_some() {
+                        self.active_duplex = None;
+                        self.toggle_duplex();
+                    }
+                }
+                Err(err) => {
+                    self.last_status_msg = self.lang.status_vmic_driver_failed(&err);
+                }
+            }
+        }
+
         let maybe_update = self
             .pending_devices
             .lock()
@@ -784,6 +831,18 @@ impl RsRelayGuiApp {
         self.devices = new_devices;
         self.local_lan_ip = detect_local_lan_ip();
         self.sck_permission_granted = has_system_loopback_permission();
+        self.audiorelay_conflict_cached = is_audiorelay_backend_running();
+
+        // If Duplex Mic RX was waiting in Echo-Free Guard mode and a real Virtual Mic driver
+        // just became available (e.g. after VB-CABLE or rsrelayVirtualMic install), bind automatically!
+        if let Some(ref dpx) = self.active_duplex {
+            let st = dpx.status();
+            if !st.virtual_mic_ready && select_default_virtual_mic_output_device().is_some() {
+                self.active_duplex = None;
+                self.toggle_duplex();
+                return;
+            }
+        }
 
         if manual {
             self.last_status_msg = self.lang.status_refreshed_ports(in_count, out_count);
@@ -1081,6 +1140,26 @@ impl RsRelayGuiApp {
         }
     }
 
+    pub fn trigger_install_virtual_mic_driver(&mut self) {
+        if self.installing_vmic_driver.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.last_status_msg = self.lang.status_installing_vmic_driver();
+        let flag = Arc::clone(&self.installing_vmic_driver);
+        let result_slot = Arc::clone(&self.pending_vmic_install_result);
+        thread::spawn(move || {
+            let res = if cfg!(target_os = "macos") {
+                install_macos_virtual_mic_driver()
+            } else {
+                launch_windows_vbcable_install()
+            };
+            if let Ok(mut guard) = result_slot.lock() {
+                *guard = Some(res);
+            }
+            flag.store(false, Ordering::Relaxed);
+        });
+    }
+
     pub fn toggle_duplex(&mut self) {
         if self.active_duplex.is_some() {
             self.active_duplex = None;
@@ -1113,28 +1192,40 @@ impl RsRelayGuiApp {
         };
 
         let mut cfg = DuplexSessionConfig::new(self.duplex_role, peer_ip);
+        cfg.media_mode = self.duplex_media_mode;
+        cfg.mic_mode = self.duplex_mic_mode;
         cfg.downlink_udp_port = self.duplex_downlink_port;
         cfg.uplink_udp_port = self.duplex_uplink_port;
-        cfg.tx_device_name = self.selected_tx_device.clone();
-        cfg.rx_device_name = self.selected_rx_device.clone();
+        cfg.media_tx_device = self.duplex_media_tx_device.clone();
+        cfg.media_rx_device = self.duplex_media_rx_device.clone();
+        cfg.mic_tx_device = self.duplex_mic_tx_device.clone();
+        cfg.mic_rx_device = self.duplex_mic_rx_device.clone();
+        cfg.media_channels = self.duplex_rx_channels;
+        cfg.mic_channels = ChannelLayout::Stereo;
         cfg.profile = self.selected_profile;
         cfg.mic_noise_gate_db = Some(self.duplex_gate_db);
         cfg.initial_volume = self.volume;
+        cfg.mic_rx_gain = self.volume;
         cfg.advertise_mdns = self.advertise_mdns && self.lan_advertiser.is_none();
 
         match DuplexSession::start(cfg) {
             Ok(session) => {
                 session.set_tx_muted(self.duplex_mic_muted);
                 let st = session.status();
+                let tx_label = st
+                    .primary_tx()
+                    .map(|t| t.device_name.as_str())
+                    .unwrap_or("—");
+                let rx_label = st
+                    .primary_rx()
+                    .map(|r| r.device_name.as_str())
+                    .unwrap_or("—");
                 self.duplex_started_at = Some(Instant::now());
                 self.duplex_buffer_sparkline.clear();
                 self.duplex_tx_envelope_sparkline.clear();
-                self.last_status_msg = self.lang.status_duplex_active(
-                    self.duplex_role,
-                    peer_ip,
-                    &st.tx.device_name,
-                    &st.rx.device_name,
-                );
+                self.last_status_msg =
+                    self.lang
+                        .status_duplex_active(self.duplex_role, peer_ip, tx_label, rx_label);
                 self.active_duplex = Some(session);
             }
             Err(e) => {
@@ -1238,15 +1329,37 @@ impl RsRelayGuiApp {
 
         if let Some(ref dpx) = self.active_duplex {
             let st = dpx.status();
-            self.duplex_tx_vu_meter.update(st.tx.peak_level, true);
-            self.duplex_rx_vu_meter.update(st.rx.peak_level, true);
-            if st.rx.net.packets_received > 0 {
-                self.duplex_buffer_sparkline.push(st.rx.net.buffer_level_ms);
+            // Left Card (`duplex_rx_vu_meter` + `duplex_buffer_sparkline`) tracks the Media / Player Bus
+            // (falling back to `mic_rx` when Media Bus is Off so pure Mic RX still animates jitter chart)
+            let left_peak = st
+                .media_rx
+                .as_ref()
+                .map(|r| r.peak_level)
+                .or_else(|| st.media_tx.as_ref().map(|t| t.peak_level))
+                .unwrap_or(0.0);
+            let left_active = st.media_rx.is_some() || st.media_tx.is_some();
+            self.duplex_rx_vu_meter.update(left_peak, left_active);
+
+            if let Some(rx_for_jb) = st.media_rx.as_ref().or(st.mic_rx.as_ref()) {
+                if rx_for_jb.net.packets_received > 0 {
+                    self.duplex_buffer_sparkline.push(rx_for_jb.net.buffer_level_ms);
+                }
             }
-            let env_db = if self.duplex_mic_muted {
+
+            // Right Card (`duplex_tx_vu_meter` + `duplex_tx_envelope_sparkline`) tracks the Mic / VirtualMic Bus
+            let right_peak = st
+                .mic_tx
+                .as_ref()
+                .map(|t| t.peak_level)
+                .unwrap_or(0.0)
+                .max(st.mic_rx.as_ref().map(|r| r.peak_level).unwrap_or(0.0));
+            let right_active = st.mic_tx.is_some() || st.mic_rx.is_some();
+            self.duplex_tx_vu_meter.update(right_peak, right_active);
+
+            let env_db = if self.duplex_mic_muted && st.mic_rx.is_none() {
                 -58.0
             } else {
-                linear_to_dbfs(st.tx.peak_level).max(-56.0)
+                linear_to_dbfs(right_peak).max(-56.0)
             };
             self.duplex_tx_envelope_sparkline.push(env_db);
         } else {
@@ -2555,11 +2668,8 @@ impl RsRelayGuiApp {
         let rtt_str = st_opt
             .as_ref()
             .and_then(|st| {
-                if st.tx.control.connected {
-                    Some(format!("{:.2}", (st.tx.control.rtt_us as f64) / 1000.0))
-                } else {
-                    Some("0.42".to_string())
-                }
+                st.best_rtt_us()
+                    .map(|us| format!("{:.2}", (us as f64) / 1000.0))
             })
             .unwrap_or_else(|| {
                 if self.demo_mode {
@@ -2744,7 +2854,7 @@ impl RsRelayGuiApp {
                         Stroke::new(1.0_f32, palette::LINE()),
                     );
 
-                    // 3. Local Role (`本机角色`: 主机电脑 | 无线耳麦)
+                    // 3. Local Role (`本机角色`: 主机电脑 | 无线耳麦 | 双机互享)
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 5.0;
                         ui.label(
@@ -2755,8 +2865,17 @@ impl RsRelayGuiApp {
                         let roles = [
                             (DuplexRole::Host, t.role_host_short),
                             (DuplexRole::Headset, t.role_headset_short),
+                            (DuplexRole::Symmetric, t.role_symmetric_short),
                         ];
-                        segmented_control(ui, "c2_role_seg", &mut self.duplex_role, &roles);
+                        if segmented_control(ui, "c2_role_seg", &mut self.duplex_role, &roles) {
+                            let (m_mode, v_mode) = preset_bus_modes_for_role(self.duplex_role);
+                            self.duplex_media_mode = m_mode;
+                            self.duplex_mic_mode = v_mode;
+                            if self.active_duplex.is_some() {
+                                self.active_duplex = None;
+                                self.toggle_duplex();
+                            }
+                        }
                     });
 
                     // 4. Quality & Latency (`音质与延迟`)
@@ -2796,13 +2915,41 @@ impl RsRelayGuiApp {
 
         ui.add_space(16.0);
 
-        // Two-Column Cards (`收听` on Left, `麦克风` on Right)
+        // Two-Column Orthogonal Bus Cards:
+        //   LEFT CARD  = 播放器共享通道 (`:49153` · SystemLoopback ⇄ Headphones/Speaker)
+        //   RIGHT CARD = 麦克风共享通道 (`:49155` · Physical Mic ⇄ Virtual Mic)
         let target_buf_ms = self.selected_profile.default_target_buffer_ms();
+        let mut restart_duplex_requested = false;
+        let mut install_vmic_requested = false;
+
         ui.columns(2, |columns| {
             // =================================================================
-            // LEFT CARD: 收听 (Listen / Downlink RX)
+            // LEFT CARD: 播放器共享通道 (Media / Speaker Bus `:49153`)
             // =================================================================
-            theme::studio_card_frame(dpx_running, palette::ACCENT()).show(&mut columns[0], |ui| {
+            let media_mode = self.duplex_media_mode;
+            let media_active = dpx_running && media_mode != MediaBusMode::Off;
+            theme::studio_card_frame(media_active, palette::ACCENT()).show(&mut columns[0], |ui| {
+                let (media_title, media_base_sub, media_icon) = match media_mode {
+                    MediaBusMode::SendLoopback => (
+                        t.c2_host_tx_title,
+                        t.c2_host_tx_subtitle,
+                        IconKind::SpeakerDevice,
+                    ),
+                    MediaBusMode::ReceiveSpeaker => {
+                        (t.c2_listen_title, t.c2_listen_subtitle, IconKind::Headset)
+                    }
+                    MediaBusMode::Bidirectional => (
+                        t.c2_media_bi_title,
+                        t.c2_media_bi_subtitle,
+                        IconKind::Headset,
+                    ),
+                    MediaBusMode::Off => (
+                        t.c2_media_off_title,
+                        t.c2_media_off_subtitle,
+                        IconKind::SpeakerDevice,
+                    ),
+                };
+
                 // 1. Card Header (`.ch`)
                 egui::Frame::none()
                     .inner_margin(egui::Margin {
@@ -2814,41 +2961,41 @@ impl RsRelayGuiApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 12.0;
-                            draw_card_icon_tile(ui, IconKind::Headset);
+                            draw_card_icon_tile(ui, media_icon);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 1.0;
                                 ui.label(
-                                    RichText::new(t.c2_listen_title)
+                                    RichText::new(media_title)
                                         .size(15.0)
                                         .color(palette::TEXT_PRIMARY())
                                         .strong(),
                                 );
-                                let listen_sub = if let Some(src_addr) =
-                                    st_opt.as_ref().and_then(|st| st.rx.net.source_addr)
+                                let media_sub = if let Some(src_addr) = st_opt
+                                    .as_ref()
+                                    .and_then(|st| st.media_rx.as_ref())
+                                    .and_then(|rx| rx.net.source_addr)
                                 {
                                     let src_ip = src_addr.ip().to_string();
                                     let src_peer = self.resolve_peer_name(&src_ip);
-                                    format!("{} · {src_peer} ({src_addr})", t.c2_listen_subtitle)
+                                    format!("{media_base_sub} · {src_peer}")
                                 } else {
-                                    t.c2_listen_subtitle.to_string()
+                                    media_base_sub.to_string()
                                 };
                                 ui.label(
-                                    RichText::new(listen_sub)
+                                    RichText::new(media_sub)
                                         .size(11.5)
                                         .color(palette::TEXT_MUTED()),
                                 );
                             });
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                status_chip(
-                                    ui,
-                                    if dpx_running {
-                                        t.status_healthy
-                                    } else {
-                                        t.status_standby
-                                    },
-                                    None,
-                                    dpx_running,
-                                );
+                                let chip_txt = if !media_active {
+                                    t.status_standby
+                                } else if media_mode == MediaBusMode::SendLoopback {
+                                    t.status_sending
+                                } else {
+                                    t.status_healthy
+                                };
+                                status_chip(ui, chip_txt, None, media_active);
                             });
                         });
                     });
@@ -2862,17 +3009,27 @@ impl RsRelayGuiApp {
                         bottom: 18.0,
                     })
                     .show(ui, |ui| {
-                        draw_stereo_vu_meter(ui, &self.duplex_rx_vu_meter, dpx_running, false);
+                        draw_stereo_vu_meter(ui, &self.duplex_rx_vu_meter, media_active, false);
                     });
 
                 // 3. Stats Row (`.stats`)
-                let (buf_val, asrc_val, lost_val, repaired_unit) = if let Some(ref st) = st_opt {
-                    let repaired = st.rx.net.fec_recovered + st.rx.net.plc_frames;
+                let rx_stat_ref = st_opt
+                    .as_ref()
+                    .and_then(|st| st.media_rx.as_ref().or(st.mic_rx.as_ref()));
+                let (buf_val, asrc_val, lost_val, repaired_unit) = if let Some(rx_s) = rx_stat_ref {
+                    let repaired = rx_s.net.fec_recovered + rx_s.net.plc_frames;
                     (
-                        format!("{:.1}", st.rx.net.buffer_level_ms),
-                        format!("{:.5}", st.rx.net.resample_ratio),
-                        format!("{}", st.rx.net.packets_lost),
+                        format!("{:.1}", rx_s.net.buffer_level_ms),
+                        format!("{:.5}", rx_s.net.resample_ratio),
+                        format!("{}", rx_s.net.packets_lost),
                         format!("/ {repaired}"),
+                    )
+                } else if let Some(tx_s) = st_opt.as_ref().and_then(|st| st.media_tx.as_ref()) {
+                    (
+                        "—".to_string(),
+                        "1.00000".to_string(),
+                        format!("{}", tx_s.net.packets_sent),
+                        t.unit_packets.to_string(),
                     )
                 } else if self.demo_mode {
                     (
@@ -2898,7 +3055,7 @@ impl RsRelayGuiApp {
                         (t.stat_clock_comp, &asrc_val, "×"),
                         (t.stat_loss_repaired, &lost_val, &repaired_unit),
                     ],
-                    dpx_running,
+                    media_active,
                 );
 
                 // 4. Jitter Buffer Sparkline Chart (`.chart`)
@@ -2914,30 +3071,81 @@ impl RsRelayGuiApp {
                     palette::ACCENT(),
                 );
 
-                // 5. Settings List (`.set`, 3 rows)
-                let mut rx_dev_opts = vec![(None, t.device_default_speaker.to_string())];
-                for dev in &self.devices {
-                    if dev.is_output {
-                        rx_dev_opts.push((Some(dev.name.clone()), dev.name.clone()));
-                    }
-                }
-                let current_rx = self
-                    .selected_rx_device
-                    .clone()
-                    .unwrap_or_else(|| t.device_default_speaker.to_string());
-                settings_row(ui, t.label_output_device, true, |ui| {
-                    if quiet_select_pill(
+                // 5. Settings List (`.set`)
+                settings_row(ui, t.label_bus_direction, true, |ui| {
+                    let media_modes = [
+                        (MediaBusMode::Off, t.bus_off),
+                        (MediaBusMode::SendLoopback, t.media_mode_send),
+                        (MediaBusMode::ReceiveSpeaker, t.media_mode_recv),
+                        (MediaBusMode::Bidirectional, t.media_mode_bi),
+                    ];
+                    if segmented_control(
                         ui,
-                        "c2_rx_device_combo",
-                        &mut self.selected_rx_device,
-                        &current_rx,
-                        &rx_dev_opts,
+                        "c2_media_mode_seg",
+                        &mut self.duplex_media_mode,
+                        &media_modes,
                     ) && self.active_duplex.is_some()
                     {
-                        self.active_duplex = None;
-                        self.toggle_duplex();
+                        restart_duplex_requested = true;
                     }
                 });
+
+                if self.duplex_media_mode.sends() {
+                    let default_lpbk = t.c2_host_tx_default_loopback.to_string();
+                    let mut lpbk_opts = vec![(None, default_lpbk.clone())];
+                    for dev in &self.devices {
+                        let eligible = if cfg!(target_os = "windows") {
+                            dev.is_output && !is_virtual_mic_output_sink_name(&dev.name)
+                        } else {
+                            dev.is_input && !is_virtual_mic_input_device_name(&dev.name)
+                        };
+                        if eligible {
+                            lpbk_opts.push((Some(dev.name.clone()), dev.name.clone()));
+                        }
+                    }
+                    let cur_lpbk = self
+                        .duplex_media_tx_device
+                        .clone()
+                        .unwrap_or(default_lpbk);
+                    settings_row(ui, t.c2_host_tx_device_label, true, |ui| {
+                        if quiet_select_pill(
+                            ui,
+                            "c2_media_tx_dev_combo",
+                            &mut self.duplex_media_tx_device,
+                            &cur_lpbk,
+                            &lpbk_opts,
+                        ) && self.active_duplex.is_some()
+                        {
+                            restart_duplex_requested = true;
+                        }
+                    });
+                }
+
+                if self.duplex_media_mode.receives() {
+                    let default_spk = t.device_default_speaker.to_string();
+                    let mut spk_opts = vec![(None, default_spk.clone())];
+                    for dev in &self.devices {
+                        if dev.is_output && !is_virtual_mic_output_sink_name(&dev.name) {
+                            spk_opts.push((Some(dev.name.clone()), dev.name.clone()));
+                        }
+                    }
+                    let cur_spk = self
+                        .duplex_media_rx_device
+                        .clone()
+                        .unwrap_or(default_spk);
+                    settings_row(ui, t.label_output_device, true, |ui| {
+                        if quiet_select_pill(
+                            ui,
+                            "c2_media_rx_dev_combo",
+                            &mut self.duplex_media_rx_device,
+                            &cur_spk,
+                            &spk_opts,
+                        ) && self.active_duplex.is_some()
+                        {
+                            restart_duplex_requested = true;
+                        }
+                    });
+                }
 
                 let gain_fmt = format_gain_db(self.volume);
                 settings_row(ui, t.label_output_gain, true, |ui| {
@@ -2947,6 +3155,7 @@ impl RsRelayGuiApp {
                         }
                         if let Some(ref dpx) = self.active_duplex {
                             dpx.set_rx_volume(self.volume);
+                            dpx.set_mic_rx_gain(self.volume);
                         }
                     }
                 });
@@ -2956,14 +3165,31 @@ impl RsRelayGuiApp {
                         (ChannelLayout::Stereo, t.channel_stereo),
                         (ChannelLayout::Mono, t.channel_mono),
                     ];
-                    segmented_control(ui, "c2_channels_seg", &mut self.duplex_rx_channels, &ch_opts);
+                    if segmented_control(
+                        ui,
+                        "c2_channels_seg",
+                        &mut self.duplex_rx_channels,
+                        &ch_opts,
+                    ) && self.active_duplex.is_some()
+                    {
+                        restart_duplex_requested = true;
+                    }
                 });
             });
 
             // =================================================================
-            // RIGHT CARD: 麦克风 (Microphone / Uplink TX)
+            // RIGHT CARD: 麦克风共享通道 (Mic ⇄ Virtual Mic Bus `:49155`)
             // =================================================================
-            theme::studio_card_frame(dpx_running, palette::ACCENT()).show(&mut columns[1], |ui| {
+            let mic_mode = self.duplex_mic_mode;
+            let mic_active = dpx_running && mic_mode != MicBusMode::Off;
+            theme::studio_card_frame(mic_active, palette::ACCENT()).show(&mut columns[1], |ui| {
+                let (mic_title, mic_sub) = match mic_mode {
+                    MicBusMode::SendMic => (t.c2_mic_title, t.c2_mic_subtitle),
+                    MicBusMode::ReceiveVirtualMic => (t.c2_host_rx_title, t.c2_host_rx_subtitle),
+                    MicBusMode::Bidirectional => (t.c2_mic_bi_title, t.c2_mic_bi_subtitle),
+                    MicBusMode::Off => (t.c2_mic_off_title, t.c2_mic_off_subtitle),
+                };
+
                 // 1. Card Header (`.ch`)
                 egui::Frame::none()
                     .inner_margin(egui::Margin {
@@ -2979,22 +3205,35 @@ impl RsRelayGuiApp {
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 1.0;
                                 ui.label(
-                                    RichText::new(t.c2_mic_title)
+                                    RichText::new(mic_title)
                                         .size(15.0)
                                         .color(palette::TEXT_PRIMARY())
                                         .strong(),
                                 );
+                                let sub_str = if let Some(src_addr) = st_opt
+                                    .as_ref()
+                                    .and_then(|st| st.mic_rx.as_ref())
+                                    .and_then(|rx| rx.net.source_addr)
+                                {
+                                    let src_ip = src_addr.ip().to_string();
+                                    let src_peer = self.resolve_peer_name(&src_ip);
+                                    format!("{mic_sub} · {src_peer}")
+                                } else {
+                                    mic_sub.to_string()
+                                };
                                 ui.label(
-                                    RichText::new(t.c2_mic_subtitle)
+                                    RichText::new(sub_str)
                                         .size(11.5)
                                         .color(palette::TEXT_MUTED()),
                                 );
                             });
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                let chip_label = if !dpx_running {
+                                let chip_label = if !mic_active {
                                     t.status_standby
-                                } else if self.duplex_mic_muted {
+                                } else if mic_mode.sends() && self.duplex_mic_muted {
                                     t.status_muted
+                                } else if mic_mode == MicBusMode::ReceiveVirtualMic {
+                                    t.status_receiving
                                 } else {
                                     t.status_speaking
                                 };
@@ -3002,7 +3241,7 @@ impl RsRelayGuiApp {
                                     ui,
                                     chip_label,
                                     None,
-                                    dpx_running && !self.duplex_mic_muted,
+                                    mic_active && !(mic_mode == MicBusMode::SendMic && self.duplex_mic_muted),
                                 );
                             });
                         });
@@ -3020,8 +3259,8 @@ impl RsRelayGuiApp {
                         draw_mono_gate_vu_meter(
                             ui,
                             &self.duplex_tx_vu_meter,
-                            dpx_running,
-                            self.duplex_mic_muted,
+                            mic_active,
+                            mic_mode == MicBusMode::SendMic && self.duplex_mic_muted,
                             self.duplex_gate_db,
                             t.c2_gate_marker_prefix,
                         );
@@ -3029,16 +3268,25 @@ impl RsRelayGuiApp {
 
                 // 3. Stats Row (`.stats`)
                 let (lvl_val, gated_val, sent_val) = if let Some(ref st) = st_opt {
-                    let db_str = if self.duplex_mic_muted || self.duplex_tx_vu_meter.smoothed_db <= -59.5 {
+                    let db_str = if (mic_mode == MicBusMode::SendMic && self.duplex_mic_muted)
+                        || self.duplex_tx_vu_meter.smoothed_db <= -59.5
+                    {
                         "-∞".to_string()
                     } else {
                         format!("{:.1}", self.duplex_tx_vu_meter.smoothed_db)
                     };
-                    (
-                        db_str,
-                        format_with_commas(st.tx.net.gated_dtx_frames),
-                        format_with_commas(st.tx.net.packets_sent),
-                    )
+                    let gated = st
+                        .mic_tx
+                        .as_ref()
+                        .map(|tx| tx.net.gated_dtx_frames)
+                        .unwrap_or(0);
+                    let pkts = st
+                        .mic_tx
+                        .as_ref()
+                        .map(|tx| tx.net.packets_sent)
+                        .or_else(|| st.mic_rx.as_ref().map(|rx| rx.net.packets_received))
+                        .unwrap_or(0);
+                    (db_str, format_with_commas(gated), format_with_commas(pkts))
                 } else if self.demo_mode {
                     (
                         "-14.2".to_string(),
@@ -3056,14 +3304,14 @@ impl RsRelayGuiApp {
                         (t.stat_gated_frames, &gated_val, ""),
                         (t.stat_packets_sent, &sent_val, t.unit_packets),
                     ],
-                    dpx_running,
+                    mic_active,
                 );
 
                 // 4. Voice Envelope Sparkline Chart (`.chart`)
                 draw_sparkline(
                     ui,
                     t.c2_voice_chart_title,
-                    "Opus 128 kbps",
+                    "Opus 64 kbps",
                     t.chart_tx_idle_hint,
                     &self.duplex_tx_envelope_sparkline,
                     -60.0,
@@ -3072,53 +3320,201 @@ impl RsRelayGuiApp {
                     palette::ACCENT(),
                 );
 
-                // 5. Settings List (`.set`, 3 rows)
-                let mut tx_dev_opts = vec![(None, t.device_system_default.to_string())];
-                for dev in &self.devices {
-                    let eligible = dev.is_input
-                        || (cfg!(target_os = "windows")
-                            && self.duplex_role == DuplexRole::Host
-                            && dev.is_output);
-                    if eligible {
-                        tx_dev_opts.push((Some(dev.name.clone()), dev.name.clone()));
-                    }
-                }
-                let current_tx = self
-                    .selected_tx_device
+                // 4.5 Smart Virtual Mic Health & One-Click Driver Banner (when receiving into Virtual Mic)
+                let auto_vmic = select_default_virtual_mic_output_device();
+                let effective_vmic = self
+                    .duplex_mic_rx_device
                     .clone()
-                    .unwrap_or_else(|| t.device_system_default.to_string());
-                settings_row(ui, t.label_microphone, true, |ui| {
-                    if quiet_select_pill(
+                    .or_else(|| auto_vmic.clone());
+
+                if self.duplex_mic_mode.receives() {
+                    let is_installing = self.installing_vmic_driver.load(Ordering::Relaxed);
+                    egui::Frame::none()
+                        .fill(palette::BG_RAISED())
+                        .inner_margin(egui::Margin::symmetric(20.0, 10.0))
+                        .show(ui, |ui| {
+                            if let Some(ref sink_name) = effective_vmic {
+                                let app_mic_name = Self::app_recording_mic_name_for_sink(sink_name);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "✓ {}{}",
+                                            t.c2_vmic_ready_prefix, app_mic_name
+                                        ))
+                                        .size(11.5)
+                                        .color(palette::ACCENT()),
+                                    );
+                                });
+                                if cfg!(target_os = "windows")
+                                    && self.audiorelay_conflict_cached
+                                    && sink_name.to_ascii_lowercase().contains("audiorelay")
+                                {
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        RichText::new(t.c2_vmic_audiorelay_hint)
+                                            .size(11.0)
+                                            .color(palette::TEXT_MUTED()),
+                                    );
+                                }
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(t.c2_vmic_missing_warn)
+                                            .size(11.5)
+                                            .color(palette::STATUS_WARN()),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            let btn_txt = if is_installing {
+                                                t.btn_installing_vmic
+                                            } else if cfg!(target_os = "macos") {
+                                                t.btn_install_macos_vmic
+                                            } else {
+                                                t.btn_install_win_vbcable
+                                            };
+                                            if ui
+                                                .add_enabled(
+                                                    !is_installing,
+                                                    egui::Button::new(
+                                                        RichText::new(btn_txt)
+                                                            .size(11.5)
+                                                            .color(palette::TEXT_PRIMARY()),
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                install_vmic_requested = true;
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                    draw_hairline(ui);
+                }
+
+                // 5. Settings List (`.set`)
+                settings_row(ui, t.label_bus_direction, true, |ui| {
+                    let mic_modes = [
+                        (MicBusMode::Off, t.bus_off),
+                        (MicBusMode::SendMic, t.mic_mode_send),
+                        (MicBusMode::ReceiveVirtualMic, t.mic_mode_recv),
+                        (MicBusMode::Bidirectional, t.mic_mode_bi),
+                    ];
+                    if segmented_control(
                         ui,
-                        "c2_tx_device_combo",
-                        &mut self.selected_tx_device,
-                        &current_tx,
-                        &tx_dev_opts,
+                        "c2_mic_mode_seg",
+                        &mut self.duplex_mic_mode,
+                        &mic_modes,
                     ) && self.active_duplex.is_some()
                     {
-                        self.active_duplex = None;
-                        self.toggle_duplex();
+                        restart_duplex_requested = true;
                     }
                 });
 
-                let gate_fmt = format!("{:.0} dB", self.duplex_gate_db);
-                settings_row(ui, t.label_noise_gate_threshold, true, |ui| {
-                    if quiet_slider_f32(ui, &mut self.duplex_gate_db, -65.0..=-20.0, &gate_fmt) {
-                        if let Some(ref dpx) = self.active_duplex {
-                            dpx.set_tx_noise_gate_db(Some(self.duplex_gate_db));
+                if self.duplex_mic_mode.sends() {
+                    let default_mic = t.device_system_default.to_string();
+                    let mut mic_opts = vec![(None, default_mic.clone())];
+                    for dev in &self.devices {
+                        if dev.is_input && !is_virtual_mic_input_device_name(&dev.name) {
+                            mic_opts.push((Some(dev.name.clone()), dev.name.clone()));
                         }
                     }
-                });
+                    let cur_mic = self.duplex_mic_tx_device.clone().unwrap_or(default_mic);
+                    settings_row(ui, t.label_microphone, true, |ui| {
+                        if quiet_select_pill(
+                            ui,
+                            "c2_mic_tx_dev_combo",
+                            &mut self.duplex_mic_tx_device,
+                            &cur_mic,
+                            &mic_opts,
+                        ) && self.active_duplex.is_some()
+                        {
+                            restart_duplex_requested = true;
+                        }
+                    });
+                }
 
-                settings_row(ui, t.label_mic_mute, false, |ui| {
-                    if pill_toggle(ui, &mut self.duplex_mic_muted) {
-                        if let Some(ref dpx) = self.active_duplex {
-                            dpx.set_tx_muted(self.duplex_mic_muted);
+                if self.duplex_mic_mode.receives() {
+                    let default_vmic_lbl = if let Some(ref vname) = auto_vmic {
+                        format!("{} ({vname})", t.c2_host_rx_auto_vmic)
+                    } else {
+                        t.c2_vmic_guard_option.to_string()
+                    };
+                    let mut vmic_opts = vec![(None, default_vmic_lbl.clone())];
+                    for dev in &self.devices {
+                        if dev.is_output && is_virtual_mic_output_sink_name(&dev.name) {
+                            vmic_opts.push((Some(dev.name.clone()), dev.name.clone()));
                         }
                     }
-                });
+                    let cur_vmic = self
+                        .duplex_mic_rx_device
+                        .clone()
+                        .unwrap_or(default_vmic_lbl);
+                    settings_row(
+                        ui,
+                        t.c2_host_rx_device_label,
+                        self.duplex_mic_mode.sends(),
+                        |ui| {
+                            if quiet_select_pill(
+                                ui,
+                                "c2_mic_rx_dev_combo",
+                                &mut self.duplex_mic_rx_device,
+                                &cur_vmic,
+                                &vmic_opts,
+                            ) && self.active_duplex.is_some()
+                            {
+                                restart_duplex_requested = true;
+                            }
+                        },
+                    );
+                }
+
+                if self.duplex_mic_mode.sends() {
+                    let gate_fmt = format!("{:.0} dB", self.duplex_gate_db);
+                    settings_row(ui, t.label_noise_gate_threshold, true, |ui| {
+                        if quiet_slider_f32(ui, &mut self.duplex_gate_db, -65.0..=-20.0, &gate_fmt)
+                        {
+                            if let Some(ref dpx) = self.active_duplex {
+                                dpx.set_tx_noise_gate_db(Some(self.duplex_gate_db));
+                            }
+                        }
+                    });
+
+                    settings_row(ui, t.label_mic_mute, false, |ui| {
+                        if pill_toggle(ui, &mut self.duplex_mic_muted) {
+                            if let Some(ref dpx) = self.active_duplex {
+                                dpx.set_tx_muted(self.duplex_mic_muted);
+                            }
+                        }
+                    });
+                }
             });
         });
+
+        if install_vmic_requested {
+            self.trigger_install_virtual_mic_driver();
+        }
+        if restart_duplex_requested && self.active_duplex.is_some() {
+            self.active_duplex = None;
+            self.toggle_duplex();
+        }
+    }
+
+    /// Map an internal Virtual Mic output sink name to the corresponding OS recording device name
+    /// that applications (Zoom, Chrome, WeChat, Discord, OBS) should select as their Microphone.
+    fn app_recording_mic_name_for_sink(sink_name: &str) -> String {
+        let lower = sink_name.to_ascii_lowercase();
+        if lower.contains("rsrelay virtual mic") {
+            MACOS_RSRELAY_VMIC_INPUT_NAME.to_string()
+        } else if lower.contains("cable input") {
+            sink_name.replace("CABLE Input", "CABLE Output")
+        } else if lower.contains("voicemeeter input") {
+            "VoiceMeeter Out B1".to_string()
+        } else {
+            sink_name.to_string()
+        }
     }
 
     // =========================================================================
@@ -3145,6 +3541,7 @@ impl RsRelayGuiApp {
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(Align::Max), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
                 if ui
                     .button(
                         RichText::new(t.btn_refresh_ports)
@@ -3155,6 +3552,32 @@ impl RsRelayGuiApp {
                     .clicked()
                 {
                     self.refresh_audio_devices(true);
+                }
+                if (cfg!(target_os = "macos") && !is_macos_rsrelay_driver_installed())
+                    || (cfg!(target_os = "windows")
+                        && select_default_virtual_mic_output_device().is_none())
+                {
+                    let installing = self.installing_vmic_driver.load(Ordering::Relaxed);
+                    let drv_btn = if installing {
+                        t.btn_installing_vmic
+                    } else if cfg!(target_os = "macos") {
+                        t.btn_install_macos_vmic
+                    } else {
+                        t.btn_install_win_vbcable
+                    };
+                    if ui
+                        .add_enabled(
+                            !installing,
+                            egui::Button::new(
+                                RichText::new(drv_btn)
+                                    .size(12.5)
+                                    .color(palette::ACCENT()),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.trigger_install_virtual_mic_driver();
+                    }
                 }
             });
         });
@@ -3744,9 +4167,15 @@ mod tests {
                     WorkspaceTab::HardwareMatrix,
                 ] {
                     app.active_tab = tab;
-                    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                        app.render_ui(ctx);
-                    });
+                    for role in [DuplexRole::Host, DuplexRole::Headset, DuplexRole::Symmetric] {
+                        app.duplex_role = role;
+                        let (m, v) = preset_bus_modes_for_role(role);
+                        app.duplex_media_mode = m;
+                        app.duplex_mic_mode = v;
+                        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                            app.render_ui(ctx);
+                        });
+                    }
                 }
             }
         }

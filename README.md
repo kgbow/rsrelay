@@ -64,12 +64,18 @@ cargo run --release -p rsrelay-cli -- self-test --duration-secs 5 --profile bala
 cargo run --release -p rsrelay-cli -- self-test --duplex --duration-secs 5 --profile balanced
 ```
 
-### 4. Full-Duplex Wireless Headset Mode (System Audio Downlink + Mic Uplink)
+### 4. Cross-Machine Speaker + Virtual Microphone Sharing (Windows ⇄ macOS)
 ```bash
-# On Main PC (Host): stream system audio to 192.168.1.105:49153 and receive remote Mic on :49155
+# Optional one-time Virtual Mic driver install (`rsrelayVirtualMic.driver` on macOS, `VB-CABLE` via winget on Windows):
+cargo run --release -p rsrelay-cli -- install-driver
+
+# Symmetric Dual-Desktop Sharing (share BOTH Player audio :49153 and Microphones :49155 between Win & Mac):
+cargo run --release -p rsrelay-cli -- duplex --role symmetric --peer 192.168.1.105
+
+# Wireless Headset Mode — On Main PC (Host): stream system audio to :49153 & inject remote Mic into Virtual Mic (:49155)
 cargo run --release -p rsrelay-cli -- duplex --role host --peer 192.168.1.105
 
-# On Secondary Device (Headset): receive Host audio on :49153 and send Mic back to 192.168.1.100:49155 (with -45dB Noise Gate)
+# Wireless Headset Mode — On Headset Device: play Host audio (:49153) & send local Mic (:49155)
 cargo run --release -p rsrelay-cli -- duplex --role headset --peer 192.168.1.100 --gate-db -45.0
 ```
 

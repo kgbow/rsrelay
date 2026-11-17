@@ -276,10 +276,13 @@ fn select_capture_device(
                     }
                 }
 
-                for keyword in ["blackhole", "loopback", "soundflower", "virtual", "monitor"] {
+                for keyword in ["blackhole", "loopback", "soundflower", "monitor"] {
                     if let Some(dev) = host.input_devices()?.find(|d| {
                         d.name()
-                            .map(|n| n.to_lowercase().contains(keyword))
+                            .map(|n| {
+                                let lower = n.to_lowercase();
+                                lower.contains(keyword) && !lower.contains("rsrelay virtual mic")
+                            })
                             .unwrap_or(false)
                     }) {
                         let cfg = dev.default_input_config()?;
@@ -307,9 +310,35 @@ fn select_capture_device(
                     })
                     .ok_or_else(|| AudioError::DeviceNotFound(filter.to_string()))?
             } else {
-                host.default_input_device().ok_or_else(|| {
-                    AudioError::DeviceNotFound("default microphone input".to_string())
-                })?
+                // When auto-selecting a physical microphone, avoid virtual microphone loopback
+                // endpoints (`Virtual Mic`, `CABLE Output`, `rsrelay Virtual Mic`, `BlackHole`)
+                // if the user previously set a virtual mic as OS Default Input, preventing loops.
+                let default_dev = host.default_input_device();
+                let default_is_virtual = default_dev
+                    .as_ref()
+                    .and_then(|d| d.name().ok())
+                    .map(|n| crate::device::is_virtual_mic_input_device_name(&n))
+                    .unwrap_or(false);
+
+                if !default_is_virtual {
+                    if let Some(d) = default_dev {
+                        d
+                    } else {
+                        return Err(AudioError::DeviceNotFound(
+                            "default microphone input".to_string(),
+                        ));
+                    }
+                } else if let Some(phys) = host.input_devices()?.find(|d| {
+                    d.name()
+                        .map(|n| !crate::device::is_virtual_mic_input_device_name(&n))
+                        .unwrap_or(false)
+                }) {
+                    phys
+                } else {
+                    default_dev.ok_or_else(|| {
+                        AudioError::DeviceNotFound("default microphone input".to_string())
+                    })?
+                }
             };
             let cfg = dev.default_input_config()?;
             Ok((dev, cfg, false))

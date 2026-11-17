@@ -1,6 +1,8 @@
 //! macOS `ScreenCaptureKit` native driverless system audio capture & planar-to-interleaved converter.
 
+#[cfg(target_os = "macos")]
 use std::ffi::c_void;
+#[cfg(target_os = "macos")]
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,

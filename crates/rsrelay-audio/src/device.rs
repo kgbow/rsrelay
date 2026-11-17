@@ -2,6 +2,8 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::windows_virtual_mic::{is_virtual_mic_driver_available, VIRTUAL_MIC_OUTPUT_DEVICE_NAME};
+
 #[derive(Debug, Error)]
 pub enum AudioError {
     #[error("no suitable audio device found: {0}")]
@@ -39,6 +41,46 @@ pub struct AudioDeviceInfo {
     pub is_default_output: bool,
     pub default_sample_rate: Option<u32>,
     pub default_channels: Option<u16>,
+}
+
+/// Check whether an input device name belongs to a virtual microphone / loopback cable
+/// rather than a physical hardware microphone.
+///
+/// Used when auto-selecting a physical microphone (`CaptureSource::Microphone` with `None` filter)
+/// so `rsrelay` does not accidentally capture from `Virtual Mic` / `CABLE Output` / `rsrelay Virtual Mic`
+/// when the user has set the virtual mic as their OS default recording device.
+pub fn is_virtual_mic_input_device_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "virtual mic",
+        "rsrelay virtual mic",
+        "cable output",
+        "vb-audio",
+        "blackhole",
+        "soundflower",
+        "steam streaming microphone",
+        "voicemeeter out",
+        "virtual audio",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+}
+
+/// Check whether an output device name is a virtual microphone bridge sink rather than a physical speaker.
+pub fn is_virtual_mic_output_sink_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "rsrelay virtual mic sink",
+        "virtual mic",
+        "cable input",
+        "vb-audio",
+        "blackhole",
+        "soundflower",
+        "voicemeeter input",
+        "echo-free guard",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
 }
 
 /// Enumerate all available input and output audio devices on the current host.
@@ -81,5 +123,70 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, AudioError> {
         }
     }
 
+    // When the Windows Virtual Mic kernel driver (`\\.\AudioRelayVirtualMicDeviceLink`) is active,
+    // expose it as an output destination so RX streams and Duplex Mic RX can write directly
+    // into the virtual microphone capture endpoint without playing out to speakers.
+    if is_virtual_mic_driver_available()
+        && !infos.iter().any(|d| {
+            d.is_output
+                && d.name.to_ascii_lowercase().contains("virtual mic")
+                && !d.name.to_ascii_lowercase().contains("rsrelay virtual mic")
+        })
+    {
+        infos.push(AudioDeviceInfo {
+            name: VIRTUAL_MIC_OUTPUT_DEVICE_NAME.to_string(),
+            is_input: false,
+            is_output: true,
+            is_default_input: false,
+            is_default_output: false,
+            default_sample_rate: Some(48_000),
+            default_channels: Some(2),
+        });
+    }
+
     Ok(infos)
+}
+
+/// Automatically select the preferred virtual microphone output sink across Windows and macOS.
+///
+/// Priority order:
+/// 1. `rsrelay Virtual Mic Sink` (dedicated macOS CoreAudio HAL split bridge — hardware-clocked, zero speaker hijack)
+/// 2. `CABLE Input` / `VB-Audio` (hardware-clocked WASAPI/CoreAudio virtual cable — zero `audiorelay-backend` contention)
+/// 3. `Virtual Mic (Virtual Mic for AudioRelay)` (high-resolution Windows kernel bridge)
+/// 4. `BlackHole` / `Soundflower` / `VoiceMeeter Input` / `Virtual Audio`
+pub fn select_default_virtual_mic_output_device() -> Option<String> {
+    let devices = list_audio_devices().ok()?;
+
+    // 1. Dedicated rsrelay HAL sink or hardware-clocked VB-CABLE first
+    for keyword in ["rsrelay virtual mic sink", "cable input", "vb-audio"] {
+        if let Some(dev) = devices
+            .iter()
+            .find(|d| d.is_output && d.name.to_ascii_lowercase().contains(keyword))
+        {
+            return Some(dev.name.clone());
+        }
+    }
+
+    // 2. Native Windows Virtual Mic kernel bridge
+    if is_virtual_mic_driver_available() {
+        return Some(VIRTUAL_MIC_OUTPUT_DEVICE_NAME.to_string());
+    }
+
+    // 3. Other virtual loopback cables (BlackHole, Soundflower, VoiceMeeter, Virtual Audio Driver)
+    for keyword in [
+        "virtual mic",
+        "blackhole",
+        "soundflower",
+        "voicemeeter input",
+        "virtual audio",
+    ] {
+        if let Some(dev) = devices
+            .iter()
+            .find(|d| d.is_output && d.name.to_ascii_lowercase().contains(keyword))
+        {
+            return Some(dev.name.clone());
+        }
+    }
+
+    None
 }
