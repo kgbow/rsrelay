@@ -97,3 +97,23 @@ cargo run --release -p rsrelay-cli -- send --target 192.168.1.100:49153 --source
 # Stream uncompressed lossless 16-bit 48kHz Stereo PCM over 5GHz Wi-Fi / Ethernet
 cargo run --release -p rsrelay-cli -- send --target 192.168.1.100:49153 --source loopback --profile lossless
 ```
+
+---
+
+## Building Desktop Installers (Windows & macOS)
+
+Automated multi-platform desktop builds (`rsrelay-gui`) are configured in [`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+- **Trigger a GitHub Release**: Push a version tag (`git tag v0.1.0 && git push origin v0.1.0`) to automatically build and publish:
+  - `rsrelay-v<version>-macos-universal.dmg` (Apple Silicon + Intel Universal `.app`)
+  - `rsrelay-v<version>-windows-x64-setup.exe` (Inno Setup wizard with optional Windows Firewall LAN rule & `--tray` login autostart)
+  - `rsrelay-v<version>-windows-x64-portable.zip` (Standalone `rsrelay-gui.exe`)
+  - `SHA256SUMS.txt`
+- **Local Packaging**:
+  ```bash
+  # macOS (host arch DMG, or add --universal for arm64 + x86_64):
+  ./packaging/macos/package_dmg.sh
+
+  # Windows PowerShell (requires Inno Setup 6):
+  pwsh -File packaging/windows/package_windows.ps1
+  ```

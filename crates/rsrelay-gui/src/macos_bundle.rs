@@ -74,13 +74,15 @@ pub fn install_macos_app_bundle() -> anyhow::Result<PathBuf> {
         fs::set_permissions(&dest_bin, perms)?;
     }
 
-    // 2. Write Contents/Resources/AppIcon.icns (128x128 PNG wrapped in ICNS `ic07`)
-    let icns_bytes = build_app_icon_icns_128();
+    // 2. Write Contents/Resources/AppIcon.icns (multi-resolution Retina ICNS)
+    let icns_bytes: &[u8] = include_bytes!("../../../packaging/assets/AppIcon.icns");
     let icns_path = resources_dir.join("AppIcon.icns");
     fs::write(&icns_path, icns_bytes)?;
 
     // 3. Write Contents/Info.plist
-    let info_plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+    let app_version = env!("CARGO_PKG_VERSION");
+    let info_plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -101,9 +103,9 @@ pub fn install_macos_app_bundle() -> anyhow::Result<PathBuf> {
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>{app_version}</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>{app_version}</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
@@ -116,7 +118,8 @@ pub fn install_macos_app_bundle() -> anyhow::Result<PathBuf> {
     <string>rsrelay uses ScreenCaptureKit to capture system desktop audio without virtual audio drivers.</string>
 </dict>
 </plist>
-"#;
+"#
+    );
     fs::write(contents_dir.join("Info.plist"), info_plist)?;
 
     // 4. Ad-hoc sign the .app bundle so macOS TCC persistently tracks its identity

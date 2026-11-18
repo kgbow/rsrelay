@@ -1,7 +1,11 @@
 # Rust / Cargo
 /target/
+/dist/
 **/*.rs.bk
 Cargo.lock
+
+# Packaging temp files
+packaging/windows/ChineseSimplified.isl
 
 # macOS
 .DS_Store
