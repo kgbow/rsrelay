@@ -22,11 +22,9 @@ use rsrelay_core::{
     is_macos_rsrelay_driver_installed, is_virtual_mic_input_device_name,
     is_virtual_mic_output_sink_name, launch_windows_vbcable_install, list_audio_devices,
     preset_bus_modes_for_role, request_system_loopback_permission,
-    select_default_virtual_mic_output_device, AudioDeviceInfo, CaptureSource, ChannelLayout,
-    DiscoveredPeer, DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig,
-    LatencyProfile, MediaBusMode, MicBusMode, ReceiverSession, ReceiverSessionConfig,
-    SenderSession, SenderSessionConfig, DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT,
-    MACOS_RSRELAY_VMIC_INPUT_NAME,
+    select_default_virtual_mic_output_device, AudioDeviceInfo, ChannelLayout, DiscoveredPeer,
+    DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig, LatencyProfile, MediaBusMode,
+    MicBusMode, DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT, MACOS_RSRELAY_VMIC_INPUT_NAME,
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
@@ -36,23 +34,68 @@ use tray_icon::{
 use crate::i18n::Language;
 use crate::theme::{metrics, palette, ThemeMode};
 use crate::widgets::{
-    draw_card_icon_tile, draw_hairline, draw_mono_gate_vu_meter, draw_sparkline, draw_stats_row_3,
-    draw_stereo_vu_meter, draw_tx_waveform_chart, draw_vector_icon, format_gain_db,
-    format_with_commas, ghost_stop_all_button, header_action_button, latency_profile_selector,
-    linear_to_dbfs, pill_toggle, quiet_mono_combo_pill, quiet_mono_input_pill, quiet_select_pill,
-    quiet_slider_f32, quiet_slider_u16, quiet_source_addr_pill, segmented_control, settings_row,
-    status_chip, IconKind, SparklineBuffer, VuMeterState,
+    compact_stereo_vu_meter, dbfs_to_norm, draw_card_icon_tile, draw_conduit_lane, draw_hairline,
+    draw_interactive_gate_vu_meter, draw_mute_icon_button, draw_signal_health_pill, draw_sparkline,
+    draw_stats_row_3, draw_vector_icon, drawer_toggle_button, flexible_select_pill,
+    format_with_commas, header_action_button, header_status_chip, inline_volume_slider,
+    latency_profile_selector, linear_to_dbfs, paint_text_vcenter, pill_toggle,
+    quiet_mono_input_pill, quiet_slider_u16, scene_preset_card, segmented_control, settings_row,
+    status_chip, ConduitDirection, IconKind, SparklineBuffer, VuMeterState,
 };
 
-/// Top-level workspace navigation modes.
+/// Top-level workspace navigation modes (streamlined to 2 unified workspaces).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTab {
-    /// Frame C: Side-by-side Transmit (`发送`) and Receive (`接收`) cards.
-    DualConsole,
-    /// Frame C2: Full-Duplex Wireless Headset (`双工耳麦`) with top connection bar and Listen/Mic cards.
-    FullDuplex,
+    /// Unified Visual Dual-Node Audio & Microphone Link (`音频连接`).
+    AudioLink,
     /// Local CoreAudio / WASAPI hardware device inspector (`音频设备`).
     HardwareMatrix,
+}
+
+/// Intuitive 1-click scene presets covering both full-duplex and 1-way audio/mic scenarios.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScenePreset {
+    /// Listen to peer's desktop audio + send local physical mic (`当无线耳麦`).
+    Headset,
+    /// Send local desktop audio + receive peer's mic into Virtual Mic (`作为主机电脑`).
+    Host,
+    /// Only listen to peer's desktop audio, mic off (`仅当无线音箱`).
+    SpeakerOnly,
+    /// Only send local physical mic to peer's Virtual Mic, speaker off (`仅当无线麦克风`).
+    MicOnly,
+}
+
+impl ScenePreset {
+    pub const fn bus_modes(self) -> (DuplexRole, MediaBusMode, MicBusMode) {
+        match self {
+            Self::Headset => (
+                DuplexRole::Headset,
+                MediaBusMode::ReceiveSpeaker,
+                MicBusMode::SendMic,
+            ),
+            Self::Host => (
+                DuplexRole::Host,
+                MediaBusMode::SendLoopback,
+                MicBusMode::ReceiveVirtualMic,
+            ),
+            Self::SpeakerOnly => (
+                DuplexRole::Headset,
+                MediaBusMode::ReceiveSpeaker,
+                MicBusMode::Off,
+            ),
+            Self::MicOnly => (DuplexRole::Headset, MediaBusMode::Off, MicBusMode::SendMic),
+        }
+    }
+
+    pub const fn from_bus_modes(media: MediaBusMode, mic: MicBusMode) -> Option<Self> {
+        match (media, mic) {
+            (MediaBusMode::ReceiveSpeaker, MicBusMode::SendMic) => Some(Self::Headset),
+            (MediaBusMode::SendLoopback, MicBusMode::ReceiveVirtualMic) => Some(Self::Host),
+            (MediaBusMode::ReceiveSpeaker, MicBusMode::Off) => Some(Self::SpeakerOnly),
+            (MediaBusMode::Off, MicBusMode::SendMic) => Some(Self::MicOnly),
+            _ => None,
+        }
+    }
 }
 
 /// Generate a crisp 32x32 RGBA Quiet Graphite waveform icon in memory.
@@ -69,15 +112,15 @@ pub fn build_app_icon_rgba() -> (Vec<u8>, u32, u32) {
             let dx = (x - 16).abs();
             let dy = (y - 16).abs();
 
-            // Rounded square badge
-            if dx <= 14 && dy <= 14 && (dx <= 10 || dy <= 10 || (dx - 10) * (dx - 10) + (dy - 10) * (dy - 10) <= 16) {
-                // Quiet Graphite `#1C1C1F` background
+            if dx <= 14
+                && dy <= 14
+                && (dx <= 10 || dy <= 10 || (dx - 10) * (dx - 10) + (dy - 10) * (dy - 10) <= 16)
+            {
                 rgba[idx] = 28;
                 rgba[idx + 1] = 28;
                 rgba[idx + 2] = 31;
                 rgba[idx + 3] = 255;
 
-                // 5-bar waveform in `#3CE0A0`
                 for (bx, bh) in bar_xs.iter().zip(bar_heights.iter()) {
                     if (x - *bx).abs() <= 1 && (y - 16).abs() <= bh / 2 {
                         rgba[idx] = 60;
@@ -95,7 +138,7 @@ pub fn build_app_icon_rgba() -> (Vec<u8>, u32, u32) {
 /// Window visibility & GPU framebuffer lifecycle state for System Tray mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayWindowState {
-    /// Normal Quiet Graphite desktop window (`1220x760`).
+    /// Normal desktop window (`1220x760`).
     Visible,
     /// Multi-frame transition that shrinks viewport to `1x1` to release GPU backbuffers.
     ShrinkingToTray { frames_remaining: u8 },
@@ -177,13 +220,12 @@ mod win32_tray {
                 unsafe {
                     *(lparam as *mut HWND) = hwnd;
                 }
-                return 0; // Stop enumeration
+                return 0;
             }
         }
-        1 // Continue enumeration
+        1
     }
 
-    /// Capture the `winit` root window `HWND` on the GUI thread and start the hidden-tray heartbeat thread.
     pub fn capture_main_window_hwnd() -> Option<HWND> {
         let current = GLOBAL_MAIN_HWND.load(Ordering::Relaxed);
         if current != 0 && unsafe { IsWindow(current) != 0 } {
@@ -221,7 +263,6 @@ mod win32_tray {
         });
     }
 
-    /// Set whether the window is currently hidden or shrinking to the Windows system tray.
     pub fn set_hidden_in_tray(hidden: bool) {
         WINDOWS_HIDDEN_IN_TRAY.store(hidden, Ordering::Relaxed);
         if hidden {
@@ -230,8 +271,6 @@ mod win32_tray {
         }
     }
 
-    /// Post `WM_PAINT` directly to the `winit` window queue so `WindowEvent::RedrawRequested`
-    /// fires on Windows even when the window is hidden (`SW_HIDE` / `!WS_VISIBLE`).
     pub fn wake_main_window() {
         let hwnd = GLOBAL_MAIN_HWND.load(Ordering::Relaxed);
         if hwnd != 0 && unsafe { IsWindow(hwnd) != 0 } {
@@ -241,7 +280,6 @@ mod win32_tray {
         }
     }
 
-    /// Restore and bring the `winit` window to the foreground on Windows.
     pub fn present_and_focus_main_window() {
         let hwnd = GLOBAL_MAIN_HWND.load(Ordering::Relaxed);
         if hwnd != 0 && unsafe { IsWindow(hwnd) != 0 } {
@@ -257,7 +295,6 @@ mod win32_tray {
         }
     }
 
-    /// Post `WM_PAINT` and `WM_CLOSE` so `eframe` processes shutdown immediately even while hidden in the tray.
     pub fn request_close_main_window() {
         let hwnd = GLOBAL_MAIN_HWND.load(Ordering::Relaxed);
         if hwnd != 0 && unsafe { IsWindow(hwnd) != 0 } {
@@ -332,15 +369,15 @@ struct SystemTrayHandles {
     _tray: Option<TrayIcon>,
     title_item: MenuItem,
     toggle_window_item: MenuItem,
-    toggle_tx_item: MenuItem,
-    toggle_rx_item: MenuItem,
-    toggle_duplex_item: MenuItem,
+    toggle_link_item: MenuItem,
+    mute_speaker_item: MenuItem,
+    mute_mic_item: MenuItem,
     stop_all_item: MenuItem,
     quit_item: MenuItem,
     toggle_window_id: tray_icon::menu::MenuId,
-    toggle_tx_id: tray_icon::menu::MenuId,
-    toggle_rx_id: tray_icon::menu::MenuId,
-    toggle_duplex_id: tray_icon::menu::MenuId,
+    toggle_link_id: tray_icon::menu::MenuId,
+    mute_speaker_id: tray_icon::menu::MenuId,
+    mute_mic_id: tray_icon::menu::MenuId,
     stop_all_id: tray_icon::menu::MenuId,
     quit_id: tray_icon::menu::MenuId,
 }
@@ -354,9 +391,9 @@ impl SystemTrayHandles {
         } else {
             t.tray_hide_console
         });
-        self.toggle_tx_item.set_text(t.tray_toggle_tx);
-        self.toggle_rx_item.set_text(t.tray_toggle_rx);
-        self.toggle_duplex_item.set_text(t.tray_toggle_duplex);
+        self.toggle_link_item.set_text(t.tray_toggle_link);
+        self.mute_speaker_item.set_text(t.tray_mute_speaker);
+        self.mute_mic_item.set_text(t.tray_mute_mic);
         self.stop_all_item.set_text(t.tray_stop_all);
         self.quit_item.set_text(t.tray_quit);
     }
@@ -370,16 +407,16 @@ fn init_system_tray(lang: Language) -> anyhow::Result<SystemTrayHandles> {
     let menu = Menu::new();
     let title_item = MenuItem::new(t.tray_title, false, None);
     let toggle_window_item = MenuItem::new(t.tray_hide_console, true, None);
-    let toggle_tx_item = MenuItem::new(t.tray_toggle_tx, true, None);
-    let toggle_rx_item = MenuItem::new(t.tray_toggle_rx, true, None);
-    let toggle_duplex_item = MenuItem::new(t.tray_toggle_duplex, true, None);
+    let toggle_link_item = MenuItem::new(t.tray_toggle_link, true, None);
+    let mute_speaker_item = MenuItem::new(t.tray_mute_speaker, true, None);
+    let mute_mic_item = MenuItem::new(t.tray_mute_mic, true, None);
     let stop_all_item = MenuItem::new(t.tray_stop_all, true, None);
     let quit_item = MenuItem::new(t.tray_quit, true, None);
 
     let toggle_window_id = toggle_window_item.id().clone();
-    let toggle_tx_id = toggle_tx_item.id().clone();
-    let toggle_rx_id = toggle_rx_item.id().clone();
-    let toggle_duplex_id = toggle_duplex_item.id().clone();
+    let toggle_link_id = toggle_link_item.id().clone();
+    let mute_speaker_id = mute_speaker_item.id().clone();
+    let mute_mic_id = mute_mic_item.id().clone();
     let stop_all_id = stop_all_item.id().clone();
     let quit_id = quit_item.id().clone();
 
@@ -389,9 +426,9 @@ fn init_system_tray(lang: Language) -> anyhow::Result<SystemTrayHandles> {
 
     menu.append(&title_item)?;
     menu.append(&toggle_window_item)?;
-    menu.append(&toggle_tx_item)?;
-    menu.append(&toggle_rx_item)?;
-    menu.append(&toggle_duplex_item)?;
+    menu.append(&toggle_link_item)?;
+    menu.append(&mute_speaker_item)?;
+    menu.append(&mute_mic_item)?;
     menu.append(&stop_all_item)?;
     menu.append(&quit_item)?;
 
@@ -447,31 +484,29 @@ fn init_system_tray(lang: Language) -> anyhow::Result<SystemTrayHandles> {
         _tray: tray,
         title_item,
         toggle_window_item,
-        toggle_tx_item,
-        toggle_rx_item,
-        toggle_duplex_item,
+        toggle_link_item,
+        mute_speaker_item,
+        mute_mic_item,
         stop_all_item,
         quit_item,
         toggle_window_id,
-        toggle_tx_id,
-        toggle_rx_id,
-        toggle_duplex_id,
+        toggle_link_id,
+        mute_speaker_id,
+        mute_mic_id,
         stop_all_id,
         quit_id,
     })
 }
 
 fn format_elapsed_hms(started_at: Option<Instant>) -> String {
-    let secs = started_at
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
+    let secs = started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
     format!("{h:02}:{m:02}:{s:02}")
 }
 
-fn split_host_port(input: &str, default_port: u16) -> (String, String) {
+pub fn split_host_port(input: &str, default_port: u16) -> (String, String) {
     let trimmed = input.trim();
     if let Some((host, port)) = trimmed.rsplit_once(':') {
         (host.to_string(), format!(":{port}"))
@@ -482,7 +517,7 @@ fn split_host_port(input: &str, default_port: u16) -> (String, String) {
     }
 }
 
-fn parse_socket_addr_flexible(
+pub fn parse_socket_addr_flexible(
     input: &str,
     default_ip: IpAddr,
     default_port: u16,
@@ -522,25 +557,9 @@ pub struct RsRelayGuiApp {
     last_lan_scan: Instant,
     lan_advertiser: Option<DiscoveryService>,
 
-    // Sender controls
+    // Unified Audio Link session & topology controls
     pub target_addr_input: String,
-    pub selected_source: CaptureSource,
-    pub selected_tx_device: Option<String>,
-    pub selected_profile: LatencyProfile,
-    pub opus_bitrate_kbps: u32,
-    pub active_sender: Option<SenderSession>,
-    tx_started_at: Option<Instant>,
-
-    // Receiver controls
-    pub bind_addr_input: String,
-    pub selected_rx_device: Option<String>,
-    pub target_buffer_ms: u16,
-    pub volume: f32,
-    pub advertise_mdns: bool,
-    pub active_receiver: Option<ReceiverSession>,
-    rx_started_at: Option<Instant>,
-
-    // Full-Duplex & Cross-Machine Speaker + Virtual Mic Sharing controls
+    pub duplex_peer_ip_input: String,
     pub duplex_role: DuplexRole,
     pub duplex_media_mode: MediaBusMode,
     pub duplex_mic_mode: MicBusMode,
@@ -548,29 +567,39 @@ pub struct RsRelayGuiApp {
     pub duplex_media_rx_device: Option<String>,
     pub duplex_mic_tx_device: Option<String>,
     pub duplex_mic_rx_device: Option<String>,
-    pub duplex_peer_ip_input: String,
+
+    pub selected_profile: LatencyProfile,
+    pub volume: f32,
+    pub speaker_muted: bool,
+    pub duplex_mic_muted: bool,
+    pub duplex_gate_db: f32,
+
+    // Collapsible Pro Telemetry & Advanced Drawer controls
+    pub show_advanced_drawer: bool,
     pub duplex_downlink_port: u16,
     pub duplex_uplink_port: u16,
-    pub duplex_gate_db: f32,
-    pub duplex_mic_muted: bool,
+    pub media_port_input: String,
+    pub mic_port_input: String,
+    pub custom_buffer_enabled: bool,
+    pub target_buffer_ms: u16,
+    pub opus_bitrate_kbps: u16,
     pub duplex_rx_channels: ChannelLayout,
+    pub use_test_tone: bool,
+    pub advertise_mdns: bool,
+
     pub active_duplex: Option<DuplexSession>,
     duplex_started_at: Option<Instant>,
     pub installing_vmic_driver: Arc<AtomicBool>,
     pending_vmic_install_result: Arc<Mutex<Option<Result<String, String>>>>,
     pub audiorelay_conflict_cached: bool,
 
-    // Real-time VU meters & chart sparkline buffers
-    tx_vu_meter: VuMeterState,
-    rx_vu_meter: VuMeterState,
-    duplex_tx_vu_meter: VuMeterState,
+    // Real-time VU meters & 20s sparkline buffers
     duplex_rx_vu_meter: VuMeterState,
-    tx_waveform_sparkline: SparklineBuffer,
-    rx_buffer_sparkline: SparklineBuffer,
+    duplex_tx_vu_meter: VuMeterState,
     duplex_buffer_sparkline: SparklineBuffer,
     duplex_tx_envelope_sparkline: SparklineBuffer,
 
-    // Support `--sck` / `--demo` / `--screenshot=<path>` flags for visual verification
+    // Visual verification & tray lifecycle
     pub demo_mode: bool,
     pub screenshot_target: Option<String>,
     screenshot_frames: u8,
@@ -608,14 +637,14 @@ impl RsRelayGuiApp {
             None
         };
 
-        let initial_duplex_role = DuplexRole::Headset;
-        let (init_media_mode, init_mic_mode) = preset_bus_modes_for_role(initial_duplex_role);
+        let initial_role = DuplexRole::Headset;
+        let (init_media_mode, init_mic_mode) = preset_bus_modes_for_role(initial_role);
         let audiorelay_conflict_cached = is_audiorelay_backend_running();
 
         let mut app = Self {
             lang,
             theme_mode: ThemeMode::System,
-            active_tab: WorkspaceTab::DualConsole,
+            active_tab: WorkspaceTab::AudioLink,
             theme_initialized: false,
             local_lan_ip,
             sck_permission_granted,
@@ -628,43 +657,37 @@ impl RsRelayGuiApp {
             last_lan_scan: Instant::now(),
             lan_advertiser,
             target_addr_input: format!("127.0.0.1:{DEFAULT_AUDIO_UDP_PORT}"),
-            selected_source: CaptureSource::SystemLoopback,
-            selected_tx_device: None,
-            selected_profile: LatencyProfile::Balanced,
-            opus_bitrate_kbps: 128,
-            active_sender: None,
-            tx_started_at: None,
-            bind_addr_input: format!("0.0.0.0:{DEFAULT_AUDIO_UDP_PORT}"),
-            selected_rx_device: None,
-            target_buffer_ms: 20,
-            volume: 1.0,
-            advertise_mdns: true,
-            active_receiver: None,
-            rx_started_at: None,
-            duplex_role: initial_duplex_role,
+            duplex_peer_ip_input: "127.0.0.1".to_string(),
+            duplex_role: initial_role,
             duplex_media_mode: init_media_mode,
             duplex_mic_mode: init_mic_mode,
             duplex_media_tx_device: None,
             duplex_media_rx_device: None,
             duplex_mic_tx_device: None,
             duplex_mic_rx_device: None,
-            duplex_peer_ip_input: "127.0.0.1".to_string(),
+            selected_profile: LatencyProfile::Balanced,
+            volume: 1.0,
+            speaker_muted: false,
+            duplex_mic_muted: false,
+            duplex_gate_db: -42.0,
+            show_advanced_drawer: false,
             duplex_downlink_port: DEFAULT_AUDIO_UDP_PORT,
             duplex_uplink_port: DEFAULT_UPLINK_UDP_PORT,
-            duplex_gate_db: -42.0,
-            duplex_mic_muted: false,
+            media_port_input: DEFAULT_AUDIO_UDP_PORT.to_string(),
+            mic_port_input: DEFAULT_UPLINK_UDP_PORT.to_string(),
+            custom_buffer_enabled: false,
+            target_buffer_ms: 20,
+            opus_bitrate_kbps: 128,
             duplex_rx_channels: ChannelLayout::Stereo,
+            use_test_tone: false,
+            advertise_mdns: true,
             active_duplex: None,
             duplex_started_at: None,
             installing_vmic_driver: Arc::new(AtomicBool::new(false)),
             pending_vmic_install_result: Arc::new(Mutex::new(None)),
             audiorelay_conflict_cached,
-            tx_vu_meter: VuMeterState::default(),
-            rx_vu_meter: VuMeterState::default(),
-            duplex_tx_vu_meter: VuMeterState::default(),
             duplex_rx_vu_meter: VuMeterState::default(),
-            tx_waveform_sparkline: SparklineBuffer::new(96),
-            rx_buffer_sparkline: SparklineBuffer::new(64),
+            duplex_tx_vu_meter: VuMeterState::default(),
             duplex_buffer_sparkline: SparklineBuffer::new(64),
             duplex_tx_envelope_sparkline: SparklineBuffer::new(64),
             demo_mode: false,
@@ -693,6 +716,53 @@ impl RsRelayGuiApp {
             tray.set_language(lang, hidden);
         }
         self.last_status_msg = lang.status_language_switched();
+    }
+
+    pub fn apply_scene_preset(&mut self, preset: ScenePreset) {
+        let (role, media, mic) = preset.bus_modes();
+        self.duplex_role = role;
+        self.duplex_media_mode = media;
+        self.duplex_mic_mode = mic;
+        if self.active_duplex.is_some() {
+            self.restart_active_session();
+        }
+    }
+
+    fn sync_role_from_bus_modes(&mut self) {
+        self.duplex_role = match (self.duplex_media_mode, self.duplex_mic_mode) {
+            (MediaBusMode::SendLoopback, MicBusMode::ReceiveVirtualMic)
+            | (MediaBusMode::SendLoopback, MicBusMode::Off)
+            | (MediaBusMode::Off, MicBusMode::ReceiveVirtualMic) => DuplexRole::Host,
+            (MediaBusMode::Bidirectional, _) | (_, MicBusMode::Bidirectional) => {
+                DuplexRole::Symmetric
+            }
+            _ => DuplexRole::Headset,
+        };
+    }
+
+    pub fn toggle_speaker_mute(&mut self) {
+        self.speaker_muted = !self.speaker_muted;
+        if let Some(ref dpx) = self.active_duplex {
+            let eff_vol = if self.speaker_muted { 0.0 } else { self.volume };
+            dpx.set_rx_volume(eff_vol);
+            if !self.duplex_media_mode.receives() && self.duplex_media_mode.sends() {
+                dpx.set_media_tx_muted(self.speaker_muted);
+            }
+        }
+    }
+
+    pub fn toggle_mic_mute(&mut self) {
+        self.duplex_mic_muted = !self.duplex_mic_muted;
+        if let Some(ref dpx) = self.active_duplex {
+            dpx.set_tx_muted(self.duplex_mic_muted);
+            if !self.duplex_mic_mode.sends() && self.duplex_mic_mode.receives() {
+                dpx.set_mic_rx_gain(if self.duplex_mic_muted {
+                    0.0
+                } else {
+                    self.volume
+                });
+            }
+        }
     }
 
     pub fn enter_tray_background_mode(&mut self, ctx: &egui::Context) {
@@ -742,28 +812,7 @@ impl RsRelayGuiApp {
             let st = dpx.status();
             let tx_pkts = st.primary_tx().map(|t| t.net.packets_sent).unwrap_or(0);
             let rx_buf = st.primary_rx().map(|r| r.net.buffer_level_ms).unwrap_or(0.0);
-            format!("● DUPLEX LIVE — TX: {tx_pkts} | RX Buf: {rx_buf:.1} ms")
-        } else if self.active_sender.is_some() && self.active_receiver.is_some() {
-            let tx_pkts = self
-                .active_sender
-                .as_ref()
-                .map(|s| s.status().net.packets_sent)
-                .unwrap_or(0);
-            let rx_buf = self
-                .active_receiver
-                .as_ref()
-                .map(|r| r.status().net.buffer_level_ms)
-                .unwrap_or(0.0);
-            format!("● TX+RX LIVE — Sent: {tx_pkts} | Buf: {rx_buf:.1} ms")
-        } else if let Some(ref tx) = self.active_sender {
-            let st = tx.status();
-            format!("● TX LIVE — {} pkts ({} Hz)", st.net.packets_sent, st.sample_rate)
-        } else if let Some(ref rx) = self.active_receiver {
-            let st = rx.status();
-            format!(
-                "● RX LIVE — Buf: {:.1} ms ({} pkts)",
-                st.net.buffer_level_ms, st.net.packets_received
-            )
+            format!("● LIVE — TX: {tx_pkts} | Buf: {rx_buf:.1} ms")
         } else {
             self.lang.texts().tray_title.to_string()
         };
@@ -797,8 +846,7 @@ impl RsRelayGuiApp {
                     self.last_status_msg = self.lang.status_vmic_driver_installed(&detail);
                     self.devices = list_audio_devices().unwrap_or_default();
                     if self.active_duplex.is_some() {
-                        self.active_duplex = None;
-                        self.toggle_duplex();
+                        self.restart_active_session();
                     }
                 }
                 Err(err) => {
@@ -833,59 +881,47 @@ impl RsRelayGuiApp {
         self.sck_permission_granted = has_system_loopback_permission();
         self.audiorelay_conflict_cached = is_audiorelay_backend_running();
 
-        // If Duplex Mic RX was waiting in Echo-Free Guard mode and a real Virtual Mic driver
-        // just became available (e.g. after VB-CABLE or rsrelayVirtualMic install), bind automatically!
         if let Some(ref dpx) = self.active_duplex {
             let st = dpx.status();
+            // Auto-bind real Virtual Mic driver if one just became available
             if !st.virtual_mic_ready && select_default_virtual_mic_output_device().is_some() {
-                self.active_duplex = None;
-                self.toggle_duplex();
+                self.restart_active_session();
                 return;
+            }
+
+            // Auto-follow OS default speaker or microphone on hotplug
+            if self.auto_follow_default_device {
+                let mut should_hotswap = None;
+                if self.duplex_media_rx_device.is_none() {
+                    if let (Some(ref m_rx), Some(ref def_out)) = (&st.media_rx, &new_default_out) {
+                        if &m_rx.device_name != def_out {
+                            should_hotswap = Some(def_out.clone());
+                        }
+                    }
+                }
+                if should_hotswap.is_none() && self.duplex_mic_tx_device.is_none() {
+                    if let (Some(ref v_tx), Some(ref def_in)) = (&st.mic_tx, &new_default_in) {
+                        if !is_virtual_mic_input_device_name(def_in) && &v_tx.device_name != def_in
+                        {
+                            should_hotswap = Some(def_in.clone());
+                        }
+                    }
+                }
+                if let Some(dev_name) = should_hotswap {
+                    self.restart_active_session();
+                    self.last_status_msg = self.lang.status_hotswapped_device(&dev_name);
+                    return;
+                }
             }
         }
 
         if manual {
             self.last_status_msg = self.lang.status_refreshed_ports(in_count, out_count);
         }
-
-        if self.auto_follow_default_device || manual {
-            if self.selected_rx_device.is_none() {
-                if let (Some(ref rx), Some(ref def_out)) = (&self.active_receiver, &new_default_out)
-                {
-                    if &rx.status().device_name != def_out {
-                        self.active_receiver = None;
-                        self.toggle_receiver();
-                        self.last_status_msg = self.lang.status_hotswapped_output(def_out);
-                    }
-                }
-            }
-
-            if self.selected_tx_device.is_none()
-                && self.selected_source == CaptureSource::Microphone
-            {
-                if let (Some(ref tx), Some(ref def_in)) = (&self.active_sender, &new_default_in) {
-                    if &tx.status().device_name != def_in {
-                        self.active_sender = None;
-                        self.toggle_sender();
-                        self.last_status_msg = self.lang.status_hotswapped_input(def_in);
-                    }
-                }
-            }
-        }
-    }
-
-    fn current_configured_rx_port(&self) -> u16 {
-        parse_socket_addr_flexible(
-            &self.bind_addr_input,
-            IpAddr::from([0, 0, 0, 0]),
-            DEFAULT_AUDIO_UDP_PORT,
-        )
-        .map(|sa| sa.port())
-        .unwrap_or(DEFAULT_AUDIO_UDP_PORT)
     }
 
     fn sync_lan_advertiser(&mut self) {
-        let port = self.current_configured_rx_port();
+        let port = self.duplex_downlink_port;
         if self.advertise_mdns {
             if let Some(ref svc) = self.lan_advertiser {
                 svc.set_advertised_port(port);
@@ -943,11 +979,7 @@ impl RsRelayGuiApp {
     }
 
     fn apply_auto_discovered_target(&mut self) {
-        if self.demo_mode
-            || self.target_addr_manually_edited
-            || self.active_sender.is_some()
-            || self.active_duplex.is_some()
-        {
+        if self.demo_mode || self.target_addr_manually_edited || self.active_duplex.is_some() {
             return;
         }
         let trimmed = self.target_addr_input.trim();
@@ -973,7 +1005,7 @@ impl RsRelayGuiApp {
         }
     }
 
-    fn build_target_combo_options(&self) -> Vec<(String, String, bool)> {
+    pub fn build_target_combo_options(&self) -> Vec<(String, String, bool)> {
         let t = self.lang.texts();
         let mut opts: Vec<(String, String, bool)> = Vec::new();
 
@@ -992,8 +1024,7 @@ impl RsRelayGuiApp {
         }
 
         if let Some(lan_ip) = self.local_lan_ip {
-            let rx_port = self.current_configured_rx_port();
-            let addr_val = format!("{lan_ip}:{rx_port}");
+            let addr_val = format!("{lan_ip}:{}", self.duplex_downlink_port);
             if !opts.iter().any(|(a, _, _)| a == &addr_val) {
                 let label = format!("{} · {addr_val}", t.combo_local_lan);
                 opts.push((addr_val, label, false));
@@ -1010,132 +1041,27 @@ impl RsRelayGuiApp {
     }
 
     pub fn stop_all_streams(&mut self) {
-        self.active_sender = None;
-        self.active_receiver = None;
         self.active_duplex = None;
-        self.tx_started_at = None;
-        self.rx_started_at = None;
         self.duplex_started_at = None;
-        self.tx_waveform_sparkline.clear();
-        self.rx_buffer_sparkline.clear();
         self.duplex_buffer_sparkline.clear();
         self.duplex_tx_envelope_sparkline.clear();
         self.last_status_msg = self.lang.status_all_stopped();
     }
 
-    pub fn toggle_sender(&mut self) {
-        if self.active_sender.is_some() {
-            self.active_sender = None;
-            self.tx_started_at = None;
-            self.tx_waveform_sparkline.clear();
-            self.last_status_msg = self.lang.status_sender_stopped();
-            return;
-        }
-
-        self.active_duplex = None;
-        self.duplex_started_at = None;
-
-        let target_addr: SocketAddr = match parse_socket_addr_flexible(
-            &self.target_addr_input,
-            IpAddr::from([127, 0, 0, 1]),
-            DEFAULT_AUDIO_UDP_PORT,
-        ) {
-            Ok(addr) => {
-                self.target_addr_input = addr.to_string();
-                addr
-            }
-            Err(e) => {
-                self.last_status_msg = self.lang.status_invalid_target_addr(&e);
+    fn restart_active_session(&mut self) {
+        if self.active_duplex.is_some() {
+            let prev_started = self.duplex_started_at;
+            self.active_duplex = None;
+            if self.duplex_media_mode == MediaBusMode::Off
+                && self.duplex_mic_mode == MicBusMode::Off
+            {
+                self.duplex_started_at = None;
+                self.last_status_msg = self.lang.status_all_stopped();
                 return;
             }
-        };
-
-        let cfg = SenderSessionConfig {
-            target_addr,
-            source: self.selected_source,
-            device_name: self.selected_tx_device.clone(),
-            codec: self.selected_profile.default_codec(),
-            channels: ChannelLayout::Stereo,
-            frame_duration: self.selected_profile.default_frame_duration(),
-            opus_bitrate_bps: self.opus_bitrate_kbps * 1000,
-            enable_fec: self.selected_profile.default_fec(),
-            noise_gate_db: None,
-        };
-
-        match SenderSession::start(cfg) {
-            Ok(session) => {
-                self.sck_permission_granted = has_system_loopback_permission();
-                let st = session.status();
-                self.tx_started_at = Some(Instant::now());
-                self.tx_waveform_sparkline.clear();
-                self.last_status_msg = self.lang.status_sender_streaming(
-                    &st.device_name,
-                    st.sample_rate,
-                    target_addr,
-                );
-                self.active_sender = Some(session);
-            }
-            Err(e) => {
-                self.sck_permission_granted = has_system_loopback_permission();
-                self.last_status_msg = self.lang.status_sender_failed(&e);
-            }
-        }
-    }
-
-    pub fn toggle_receiver(&mut self) {
-        if self.active_receiver.is_some() {
-            self.active_receiver = None;
-            self.rx_started_at = None;
-            self.rx_buffer_sparkline.clear();
-            self.last_status_msg = self.lang.status_receiver_stopped();
-            return;
-        }
-
-        self.active_duplex = None;
-        self.duplex_started_at = None;
-
-        let bind_addr: SocketAddr = match parse_socket_addr_flexible(
-            &self.bind_addr_input,
-            IpAddr::from([0, 0, 0, 0]),
-            DEFAULT_AUDIO_UDP_PORT,
-        ) {
-            Ok(addr) => {
-                self.bind_addr_input = addr.to_string();
-                addr
-            }
-            Err(e) => {
-                self.last_status_msg = self.lang.status_invalid_bind_addr(&e);
-                return;
-            }
-        };
-
-        self.sync_lan_advertiser();
-
-        let cfg = ReceiverSessionConfig {
-            bind_addr,
-            device_name: self.selected_rx_device.clone(),
-            channels: ChannelLayout::Stereo,
-            target_buffer_ms: self.target_buffer_ms,
-            initial_volume: self.volume,
-            // Background `lan_advertiser` already advertises this GUI instance when enabled
-            advertise_mdns: self.advertise_mdns && self.lan_advertiser.is_none(),
-            node_name: "rsrelay-desktop".to_string(),
-        };
-
-        match ReceiverSession::start(cfg) {
-            Ok(session) => {
-                let st = session.status();
-                self.rx_started_at = Some(Instant::now());
-                self.rx_buffer_sparkline.clear();
-                self.last_status_msg = self.lang.status_receiver_listening(
-                    bind_addr,
-                    &st.device_name,
-                    st.sample_rate,
-                );
-                self.active_receiver = Some(session);
-            }
-            Err(e) => {
-                self.last_status_msg = self.lang.status_receiver_failed(&e);
+            self.start_link_session_internal();
+            if self.active_duplex.is_some() && prev_started.is_some() {
+                self.duplex_started_at = prev_started;
             }
         }
     }
@@ -1162,27 +1088,50 @@ impl RsRelayGuiApp {
 
     pub fn toggle_duplex(&mut self) {
         if self.active_duplex.is_some() {
-            self.active_duplex = None;
-            self.duplex_started_at = None;
-            self.duplex_buffer_sparkline.clear();
-            self.duplex_tx_envelope_sparkline.clear();
-            self.last_status_msg = self.lang.status_duplex_stopped();
+            self.stop_all_streams();
+            return;
+        }
+        self.start_link_session_internal();
+    }
+
+    fn start_link_session_internal(&mut self) {
+        if self.duplex_media_mode == MediaBusMode::Off && self.duplex_mic_mode == MicBusMode::Off {
+            self.last_status_msg = self.lang.status_both_buses_off();
             return;
         }
 
-        self.active_sender = None;
-        self.active_receiver = None;
-        self.tx_started_at = None;
-        self.rx_started_at = None;
+        if let Ok(p) = self.media_port_input.trim().parse::<u16>() {
+            if p > 0 {
+                self.duplex_downlink_port = p;
+            }
+        }
+        self.media_port_input = self.duplex_downlink_port.to_string();
+
+        if let Ok(p) = self.mic_port_input.trim().parse::<u16>() {
+            if p > 0 {
+                self.duplex_uplink_port = p;
+            }
+        }
+        self.mic_port_input = self.duplex_uplink_port.to_string();
 
         let trimmed_peer = self.duplex_peer_ip_input.trim();
-        let peer_ip_res: Result<IpAddr, std::net::AddrParseError> = trimmed_peer
-            .parse::<IpAddr>()
-            .or_else(|_| trimmed_peer.parse::<SocketAddr>().map(|sa| sa.ip()));
+        let peer_ip_res: Result<IpAddr, std::net::AddrParseError> = if trimmed_peer.is_empty() {
+            Ok(IpAddr::from([127, 0, 0, 1]))
+        } else {
+            trimmed_peer.parse::<IpAddr>().or_else(|_| {
+                parse_socket_addr_flexible(
+                    trimmed_peer,
+                    IpAddr::from([127, 0, 0, 1]),
+                    self.duplex_downlink_port,
+                )
+                .map(|sa| sa.ip())
+            })
+        };
 
         let peer_ip: IpAddr = match peer_ip_res {
             Ok(ip) => {
                 self.duplex_peer_ip_input = ip.to_string();
+                self.target_addr_input = format!("{ip}:{}", self.duplex_downlink_port);
                 ip
             }
             Err(e) => {
@@ -1190,6 +1139,9 @@ impl RsRelayGuiApp {
                 return;
             }
         };
+
+        self.sync_role_from_bus_modes();
+        self.sync_lan_advertiser();
 
         let mut cfg = DuplexSessionConfig::new(self.duplex_role, peer_ip);
         cfg.media_mode = self.duplex_media_mode;
@@ -1204,32 +1156,50 @@ impl RsRelayGuiApp {
         cfg.mic_channels = ChannelLayout::Stereo;
         cfg.profile = self.selected_profile;
         cfg.mic_noise_gate_db = Some(self.duplex_gate_db);
-        cfg.initial_volume = self.volume;
-        cfg.mic_rx_gain = self.volume;
+        cfg.initial_volume = if self.speaker_muted { 0.0 } else { self.volume };
+        cfg.mic_rx_gain = if self.duplex_mic_muted && !self.duplex_mic_mode.sends() {
+            0.0
+        } else {
+            self.volume
+        };
         cfg.advertise_mdns = self.advertise_mdns && self.lan_advertiser.is_none();
+        cfg.synthetic_source_override = self.use_test_tone;
+        cfg.target_buffer_ms_override = if self.custom_buffer_enabled {
+            Some(self.target_buffer_ms)
+        } else {
+            None
+        };
+        cfg.media_opus_bitrate_bps_override = Some((self.opus_bitrate_kbps as u32) * 1000);
 
         match DuplexSession::start(cfg) {
             Ok(session) => {
+                self.sck_permission_granted = has_system_loopback_permission();
                 session.set_tx_muted(self.duplex_mic_muted);
+                if !self.duplex_media_mode.receives() && self.duplex_media_mode.sends() {
+                    session.set_media_tx_muted(self.speaker_muted);
+                }
                 let st = session.status();
-                let tx_label = st
-                    .primary_tx()
-                    .map(|t| t.device_name.as_str())
-                    .unwrap_or("—");
-                let rx_label = st
-                    .primary_rx()
-                    .map(|r| r.device_name.as_str())
-                    .unwrap_or("—");
+                let mut parts = Vec::new();
+                if let Some(ref rx) = st.media_rx {
+                    parts.push(format!("🎧 {}", rx.device_name));
+                } else if let Some(ref tx) = st.media_tx {
+                    parts.push(format!("🔊 {}", tx.device_name));
+                }
+                if let Some(ref tx) = st.mic_tx {
+                    parts.push(format!("🎙️ {}", tx.device_name));
+                } else if let Some(ref rx) = st.mic_rx {
+                    parts.push(format!("🎤 {}", rx.device_name));
+                }
+                let summary = parts.join(" · ");
                 self.duplex_started_at = Some(Instant::now());
                 self.duplex_buffer_sparkline.clear();
                 self.duplex_tx_envelope_sparkline.clear();
-                self.last_status_msg =
-                    self.lang
-                        .status_duplex_active(self.duplex_role, peer_ip, tx_label, rx_label);
+                self.last_status_msg = self.lang.status_link_active(peer_ip, &summary);
                 self.active_duplex = Some(session);
             }
             Err(e) => {
-                self.last_status_msg = self.lang.status_duplex_failed(&e);
+                self.sck_permission_granted = has_system_loopback_permission();
+                self.last_status_msg = self.lang.status_link_failed(&e);
             }
         }
     }
@@ -1239,31 +1209,28 @@ impl RsRelayGuiApp {
         self.local_lan_ip = "192.168.3.151".parse().ok();
         self.target_addr_input = "192.168.3.110:49153".to_string();
         self.duplex_peer_ip_input = "192.168.3.110".to_string();
-        self.selected_profile = match self.active_tab {
-            WorkspaceTab::DualConsole => LatencyProfile::LosslessPcm,
-            _ => LatencyProfile::Balanced,
-        };
+        self.selected_profile = LatencyProfile::Balanced;
         if let Ok(mut guard) = self.discovered_peers.lock() {
             *guard = vec![
                 DiscoveredPeer {
-                    instance_name: "Studio-MacBook".to_string(),
-                    hostname: "Studio-MacBook".to_string(),
+                    instance_name: "Studio-PC".to_string(),
+                    hostname: "Studio-PC".to_string(),
                     addresses: vec!["192.168.3.110".parse().unwrap()],
-                    udp_port: 49153,
-                    version: "0.4.2".to_string(),
-                    os: "macos".to_string(),
-                },
-                DiscoveredPeer {
-                    instance_name: "LivingRoom-PC".to_string(),
-                    hostname: "LivingRoom-PC".to_string(),
-                    addresses: vec!["192.168.3.128".parse().unwrap()],
                     udp_port: 49153,
                     version: "0.4.2".to_string(),
                     os: "windows".to_string(),
                 },
                 DiscoveredPeer {
+                    instance_name: "MacBook-Air".to_string(),
+                    hostname: "MacBook-Air".to_string(),
+                    addresses: vec!["192.168.3.128".parse().unwrap()],
+                    udp_port: 49153,
+                    version: "0.4.2".to_string(),
+                    os: "macos".to_string(),
+                },
+                DiscoveredPeer {
                     instance_name: "Kevins-iPad".to_string(),
-                    hostname: "Kevin’s iPad".to_string(),
+                    hostname: "Kevin's iPad".to_string(),
                     addresses: vec!["192.168.3.142".parse().unwrap()],
                     udp_port: 49153,
                     version: "0.4.2".to_string(),
@@ -1271,28 +1238,22 @@ impl RsRelayGuiApp {
                 },
             ];
         }
-        self.tx_vu_meter.smoothed_db = -16.8;
-        self.tx_vu_meter.peak_hold_db = -12.6;
-        self.tx_vu_meter.smoothed_db_r = -19.8;
-        self.tx_vu_meter.peak_hold_db_r = -14.4;
 
-        self.duplex_rx_vu_meter.smoothed_db = -21.6;
-        self.duplex_rx_vu_meter.peak_hold_db = -17.4;
-        self.duplex_rx_vu_meter.smoothed_db_r = -23.4;
-        self.duplex_rx_vu_meter.peak_hold_db_r = -18.6;
+        self.duplex_rx_vu_meter.smoothed_db = -18.4;
+        self.duplex_rx_vu_meter.peak_hold_db = -13.2;
+        self.duplex_rx_vu_meter.smoothed_db_r = -20.1;
+        self.duplex_rx_vu_meter.peak_hold_db_r = -14.8;
 
         self.duplex_tx_vu_meter.smoothed_db = -14.2;
-        self.duplex_tx_vu_meter.peak_hold_db = -11.4;
+        self.duplex_tx_vu_meter.peak_hold_db = -10.8;
+        self.duplex_tx_vu_meter.smoothed_db_r = -15.6;
+        self.duplex_tx_vu_meter.peak_hold_db_r = -11.9;
 
-        for i in 0..96 {
-            let v = 0.32 + 0.28 * ((i as f32 * 0.23).sin()) + 0.16 * ((i as f32 * 0.61).cos());
-            self.tx_waveform_sparkline.push(v.clamp(0.18, 0.88));
-        }
         for i in 0..64 {
-            let jb = 15.0 + 1.8 * ((i as f32 * 0.18).sin()) + 0.7 * ((i as f32 * 0.43).cos());
+            let jb = 18.5 + 1.4 * ((i as f32 * 0.18).sin()) + 0.6 * ((i as f32 * 0.43).cos());
             self.duplex_buffer_sparkline.push(jb);
-            let env = if (10..26).contains(&i) || (36..54).contains(&i) {
-                -18.0 + 6.0 * ((i as f32 * 0.45).sin())
+            let env = if (10..26).contains(&i) || (36..56).contains(&i) {
+                -17.0 + 5.5 * ((i as f32 * 0.45).sin())
             } else {
                 -54.0
             };
@@ -1301,44 +1262,20 @@ impl RsRelayGuiApp {
     }
 
     fn update_live_telemetry(&mut self) {
-        if self.demo_mode
-            && self.active_sender.is_none()
-            && self.active_receiver.is_none()
-            && self.active_duplex.is_none()
-        {
+        if self.demo_mode && self.active_duplex.is_none() {
             return;
-        }
-        if let Some(ref tx) = self.active_sender {
-            let st = tx.status();
-            self.tx_vu_meter.update(st.peak_level, true);
-            let norm = crate::widgets::dbfs_to_norm(self.tx_vu_meter.smoothed_db).max(0.18);
-            self.tx_waveform_sparkline.push(norm);
-        } else {
-            self.tx_vu_meter.update(0.0, false);
-        }
-
-        if let Some(ref rx) = self.active_receiver {
-            let st = rx.status();
-            self.rx_vu_meter.update(st.peak_level, true);
-            if st.net.packets_received > 0 {
-                self.rx_buffer_sparkline.push(st.net.buffer_level_ms);
-            }
-        } else {
-            self.rx_vu_meter.update(0.0, false);
         }
 
         if let Some(ref dpx) = self.active_duplex {
             let st = dpx.status();
-            // Left Card (`duplex_rx_vu_meter` + `duplex_buffer_sparkline`) tracks the Media / Player Bus
-            // (falling back to `mic_rx` when Media Bus is Off so pure Mic RX still animates jitter chart)
-            let left_peak = st
+            let media_peak = st
                 .media_rx
                 .as_ref()
                 .map(|r| r.peak_level)
                 .or_else(|| st.media_tx.as_ref().map(|t| t.peak_level))
                 .unwrap_or(0.0);
-            let left_active = st.media_rx.is_some() || st.media_tx.is_some();
-            self.duplex_rx_vu_meter.update(left_peak, left_active);
+            let media_active = st.media_rx.is_some() || st.media_tx.is_some();
+            self.duplex_rx_vu_meter.update(media_peak, media_active);
 
             if let Some(rx_for_jb) = st.media_rx.as_ref().or(st.mic_rx.as_ref()) {
                 if rx_for_jb.net.packets_received > 0 {
@@ -1346,20 +1283,20 @@ impl RsRelayGuiApp {
                 }
             }
 
-            // Right Card (`duplex_tx_vu_meter` + `duplex_tx_envelope_sparkline`) tracks the Mic / VirtualMic Bus
-            let right_peak = st
+            let mic_peak = st
                 .mic_tx
                 .as_ref()
                 .map(|t| t.peak_level)
                 .unwrap_or(0.0)
                 .max(st.mic_rx.as_ref().map(|r| r.peak_level).unwrap_or(0.0));
-            let right_active = st.mic_tx.is_some() || st.mic_rx.is_some();
-            self.duplex_tx_vu_meter.update(right_peak, right_active);
+            let mic_active = st.mic_tx.is_some() || st.mic_rx.is_some();
+            self.duplex_tx_vu_meter.update(mic_peak, mic_active);
 
-            let env_db = if self.duplex_mic_muted && st.mic_rx.is_none() {
+            let active_env_peak = if mic_active { mic_peak } else { media_peak };
+            let env_db = if self.duplex_mic_muted && st.mic_rx.is_none() && mic_active {
                 -58.0
             } else {
-                linear_to_dbfs(right_peak).max(-56.0)
+                linear_to_dbfs(active_env_peak).max(-56.0)
             };
             self.duplex_tx_envelope_sparkline.push(env_db);
         } else {
@@ -1368,26 +1305,48 @@ impl RsRelayGuiApp {
         }
     }
 
-    fn resolve_peer_name(&self, ip_part: &str) -> String {
+    fn resolve_peer_name_and_icon(&self, ip_part: &str) -> (String, IconKind) {
         if let Ok(guard) = self.discovered_peers.lock() {
             for p in guard.iter() {
                 if p.addresses.iter().any(|a| a.to_string() == ip_part) {
-                    return p.hostname.clone();
+                    let os_lower = p.os.to_ascii_lowercase();
+                    let icon = if os_lower.contains("mac") || os_lower.contains("darwin") {
+                        IconKind::Laptop
+                    } else if os_lower.contains("ios") || os_lower.contains("android") {
+                        IconKind::Mobile
+                    } else {
+                        IconKind::Desktop
+                    };
+                    return (p.hostname.clone(), icon);
                 }
             }
         }
         if ip_part == "127.0.0.1" || ip_part == "localhost" {
-            match self.lang {
-                Language::Zh => "本机回环".to_string(),
+            let lbl = match self.lang {
+                Language::Zh => "本机回环测试".to_string(),
                 Language::En => "Localhost".to_string(),
-            }
+            };
+            (lbl, IconKind::Laptop)
         } else {
-            ip_part.to_string()
+            (ip_part.to_string(), IconKind::Desktop)
+        }
+    }
+
+    fn app_recording_mic_name_for_sink(sink_name: &str) -> String {
+        let lower = sink_name.to_ascii_lowercase();
+        if lower.contains("rsrelay virtual mic") {
+            MACOS_RSRELAY_VMIC_INPUT_NAME.to_string()
+        } else if lower.contains("cable input") {
+            sink_name.replace("CABLE Input", "CABLE Output")
+        } else if lower.contains("voicemeeter input") {
+            "VoiceMeeter Out B1".to_string()
+        } else {
+            sink_name.to_string()
         }
     }
 
     // =========================================================================
-    // Left Navigation Sidebar (`aside.side` in Frames C & C2)
+    // Left Navigation Sidebar
     // =========================================================================
 
     fn render_sidebar(&mut self, ctx: &egui::Context) {
@@ -1404,7 +1363,7 @@ impl RsRelayGuiApp {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ctx, |ui| {
-                // Bottom Footer Panel inside Sidebar (Local IP, Auto-follow toggle, Language seg, Tray button)
+                // Bottom Footer Panel inside Sidebar
                 egui::TopBottomPanel::bottom("sidebar_footer_panel")
                     .frame(
                         egui::Frame::none()
@@ -1418,84 +1377,102 @@ impl RsRelayGuiApp {
                             }),
                     )
                     .show_inside(ui, |ui| {
-                        // 1. Local IP Row
                         let ip_str = self
                             .local_lan_ip
                             .map(|ip| ip.to_string())
                             .unwrap_or_else(|| "127.0.0.1".to_string());
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                ui.label(
-                                    RichText::new(t.sidebar_local_addr)
-                                        .size(11.0)
-                                        .color(palette::TEXT_MUTED()),
-                                );
-                                ui.label(
-                                    RichText::new(&ip_str)
-                                        .size(12.5)
-                                        .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_PRIMARY()),
-                                );
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                let (copy_rect, copy_resp) =
-                                    ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
-                                if copy_resp.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if ui.is_rect_visible(copy_rect) {
-                                    let p = ui.painter();
-                                    if copy_resp.hovered() {
-                                        p.rect_filled(
-                                            copy_rect,
-                                            Rounding::same(6.0),
-                                            palette::BG_RAISED(),
-                                        );
-                                    }
-                                    draw_vector_icon(
-                                        p,
-                                        copy_rect.shrink(5.0),
-                                        IconKind::Copy,
-                                        if copy_resp.hovered() {
-                                            palette::TEXT_PRIMARY()
-                                        } else {
-                                            palette::TEXT_MUTED()
-                                        },
-                                    );
-                                }
-                                if copy_resp.on_hover_text(t.lan_ip_hover).clicked() {
-                                    ui.ctx().copy_text(ip_str.clone());
-                                    if let Some(ip) = self.local_lan_ip {
-                                        self.last_status_msg = lang.status_copied_lan_ip(ip);
-                                    }
-                                }
-                            });
-                        });
-
-                        ui.add_space(10.0);
-
-                        // 2. Auto-follow Default Device Toggle Row
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(t.chk_auto_follow_hotplug)
-                                    .size(12.5)
-                                    .color(palette::TEXT_SECONDARY()),
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                pill_toggle(ui, &mut self.auto_follow_default_device);
-                            });
-                        });
-
-                        ui.add_space(10.0);
-
-                        // 3. Theme Mode 3-Way Segmented Control (`跟随系统 | 浅色 | 深色`)
                         {
-                            let theme_seg_w = ui.available_width().max(150.0);
-                            let (t_rect, _) = ui.allocate_exact_size(
-                                Vec2::new(theme_seg_w, 28.0),
+                            let (ip_row, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 36.0),
                                 Sense::hover(),
                             );
+                            let cy = ip_row.center().y;
+                            paint_text_vcenter(
+                                ui.painter(),
+                                Pos2::new(ip_row.min.x, cy - 8.5),
+                                Align::Min,
+                                t.sidebar_local_addr,
+                                FontId::new(11.0, FontFamily::Proportional),
+                                palette::TEXT_MUTED(),
+                            );
+                            paint_text_vcenter(
+                                ui.painter(),
+                                Pos2::new(ip_row.min.x, cy + 8.5),
+                                Align::Min,
+                                &ip_str,
+                                FontId::new(12.5, FontFamily::Monospace),
+                                palette::TEXT_PRIMARY(),
+                            );
+                            let copy_rect = Rect::from_center_size(
+                                Pos2::new(ip_row.max.x - 12.0, cy),
+                                Vec2::splat(24.0),
+                            );
+                            let copy_resp = ui.interact(
+                                copy_rect,
+                                ui.id().with("sidebar_copy_lan_ip"),
+                                Sense::click(),
+                            );
+                            if copy_resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if ui.is_rect_visible(copy_rect) {
+                                let p = ui.painter();
+                                if copy_resp.hovered() {
+                                    p.rect_filled(
+                                        copy_rect,
+                                        Rounding::same(6.0),
+                                        palette::BG_RAISED(),
+                                    );
+                                }
+                                draw_vector_icon(
+                                    p,
+                                    copy_rect.shrink(5.0),
+                                    IconKind::Copy,
+                                    if copy_resp.hovered() {
+                                        palette::TEXT_PRIMARY()
+                                    } else {
+                                        palette::TEXT_MUTED()
+                                    },
+                                );
+                            }
+                            if copy_resp.on_hover_text(t.lan_ip_hover).clicked() {
+                                ui.ctx().copy_text(ip_str.clone());
+                                if let Some(ip) = self.local_lan_ip {
+                                    self.last_status_msg = lang.status_copied_lan_ip(ip);
+                                }
+                            }
+                        }
+
+                        ui.add_space(10.0);
+
+                        {
+                            let (auto_row, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 22.0),
+                                Sense::hover(),
+                            );
+                            paint_text_vcenter(
+                                ui.painter(),
+                                Pos2::new(auto_row.min.x, auto_row.center().y),
+                                Align::Min,
+                                t.chk_auto_follow_hotplug,
+                                FontId::new(12.5, FontFamily::Proportional),
+                                palette::TEXT_SECONDARY(),
+                            );
+                            let mut toggle_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(auto_row)
+                                    .layout(egui::Layout::right_to_left(Align::Center)),
+                            );
+                            pill_toggle(&mut toggle_ui, &mut self.auto_follow_default_device);
+                        }
+
+                        ui.add_space(10.0);
+
+                        // Theme Mode 3-Way Segmented Control
+                        {
+                            let theme_seg_w = ui.available_width().max(150.0);
+                            let (t_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(theme_seg_w, 28.0), Sense::hover());
                             if ui.is_rect_visible(t_rect) {
                                 let p = ui.painter();
                                 p.rect(
@@ -1546,9 +1523,10 @@ impl RsRelayGuiApp {
                                             Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
                                         );
                                     }
-                                    p.text(
+                                    paint_text_vcenter(
+                                        p,
                                         opt_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
+                                        Align::Center,
                                         *m_label,
                                         FontId::new(11.5, FontFamily::Proportional),
                                         if selected {
@@ -1563,7 +1541,7 @@ impl RsRelayGuiApp {
 
                         ui.add_space(8.0);
 
-                        // 4. Language Segmented Control (`中文 | EN`) + Minimize to Tray Button
+                        // Language Segmented Control + Minimize to Tray Button
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             let seg_w = (ui.available_width() - 40.0).max(110.0);
@@ -1605,9 +1583,10 @@ impl RsRelayGuiApp {
                                             Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
                                         );
                                     }
-                                    p.text(
+                                    paint_text_vcenter(
+                                        p,
                                         opt_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
+                                        Align::Center,
                                         *l_str,
                                         FontId::new(12.0, FontFamily::Proportional),
                                         if selected {
@@ -1619,7 +1598,6 @@ impl RsRelayGuiApp {
                                 }
                             }
 
-                            // Minimize to Tray icon button (`32x30`)
                             let (tray_rect, tray_resp) =
                                 ui.allocate_exact_size(Vec2::new(32.0, 30.0), Sense::click());
                             if tray_resp.hovered() {
@@ -1657,7 +1635,7 @@ impl RsRelayGuiApp {
                         });
                     });
 
-                // Upper Sidebar Content (Brand, Mode Nav, Nearby Devices)
+                // Upper Sidebar Content (Brand, Streamlined 2-Tab Nav, Nearby Devices)
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::none()
@@ -1670,12 +1648,17 @@ impl RsRelayGuiApp {
                             }),
                     )
                     .show_inside(ui, |ui| {
-                        // Brand Block
-                        ui.horizontal(|ui| {
-                            ui.add_space(6.0);
-                            let (mark_rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-                            if ui.is_rect_visible(mark_rect) {
+                        {
+                            let (brand_row, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 32.0),
+                                Sense::hover(),
+                            );
+                            let cy = brand_row.center().y;
+                            let mark_rect = Rect::from_center_size(
+                                Pos2::new(brand_row.min.x + 20.0, cy),
+                                Vec2::splat(28.0),
+                            );
+                            if ui.is_rect_visible(brand_row) {
                                 let p = ui.painter();
                                 p.rect(
                                     mark_rect,
@@ -1689,55 +1672,50 @@ impl RsRelayGuiApp {
                                     IconKind::BrandWaveform,
                                     palette::ACCENT(),
                                 );
+                                paint_text_vcenter(
+                                    p,
+                                    Pos2::new(mark_rect.max.x + 10.0, cy - 7.5),
+                                    Align::Min,
+                                    "rsrelay",
+                                    FontId::new(15.0, FontFamily::Proportional),
+                                    palette::TEXT_PRIMARY(),
+                                );
+                                paint_text_vcenter(
+                                    p,
+                                    Pos2::new(mark_rect.max.x + 10.0, cy + 8.0),
+                                    Align::Min,
+                                    concat!("v", env!("CARGO_PKG_VERSION")),
+                                    FontId::new(11.0, FontFamily::Monospace),
+                                    palette::TEXT_MUTED(),
+                                );
                             }
-                            ui.add_space(2.0);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                ui.label(
-                                    RichText::new("rsrelay")
-                                        .size(15.0)
-                                        .color(palette::TEXT_PRIMARY())
-                                        .strong(),
-                                );
-                                ui.label(
-                                    RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
-                                        .size(11.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_MUTED()),
-                                );
-                            });
-                        });
+                        }
 
                         ui.add_space(20.0);
 
-                        // Section 1: 工作模式 (Mode Navigation)
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(t.nav_section_mode)
-                                    .size(11.0)
-                                    .color(palette::TEXT_MUTED()),
+                        {
+                            let (sec_row, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 18.0),
+                                Sense::hover(),
                             );
-                        });
+                            paint_text_vcenter(
+                                ui.painter(),
+                                Pos2::new(sec_row.min.x + 8.0, sec_row.center().y),
+                                Align::Min,
+                                t.nav_section_mode,
+                                FontId::new(11.0, FontFamily::Proportional),
+                                palette::TEXT_MUTED(),
+                            );
+                        }
                         ui.add_space(4.0);
 
-                        let dual_live = self.active_sender.is_some()
-                            || self.active_receiver.is_some()
-                            || (self.demo_mode && self.active_tab == WorkspaceTab::DualConsole);
-                        let duplex_live = self.active_duplex.is_some()
-                            || (self.demo_mode && self.active_tab == WorkspaceTab::FullDuplex);
+                        let link_live = self.active_duplex.is_some() || self.demo_mode;
                         let nav_items = [
                             (
-                                WorkspaceTab::DualConsole,
-                                IconKind::SendReceive,
-                                t.tab_dual_console,
-                                dual_live,
-                            ),
-                            (
-                                WorkspaceTab::FullDuplex,
+                                WorkspaceTab::AudioLink,
                                 IconKind::Headset,
-                                t.tab_full_duplex,
-                                duplex_live,
+                                t.tab_audio_link,
+                                link_live,
                             ),
                             (
                                 WorkspaceTab::HardwareMatrix,
@@ -1750,7 +1728,7 @@ impl RsRelayGuiApp {
                         for (tab, icon, label, is_live) in nav_items {
                             let selected = self.active_tab == tab;
                             let (nav_rect, nav_resp) = ui.allocate_exact_size(
-                                Vec2::new(ui.available_width(), 34.0),
+                                Vec2::new(ui.available_width(), 35.0),
                                 Sense::click(),
                             );
                             if nav_resp.hovered() {
@@ -1761,6 +1739,7 @@ impl RsRelayGuiApp {
                             }
                             if ui.is_rect_visible(nav_rect) {
                                 let p = ui.painter();
+                                let cy = nav_rect.center().y;
                                 if selected {
                                     p.rect(
                                         nav_rect,
@@ -1781,20 +1760,20 @@ impl RsRelayGuiApp {
                                     palette::TEXT_SECONDARY()
                                 };
                                 let icon_rect = Rect::from_center_size(
-                                    Pos2::new(nav_rect.min.x + 18.0, nav_rect.center().y),
+                                    Pos2::new(nav_rect.min.x + 18.0, cy),
                                     Vec2::splat(16.0),
                                 );
                                 draw_vector_icon(p, icon_rect, icon, fg);
-                                p.text(
-                                    Pos2::new(nav_rect.min.x + 36.0, nav_rect.center().y),
-                                    egui::Align2::LEFT_CENTER,
+                                paint_text_vcenter(
+                                    p,
+                                    Pos2::new(nav_rect.min.x + 36.0, cy),
+                                    Align::Min,
                                     label,
                                     FontId::new(13.0, FontFamily::Proportional),
                                     fg,
                                 );
                                 if is_live {
-                                    let dot_pos =
-                                        Pos2::new(nav_rect.max.x - 13.0, nav_rect.center().y);
+                                    let dot_pos = Pos2::new(nav_rect.max.x - 13.0, cy);
                                     p.circle_filled(dot_pos, 6.0, palette::ACCENT_TINT());
                                     p.circle_filled(dot_pos, 3.0, palette::ACCENT());
                                 }
@@ -1804,48 +1783,55 @@ impl RsRelayGuiApp {
 
                         ui.add_space(22.0);
 
-                        // Section 2: 附近设备 (Nearby LAN Peers)
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(t.nav_section_nearby)
-                                    .size(11.0)
-                                    .color(palette::TEXT_MUTED()),
+                        // Nearby LAN Peers Header Row (`24px` deterministic height)
+                        {
+                            let (nearby_hdr, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 24.0),
+                                Sense::hover(),
                             );
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                let (ref_rect, ref_resp) =
-                                    ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+                            let cy = nearby_hdr.center().y;
+                            paint_text_vcenter(
+                                ui.painter(),
+                                Pos2::new(nearby_hdr.min.x + 8.0, cy),
+                                Align::Min,
+                                t.nav_section_nearby,
+                                FontId::new(11.0, FontFamily::Proportional),
+                                palette::TEXT_MUTED(),
+                            );
+                            let ref_rect = Rect::from_center_size(
+                                Pos2::new(nearby_hdr.max.x - 12.0, cy),
+                                Vec2::splat(24.0),
+                            );
+                            let ref_resp = ui.interact(
+                                ref_rect,
+                                ui.id().with("sidebar_scan_lan_btn"),
+                                Sense::click(),
+                            );
+                            if ref_resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if ui.is_rect_visible(ref_rect) {
+                                let p = ui.painter();
                                 if ref_resp.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if ui.is_rect_visible(ref_rect) {
-                                    let p = ui.painter();
-                                    if ref_resp.hovered() {
-                                        p.rect_filled(
-                                            ref_rect,
-                                            Rounding::same(6.0),
-                                            palette::BG_RAISED(),
-                                        );
-                                    }
-                                    let col = if self.scanning_lan.load(Ordering::Relaxed) {
-                                        palette::ACCENT()
-                                    } else if ref_resp.hovered() {
-                                        palette::TEXT_PRIMARY()
-                                    } else {
-                                        palette::TEXT_MUTED()
-                                    };
-                                    draw_vector_icon(
-                                        p,
-                                        ref_rect.shrink(5.0),
-                                        IconKind::Refresh,
-                                        col,
+                                    p.rect_filled(
+                                        ref_rect,
+                                        Rounding::same(6.0),
+                                        palette::BG_RAISED(),
                                     );
                                 }
-                                if ref_resp.on_hover_text(t.btn_scan_lan_hover).clicked() {
-                                    self.trigger_lan_scan();
-                                }
-                            });
-                        });
+                                let col = if self.scanning_lan.load(Ordering::Relaxed) {
+                                    palette::ACCENT()
+                                } else if ref_resp.hovered() {
+                                    palette::TEXT_PRIMARY()
+                                } else {
+                                    palette::TEXT_MUTED()
+                                };
+                                draw_vector_icon(p, ref_rect.shrink(5.0), IconKind::Refresh, col);
+                            }
+                            if ref_resp.on_hover_text(t.btn_scan_lan_hover).clicked() {
+                                self.trigger_lan_scan();
+                            }
+                        }
                         ui.add_space(4.0);
 
                         self.render_sidebar_peers(ui);
@@ -1861,38 +1847,20 @@ impl RsRelayGuiApp {
             .map(|g| g.clone())
             .unwrap_or_default();
 
-        let (current_target_ip, _) =
-            split_host_port(&self.target_addr_input, DEFAULT_AUDIO_UDP_PORT);
+        let current_ip = self.duplex_peer_ip_input.trim().to_string();
 
         if peers_snapshot.is_empty() {
-            // Render the active target endpoint as a clean peer card so the sidebar always looks structured
-            let peer_name = self.resolve_peer_name(&current_target_ip);
-            let _ = self.draw_sidebar_peer_row(
-                ui,
-                &peer_name,
-                &current_target_ip,
-                DEFAULT_AUDIO_UDP_PORT,
-                IconKind::Laptop,
-                true,
-            );
+            let (peer_name, peer_icon) = self.resolve_peer_name_and_icon(&current_ip);
+            if self.draw_sidebar_peer_row(ui, &peer_name, &current_ip, peer_icon, true) {
+                self.active_tab = WorkspaceTab::AudioLink;
+            }
             if let Some(lan_ip) = self.local_lan_ip {
                 let lan_str = lan_ip.to_string();
-                if lan_str != current_target_ip {
-                    let local_label = match self.lang {
-                        Language::Zh => "本机节点 (LAN)",
-                        Language::En => "This Machine (LAN)",
-                    };
-                    if self.draw_sidebar_peer_row(
-                        ui,
-                        local_label,
-                        &lan_str,
-                        DEFAULT_AUDIO_UDP_PORT,
-                        IconKind::Desktop,
-                        false,
-                    ) {
-                        self.target_addr_input = format!("{lan_str}:{DEFAULT_AUDIO_UDP_PORT}");
-                        self.duplex_peer_ip_input = lan_str;
-                        self.target_addr_manually_edited = true;
+                if lan_str != current_ip {
+                    let local_label = self.lang.texts().combo_local_lan;
+                    if self.draw_sidebar_peer_row(ui, local_label, &lan_str, IconKind::Desktop, false)
+                    {
+                        self.select_peer_ip(&lan_str, local_label);
                     }
                 }
             }
@@ -1902,10 +1870,7 @@ impl RsRelayGuiApp {
         for peer in &peers_snapshot {
             if let Some(ip) = peer.addresses.first() {
                 let ip_str = ip.to_string();
-                let addr_str = format!("{ip_str}:{}", peer.udp_port);
-                let is_selected = self.target_addr_input == addr_str
-                    || self.duplex_peer_ip_input == ip_str
-                    || current_target_ip == ip_str;
+                let is_selected = current_ip == ip_str;
                 let os_lower = peer.os.to_ascii_lowercase();
                 let icon = if os_lower.contains("mac") || os_lower.contains("darwin") {
                     IconKind::Laptop
@@ -1914,21 +1879,22 @@ impl RsRelayGuiApp {
                 } else {
                     IconKind::Desktop
                 };
-                if self.draw_sidebar_peer_row(
-                    ui,
-                    &peer.hostname,
-                    &ip_str,
-                    peer.udp_port,
-                    icon,
-                    is_selected,
-                ) {
-                    self.target_addr_input = addr_str.clone();
-                    self.duplex_peer_ip_input = ip_str;
-                    self.target_addr_manually_edited = true;
-                    self.last_status_msg =
-                        self.lang.status_selected_lan_peer(&peer.hostname, &addr_str);
+                if self.draw_sidebar_peer_row(ui, &peer.hostname, &ip_str, icon, is_selected) {
+                    self.select_peer_ip(&ip_str, &peer.hostname);
                 }
             }
+        }
+    }
+
+    fn select_peer_ip(&mut self, ip_str: &str, peer_name: &str) {
+        let addr_str = format!("{ip_str}:{}", self.duplex_downlink_port);
+        self.duplex_peer_ip_input = ip_str.to_string();
+        self.target_addr_input = addr_str.clone();
+        self.target_addr_manually_edited = true;
+        self.active_tab = WorkspaceTab::AudioLink;
+        self.last_status_msg = self.lang.status_selected_lan_peer(peer_name, &addr_str);
+        if self.active_duplex.is_some() {
+            self.restart_active_session();
         }
     }
 
@@ -1937,7 +1903,6 @@ impl RsRelayGuiApp {
         ui: &mut egui::Ui,
         name: &str,
         ip_str: &str,
-        _port: u16,
         icon: IconKind,
         is_current: bool,
     ) -> bool {
@@ -1951,11 +1916,7 @@ impl RsRelayGuiApp {
             if is_current {
                 p.rect_filled(rect, Rounding::same(8.0), palette::PEER_ACTIVE_BG());
             } else if resp.hovered() {
-                p.rect_filled(
-                    rect,
-                    Rounding::same(8.0),
-                    palette::SIDEBAR_HOVER_BG(),
-                );
+                p.rect_filled(rect, Rounding::same(8.0), palette::SIDEBAR_HOVER_BG());
             }
 
             let os_rect = Rect::from_center_size(
@@ -1965,16 +1926,24 @@ impl RsRelayGuiApp {
             p.rect_filled(os_rect, Rounding::same(7.0), palette::BG_RAISED());
             draw_vector_icon(p, os_rect.shrink(6.0), icon, palette::TEXT_SECONDARY());
 
-            p.text(
-                Pos2::new(rect.min.x + 46.0, rect.center().y - 7.5),
-                egui::Align2::LEFT_CENTER,
+            let text_clip = Rect::from_min_max(
+                Pos2::new(rect.min.x + 44.0, rect.min.y + 2.0),
+                Pos2::new(rect.max.x - 22.0, rect.max.y - 2.0),
+            );
+            let tp = p.with_clip_rect(text_clip);
+            let cy = rect.center().y;
+            paint_text_vcenter(
+                &tp,
+                Pos2::new(rect.min.x + 46.0, cy - 8.0),
+                Align::Min,
                 name,
                 FontId::new(12.5, FontFamily::Proportional),
                 palette::TEXT_PRIMARY(),
             );
-            p.text(
-                Pos2::new(rect.min.x + 46.0, rect.center().y + 8.5),
-                egui::Align2::LEFT_CENTER,
+            paint_text_vcenter(
+                &tp,
+                Pos2::new(rect.min.x + 46.0, cy + 8.0),
+                Align::Min,
                 ip_str,
                 FontId::new(11.0, FontFamily::Monospace),
                 palette::TEXT_MUTED(),
@@ -1997,1590 +1966,1642 @@ impl RsRelayGuiApp {
     }
 
     // =========================================================================
-    // Frame C: 收发 (`DualConsole` Tab)
+    // Tab 1: Unified Visual Audio Link (`音频连接`)
     // =========================================================================
 
-    fn render_dual_console_tab(&mut self, ui: &mut egui::Ui) {
+    fn render_audio_link_tab(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang;
         let t = lang.texts();
+        let link_running = self.active_duplex.is_some() || self.demo_mode;
+        let st_opt = self.active_duplex.as_ref().map(|d| d.status());
 
-        // Top Page Header (`.top`)
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 3.0;
-                ui.label(
-                    RichText::new(t.page_c_title)
-                        .size(20.0)
-                        .color(palette::TEXT_PRIMARY())
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(t.page_c_subtitle)
-                        .size(13.0)
-                        .color(palette::TEXT_SECONDARY()),
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(Align::Max), |ui| {
-                if ghost_stop_all_button(ui, t.btn_stop_all) {
-                    self.stop_all_streams();
-                }
-            });
-        });
-
-        ui.add_space(18.0);
-
-        ui.columns(2, |columns| {
-            // =================================================================
-            // LEFT CARD: 发送 (Transmitter)
-            // =================================================================
-            let tx_running = self.active_sender.is_some() || self.demo_mode;
-            theme::studio_card_frame(tx_running, palette::ACCENT()).show(&mut columns[0], |ui| {
-                // 1. Card Header (`.ch`)
-                egui::Frame::none()
-                    .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 18.0,
-                        bottom: 0.0,
-                    })
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            draw_card_icon_tile(ui, IconKind::ArrowUpRight);
-                            ui.label(
-                                RichText::new(t.tx_card_title)
-                                    .size(15.0)
-                                    .color(palette::TEXT_PRIMARY())
-                                    .strong(),
-                            );
-                            if tx_running {
-                                let elapsed = if self.demo_mode && self.active_sender.is_none() {
-                                    "00:42:18".to_string()
-                                } else {
-                                    format_elapsed_hms(self.tx_started_at)
-                                };
-                                status_chip(ui, t.status_sending, Some(&elapsed), true);
-                            } else {
-                                status_chip(ui, t.status_standby, None, false);
-                            }
-
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                if header_action_button(
-                                    ui,
-                                    t.btn_start_tx,
-                                    t.btn_stop_tx,
-                                    tx_running,
-                                ) {
-                                    self.toggle_sender();
-                                }
-                            });
-                        });
-                    });
-
-                // 2. Hero Address & Route Block (`.hero`)
-                let (tx_host, tx_port) =
-                    split_host_port(&self.target_addr_input, DEFAULT_AUDIO_UDP_PORT);
-                let peer_name = self.resolve_peer_name(&tx_host);
-                let source_label = match self.selected_source {
-                    CaptureSource::SystemLoopback => t.source_system_loopback,
-                    CaptureSource::Microphone => t.source_microphone,
-                    CaptureSource::SyntheticTone => t.source_synthetic_tone,
-                };
-                let tx_dev_label = self
-                    .active_sender
+        // Compute signal health summary for top header pill
+        let rtt_ms: Option<f32> = st_opt
+            .as_ref()
+            .and_then(|st| st.best_rtt_us().map(|us| (us as f32) / 1000.0))
+            .or_else(|| if self.demo_mode { Some(0.42) } else { None });
+        let total_lost: u64 = st_opt
+            .as_ref()
+            .map(|st| {
+                st.media_rx
                     .as_ref()
-                    .map(|s| s.status().device_name)
-                    .or_else(|| self.selected_tx_device.clone())
-                    .unwrap_or_else(|| t.device_system_default.to_string());
-                let codec_spec = match self.selected_profile {
-                    LatencyProfile::LosslessPcm => "PCM16 · 48 kHz · 5 ms",
-                    LatencyProfile::Stable => "Opus · 48 kHz · 10 ms",
-                    _ => "Opus · 48 kHz · 5 ms",
-                };
+                    .map(|r| r.net.packets_lost)
+                    .unwrap_or(0)
+                    + st.mic_rx.as_ref().map(|r| r.net.packets_lost).unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let signal_label = if !link_running {
+            t.signal_idle
+        } else if total_lost > 0 {
+            t.signal_loss
+        } else if rtt_ms.map(|m| m < 18.0).unwrap_or(true) {
+            t.signal_excellent
+        } else {
+            t.signal_good
+        };
 
-                egui::Frame::none()
-                    .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 22.0,
-                        bottom: 18.0,
-                    })
-                    .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 6.0;
-                            ui.label(
-                                RichText::new(format!("{} · {peer_name}", t.hero_send_to))
-                                    .size(11.5)
-                                    .color(palette::TEXT_MUTED()),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.label(
-                                    RichText::new(&tx_host)
-                                        .size(29.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(if tx_running {
-                                            palette::TEXT_PRIMARY()
-                                        } else {
-                                            palette::TEXT_SECONDARY()
-                                        }),
-                                );
-                                ui.label(
-                                    RichText::new(&tx_port)
-                                        .size(29.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_MUTED()),
-                                );
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                ui.label(
-                                    RichText::new(source_label)
-                                        .size(12.0)
-                                        .color(palette::TEXT_SECONDARY()),
-                                );
-                                ui.label(RichText::new("→").size(12.0).color(palette::TEXT_MUTED()));
-                                ui.label(
-                                    RichText::new(&tx_dev_label)
-                                        .size(12.0)
-                                        .color(palette::TEXT_SECONDARY()),
-                                );
-                                ui.label(RichText::new("·").size(12.0).color(palette::TEXT_MUTED()));
-                                ui.label(
-                                    RichText::new(codec_spec)
-                                        .size(12.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_SECONDARY()),
-                                );
-                            });
-                        });
-                    });
+        // 1. Top Page Header (`48px` deterministic row so left title & right controls share exact `cy`)
+        {
+            let (hdr_rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::hover());
+            let hdr_cy = hdr_rect.center().y;
+            if ui.is_rect_visible(hdr_rect) {
+                let p = ui.painter();
+                paint_text_vcenter(
+                    p,
+                    Pos2::new(hdr_rect.min.x, hdr_cy - 11.5),
+                    Align::Min,
+                    t.page_link_title,
+                    FontId::new(20.0, FontFamily::Proportional),
+                    palette::TEXT_PRIMARY(),
+                );
+                paint_text_vcenter(
+                    p,
+                    Pos2::new(hdr_rect.min.x, hdr_cy + 12.5),
+                    Align::Min,
+                    t.page_link_subtitle,
+                    FontId::new(13.0, FontFamily::Proportional),
+                    palette::TEXT_SECONDARY(),
+                );
+            }
 
-                // 3. Stereo Segmented VU Meter (`.meter`)
-                egui::Frame::none()
-                    .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 0.0,
-                        bottom: 16.0,
-                    })
-                    .show(ui, |ui| {
-                        draw_stereo_vu_meter(ui, &self.tx_vu_meter, tx_running, false);
-                    });
-
-                // 4. 3-Column Hairline Stats Row (`.stats`)
-                let bitrate_str = if self.selected_profile == LatencyProfile::LosslessPcm {
-                    "1,536".to_string()
+            let mut right_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(hdr_rect)
+                    .layout(egui::Layout::right_to_left(Align::Center)),
+            );
+            right_ui.spacing_mut().item_spacing.x = 10.0;
+            if header_action_button(&mut right_ui, t.btn_connect, t.btn_disconnect, link_running) {
+                if self.demo_mode && self.active_duplex.is_none() {
+                    self.demo_mode = false;
                 } else {
-                    format!("{}", self.opus_bitrate_kbps)
-                };
-                let (rtt_val, pkts_val) = if let Some(ref sender) = self.active_sender {
-                    let st = sender.status();
-                    let rtt = if st.control.connected {
-                        format!("{:.2}", (st.control.rtt_us as f64) / 1000.0)
-                    } else {
-                        "0.45".to_string()
-                    };
-                    (rtt, format_with_commas(st.net.packets_sent))
-                } else if self.demo_mode {
-                    ("0.45".to_string(), "863,848".to_string())
-                } else {
-                    ("—".to_string(), "0".to_string())
-                };
-
-                draw_stats_row_3(
-                    ui,
-                    [
-                        (t.stat_bitrate, &bitrate_str, "kbps"),
-                        (t.stat_rtt, &rtt_val, "ms"),
-                        (t.stat_packets_sent, &pkts_val, t.unit_packets),
-                    ],
-                    tx_running,
-                );
-
-                // 5. 20s Waveform Chart (`.chart`)
-                let pkt_rate = match self.selected_profile.default_frame_duration() {
-                    rsrelay_core::FrameDuration::Ms5 => "200 pkt/s · 节拍抖动 ±0.08 ms",
-                    _ => "100 pkt/s · 节拍抖动 ±0.10 ms",
-                };
-                draw_tx_waveform_chart(
-                    ui,
-                    t.chart_last_20s,
-                    pkt_rate,
-                    t.chart_tx_idle_hint,
-                    &self.tx_waveform_sparkline,
-                    tx_running,
-                );
-
-                // 6. Settings List (`.set`, 4 hairline rows)
-                let src_opts = vec![
-                    (
-                        CaptureSource::SystemLoopback,
-                        t.source_system_loopback.to_string(),
-                    ),
-                    (CaptureSource::Microphone, t.source_microphone.to_string()),
-                    (
-                        CaptureSource::SyntheticTone,
-                        t.source_synthetic_tone.to_string(),
-                    ),
-                ];
-                settings_row(ui, t.label_audio_source, true, |ui| {
-                    quiet_select_pill(
-                        ui,
-                        "c_source_combo",
-                        &mut self.selected_source,
-                        source_label,
-                        &src_opts,
-                    );
-
-                    if cfg!(target_os = "macos")
-                        && self.selected_source == CaptureSource::SystemLoopback
-                        && !self.sck_permission_granted
-                        && ui
-                            .button(
-                                RichText::new(t.btn_grant_perm)
-                                    .size(11.5)
-                                    .color(palette::STATUS_WARN()),
-                            )
-                            .on_hover_text(t.hover_grant_perm)
-                            .clicked()
-                    {
-                        let _ = macos_bundle::install_macos_app_bundle();
-                        self.sck_permission_granted = request_system_loopback_permission();
-                        self.last_status_msg = if self.sck_permission_granted {
-                            lang.status_sck_granted()
-                        } else {
-                            lang.status_sck_prompted()
-                        };
-                    }
-                });
-
-                let mut tx_dev_opts = vec![(None, t.device_system_default.to_string())];
-                for dev in &self.devices {
-                    let eligible = dev.is_input
-                        || (cfg!(target_os = "windows")
-                            && self.selected_source == CaptureSource::SystemLoopback
-                            && dev.is_output);
-                    if eligible {
-                        tx_dev_opts.push((Some(dev.name.clone()), dev.name.clone()));
-                    }
-                }
-                let current_tx_label = self
-                    .selected_tx_device
-                    .clone()
-                    .unwrap_or_else(|| t.device_system_default.to_string());
-                settings_row(ui, t.label_input_device, true, |ui| {
-                    if quiet_select_pill(
-                        ui,
-                        "c_tx_device_combo",
-                        &mut self.selected_tx_device,
-                        &current_tx_label,
-                        &tx_dev_opts,
-                    ) && self.active_sender.is_some()
-                    {
-                        self.active_sender = None;
-                        self.toggle_sender();
-                    }
-                });
-
-                let target_combo_opts = self.build_target_combo_options();
-                let mut combo_outcome = crate::widgets::ComboInputOutcome::default();
-                settings_row(ui, t.label_target_addr, true, |ui| {
-                    combo_outcome = quiet_mono_combo_pill(
-                        ui,
-                        "c_target_addr_input",
-                        &mut self.target_addr_input,
-                        &target_combo_opts,
-                        t.combo_scan_lan,
-                        t.combo_no_lan_peers,
-                    );
-                });
-                if combo_outcome.edited_manually {
-                    self.target_addr_manually_edited = true;
-                    let (host, _) =
-                        split_host_port(&self.target_addr_input, DEFAULT_AUDIO_UDP_PORT);
-                    if !host.is_empty() && host != "—" {
-                        self.duplex_peer_ip_input = host;
-                    }
-                }
-                if let Some(idx) = combo_outcome.selected_option_idx {
-                    self.target_addr_manually_edited = true;
-                    if let Some((addr_val, label, _)) = target_combo_opts.get(idx) {
-                        let (host, _) = split_host_port(addr_val, DEFAULT_AUDIO_UDP_PORT);
-                        self.duplex_peer_ip_input = host;
-                        let peer_name = label.split(" · ").next().unwrap_or(addr_val);
-                        self.last_status_msg =
-                            lang.status_selected_lan_peer(peer_name, addr_val);
-                    }
-                }
-                if combo_outcome.request_rescan {
-                    self.trigger_lan_scan();
-                }
-
-                settings_row(ui, t.label_quality_latency, false, |ui| {
-                    latency_profile_selector(ui, &mut self.selected_profile, lang);
-                });
-            });
-
-            // =================================================================
-            // RIGHT CARD: 接收 (Receiver)
-            // =================================================================
-            let rx_running = self.active_receiver.is_some();
-            let rx_source_addr = self
-                .active_receiver
-                .as_ref()
-                .and_then(|r| r.status().net.source_addr);
-            theme::studio_card_frame(rx_running, palette::ACCENT()).show(&mut columns[1], |ui| {
-                // 1. Card Header (`.ch`)
-                egui::Frame::none()
-                    .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 18.0,
-                        bottom: 0.0,
-                    })
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            draw_card_icon_tile(ui, IconKind::ArrowDownLeft);
-                            ui.label(
-                                RichText::new(t.rx_card_title)
-                                    .size(15.0)
-                                    .color(palette::TEXT_PRIMARY())
-                                    .strong(),
-                            );
-                            if rx_running {
-                                let elapsed = format_elapsed_hms(self.rx_started_at);
-                                status_chip(ui, t.status_receiving, Some(&elapsed), true);
-                            } else {
-                                status_chip(ui, t.status_standby, None, false);
-                            }
-
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                if header_action_button(
-                                    ui,
-                                    t.btn_start_rx,
-                                    t.btn_stop_rx,
-                                    rx_running,
-                                ) {
-                                    self.toggle_receiver();
-                                }
-                            });
-                        });
-                    });
-
-                // 2. Hero Block (`.hero`)
-                let (rx_host, rx_port) =
-                    split_host_port(&self.bind_addr_input, DEFAULT_AUDIO_UDP_PORT);
-                let rx_dev_label = self
-                    .active_receiver
-                    .as_ref()
-                    .map(|r| r.status().device_name)
-                    .or_else(|| self.selected_rx_device.clone())
-                    .unwrap_or_else(|| t.device_default_speaker.to_string());
-
-                let (hero_caption, hero_caption_active, hero_host, hero_port) =
-                    if let Some(src_addr) = rx_source_addr {
-                        let src_ip_str = src_addr.ip().to_string();
-                        let src_peer_name = self.resolve_peer_name(&src_ip_str);
-                        (
-                            format!(
-                                "{} · {src_peer_name} ({rx_host}{rx_port})",
-                                t.hero_receiving_from
-                            ),
-                            true,
-                            src_ip_str,
-                            format!(":{}", src_addr.port()),
-                        )
-                    } else if rx_running {
-                        (
-                            t.hero_listen_waiting.to_string(),
-                            false,
-                            rx_host.clone(),
-                            rx_port.clone(),
-                        )
-                    } else {
-                        (
-                            t.hero_listen_any.to_string(),
-                            false,
-                            rx_host.clone(),
-                            rx_port.clone(),
-                        )
-                    };
-
-                egui::Frame::none()
-                    .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 22.0,
-                        bottom: 18.0,
-                    })
-                    .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 6.0;
-                            ui.label(
-                                RichText::new(&hero_caption)
-                                    .size(11.5)
-                                    .color(if hero_caption_active {
-                                        palette::ACCENT()
-                                    } else {
-                                        palette::TEXT_MUTED()
-                                    }),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.label(
-                                    RichText::new(&hero_host)
-                                        .size(29.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(if rx_running {
-                                            palette::TEXT_PRIMARY()
-                                        } else {
-                                            palette::TEXT_SECONDARY()
-                                        }),
-                                );
-                                ui.label(
-                                    RichText::new(&hero_port)
-                                        .size(29.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_MUTED()),
-                                );
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                ui.label(
-                                    RichText::new(t.route_adaptive_jb)
-                                        .size(12.0)
-                                        .color(palette::TEXT_SECONDARY()),
-                                );
-                                ui.label(RichText::new("→").size(12.0).color(palette::TEXT_MUTED()));
-                                ui.label(
-                                    RichText::new(&rx_dev_label)
-                                        .size(12.0)
-                                        .color(palette::TEXT_SECONDARY()),
-                                );
-                                ui.label(RichText::new("·").size(12.0).color(palette::TEXT_MUTED()));
-                                ui.label(
-                                    RichText::new(format!("48 kHz · {}", t.channel_stereo))
-                                        .size(12.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_SECONDARY()),
-                                );
-                            });
-                        });
-                    });
-
-                // 3. Stereo Segmented VU Meter (`.meter`)
-                egui::Frame::none()
-                    .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 0.0,
-                        bottom: 16.0,
-                    })
-                    .show(ui, |ui| {
-                        draw_stereo_vu_meter(ui, &self.rx_vu_meter, rx_running, false);
-                    });
-
-                // 4. 3-Column Hairline Stats Row (`.stats`)
-                let (buf_val, asrc_val, lost_val, repaired_unit) =
-                    if let Some(ref receiver) = self.active_receiver {
-                        let st = receiver.status();
-                        let repaired = st.net.fec_recovered + st.net.plc_frames;
-                        (
-                            format!("{:.1}", st.net.buffer_level_ms),
-                            format!("{:.5}", st.net.resample_ratio),
-                            format!("{}", st.net.packets_lost),
-                            format!("/ {repaired}"),
-                        )
-                    } else {
-                        (
-                            "—".to_string(),
-                            "1.00000".to_string(),
-                            "0".to_string(),
-                            "/ 0".to_string(),
-                        )
-                    };
-                let buf_unit = format!("/ {} ms", self.target_buffer_ms);
-
-                draw_stats_row_3(
-                    ui,
-                    [
-                        (t.stat_buffer_level, &buf_val, &buf_unit),
-                        (t.stat_clock_comp, &asrc_val, "×"),
-                        (t.stat_loss_repaired, &lost_val, &repaired_unit),
-                    ],
-                    rx_running,
-                );
-
-                // 5. Jitter Buffer Sparkline Chart (`.chart`)
-                let buf_summary = lang.format_buffer_summary(None, self.target_buffer_ms);
-                draw_sparkline(
-                    ui,
-                    t.chart_jitter_buffer,
-                    &buf_summary,
-                    t.chart_rx_idle_hint,
-                    &self.rx_buffer_sparkline,
-                    0.0,
-                    (self.target_buffer_ms as f32 * 2.0).max(36.0),
-                    Some(self.target_buffer_ms as f32),
-                    palette::ACCENT(),
-                );
-
-                // 6. Settings List (`.set`)
-                let (source_pill_text, source_pill_active) = if let Some(src_addr) = rx_source_addr {
-                    let src_ip_str = src_addr.ip().to_string();
-                    let src_peer_name = self.resolve_peer_name(&src_ip_str);
-                    (format!("{src_peer_name} · {src_addr}"), true)
-                } else {
-                    (t.source_waiting_any.to_string(), false)
-                };
-                let mut clicked_source_pill = false;
-                settings_row(ui, t.label_source_addr, true, |ui| {
-                    if quiet_source_addr_pill(
-                        ui,
-                        &source_pill_text,
-                        source_pill_active,
-                        Some(t.source_addr_hover),
-                    ) {
-                        clicked_source_pill = true;
-                    }
-                });
-                if clicked_source_pill {
-                    if let Some(src_addr) = rx_source_addr {
-                        let src_ip = src_addr.ip().to_string();
-                        ui.ctx().copy_text(src_addr.to_string());
-                        let peer_name = self.resolve_peer_name(&src_ip);
-                        let target_str = format!("{src_ip}:{DEFAULT_AUDIO_UDP_PORT}");
-                        self.target_addr_input = target_str.clone();
-                        self.duplex_peer_ip_input = src_ip;
-                        self.target_addr_manually_edited = true;
-                        self.last_status_msg =
-                            lang.status_selected_lan_peer(&peer_name, &target_str);
-                    }
-                }
-
-                let prev_bind = self.bind_addr_input.clone();
-                settings_row(ui, t.label_listen_port, true, |ui| {
-                    quiet_mono_input_pill(ui, "c_bind_addr_input", &mut self.bind_addr_input);
-                });
-                if self.bind_addr_input != prev_bind {
-                    self.sync_lan_advertiser();
-                }
-
-                let mut rx_dev_opts = vec![(None, t.device_default_speaker.to_string())];
-                for dev in &self.devices {
-                    if dev.is_output {
-                        rx_dev_opts.push((Some(dev.name.clone()), dev.name.clone()));
-                    }
-                }
-                let current_rx_label = self
-                    .selected_rx_device
-                    .clone()
-                    .unwrap_or_else(|| t.device_default_speaker.to_string());
-                settings_row(ui, t.label_output_device, true, |ui| {
-                    if quiet_select_pill(
-                        ui,
-                        "c_rx_device_combo",
-                        &mut self.selected_rx_device,
-                        &current_rx_label,
-                        &rx_dev_opts,
-                    ) && self.active_receiver.is_some()
-                    {
-                        self.active_receiver = None;
-                        self.toggle_receiver();
-                    }
-                });
-
-                let buf_fmt = format!("{} ms", self.target_buffer_ms);
-                settings_row(ui, t.label_target_buffer, true, |ui| {
-                    quiet_slider_u16(ui, &mut self.target_buffer_ms, 5..=80, &buf_fmt);
-                });
-
-                let gain_fmt = format_gain_db(self.volume);
-                settings_row(ui, t.label_output_gain, false, |ui| {
-                    if quiet_slider_f32(ui, &mut self.volume, 0.0..=2.0, &gain_fmt) {
-                        if let Some(ref rx) = self.active_receiver {
-                            rx.set_volume(self.volume);
-                        }
-                        if let Some(ref dpx) = self.active_duplex {
-                            dpx.set_rx_volume(self.volume);
-                        }
-                    }
-                });
-            });
-        });
-    }
-
-    // =========================================================================
-    // Frame C2: 双工耳麦 (`FullDuplex` Tab)
-    // =========================================================================
-
-    fn render_full_duplex_tab(&mut self, ui: &mut egui::Ui) {
-        let lang = self.lang;
-        let t = lang.texts();
-        let dpx_running = self.active_duplex.is_some() || self.demo_mode;
-
-        // Top Page Header (`.top`)
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 3.0;
-                ui.label(
-                    RichText::new(t.page_c2_title)
-                        .size(20.0)
-                        .color(palette::TEXT_PRIMARY())
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(t.page_c2_subtitle)
-                        .size(13.0)
-                        .color(palette::TEXT_SECONDARY()),
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(Align::Max), |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                if header_action_button(
-                    ui,
-                    t.btn_start_duplex,
-                    t.btn_stop_duplex,
-                    dpx_running,
-                ) {
                     self.toggle_duplex();
                 }
-                if dpx_running {
-                    let elapsed = if self.demo_mode && self.active_duplex.is_none() {
-                        "00:12:05".to_string()
-                    } else {
-                        format_elapsed_hms(self.duplex_started_at)
-                    };
-                    status_chip(ui, t.status_in_call, Some(&elapsed), true);
+            }
+            if link_running {
+                let elapsed = if self.demo_mode && self.active_duplex.is_none() {
+                    "00:12:05".to_string()
                 } else {
-                    status_chip(ui, t.status_standby, None, false);
+                    format_elapsed_hms(self.duplex_started_at)
+                };
+                header_status_chip(&mut right_ui, t.status_connected, Some(&elapsed), true);
+            } else {
+                header_status_chip(&mut right_ui, t.status_standby, None, false);
+            }
+            if draw_signal_health_pill(
+                &mut right_ui,
+                link_running,
+                rtt_ms,
+                total_lost,
+                signal_label,
+                t.signal_hover,
+            ) {
+                self.show_advanced_drawer = !self.show_advanced_drawer;
+            }
+        }
+
+        ui.add_space(14.0);
+
+        // 2. 4-Column Scene Quick-Preset Strip (1-Click Unified Role & One-Way/Duplex Selection)
+        let active_preset =
+            ScenePreset::from_bus_modes(self.duplex_media_mode, self.duplex_mic_mode);
+        let presets = [
+            (
+                ScenePreset::Headset,
+                "preset_headset",
+                IconKind::Headset,
+                t.preset_headset_title,
+                t.preset_headset_desc,
+            ),
+            (
+                ScenePreset::Host,
+                "preset_host",
+                IconKind::Desktop,
+                t.preset_host_title,
+                t.preset_host_desc,
+            ),
+            (
+                ScenePreset::SpeakerOnly,
+                "preset_speaker",
+                IconKind::SpeakerWave,
+                t.preset_speaker_title,
+                t.preset_speaker_desc,
+            ),
+            (
+                ScenePreset::MicOnly,
+                "preset_mic",
+                IconKind::Microphone,
+                t.preset_mic_title,
+                t.preset_mic_desc,
+            ),
+        ];
+
+        let mut chosen_preset = None;
+        ui.columns(4, |cols| {
+            for (idx, &(preset, id_salt, icon, title, desc)) in presets.iter().enumerate() {
+                if scene_preset_card(
+                    &mut cols[idx],
+                    id_salt,
+                    icon,
+                    title,
+                    desc,
+                    active_preset == Some(preset),
+                ) {
+                    chosen_preset = Some(preset);
                 }
-            });
+            }
         });
+        if let Some(p) = chosen_preset {
+            self.apply_scene_preset(p);
+        }
 
-        ui.add_space(18.0);
+        ui.add_space(14.0);
 
-        // Top Connection Bar Card (`section.card.conn`)
-        let peer_name = self.resolve_peer_name(&self.duplex_peer_ip_input);
-        let st_opt = self.active_duplex.as_ref().map(|d| d.status());
-        let rtt_str = st_opt
-            .as_ref()
-            .and_then(|st| {
-                st.best_rtt_us()
-                    .map(|us| format!("{:.2}", (us as f64) / 1000.0))
-            })
-            .unwrap_or_else(|| {
-                if self.demo_mode {
-                    "0.42".to_string()
-                } else {
-                    "—".to_string()
+        // 3. Hero Interactive Visual Dual-Node Signal Topology Card
+        self.render_visual_topology_card(ui, link_running, st_opt.as_ref());
+
+        ui.add_space(14.0);
+
+        // 4. Compact Bottom Bar (`30px` deterministic inner rect so label, segments & drawer button share exact `cy`)
+        let prev_profile = self.selected_profile;
+        egui::Frame::none()
+            .fill(palette::BG_PANEL())
+            .stroke(Stroke::new(1.0_f32, palette::LINE()))
+            .rounding(Rounding::same(metrics::RADIUS_CARD))
+            .inner_margin(egui::Margin::symmetric(20.0, 11.0))
+            .show(ui, |ui| {
+                let (bar_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+                let bar_cy = bar_rect.center().y;
+                let lbl_font = FontId::new(12.5, FontFamily::Proportional);
+                let lbl_w = ui
+                    .painter()
+                    .layout_no_wrap(
+                        t.label_quality_latency.to_string(),
+                        lbl_font.clone(),
+                        palette::TEXT_SECONDARY(),
+                    )
+                    .size()
+                    .x;
+                paint_text_vcenter(
+                    ui.painter(),
+                    Pos2::new(bar_rect.min.x, bar_cy),
+                    Align::Min,
+                    t.label_quality_latency,
+                    lbl_font,
+                    palette::TEXT_SECONDARY(),
+                );
+
+                let seg_area = Rect::from_min_max(
+                    Pos2::new(bar_rect.min.x + lbl_w + 14.0, bar_rect.min.y),
+                    bar_rect.max,
+                );
+                let mut left_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(seg_area)
+                        .layout(egui::Layout::left_to_right(Align::Center)),
+                );
+                latency_profile_selector(&mut left_ui, &mut self.selected_profile, lang);
+
+                let mut right_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(bar_rect)
+                        .layout(egui::Layout::right_to_left(Align::Center)),
+                );
+                right_ui.spacing_mut().item_spacing.x = 12.0;
+                if drawer_toggle_button(
+                    &mut right_ui,
+                    self.show_advanced_drawer,
+                    t.btn_drawer_open,
+                    t.btn_drawer_close,
+                ) {
+                    self.show_advanced_drawer = !self.show_advanced_drawer;
+                }
+
+                if !self.show_advanced_drawer && !self.last_status_msg.is_empty() {
+                    let is_err = self.last_status_msg.contains("失败")
+                        || self.last_status_msg.contains("无效")
+                        || self.last_status_msg.contains("请至少")
+                        || self.last_status_msg.contains("Failed")
+                        || self.last_status_msg.contains("Invalid")
+                        || self.last_status_msg.contains("Enable at least");
+                    if is_err {
+                        let err_g = right_ui.painter().layout_no_wrap(
+                            self.last_status_msg.clone(),
+                            FontId::new(11.5, FontFamily::Proportional),
+                            palette::STATUS_DANGER(),
+                        );
+                        let (err_rect, _) = right_ui
+                            .allocate_exact_size(Vec2::new(err_g.size().x, 30.0), Sense::hover());
+                        crate::widgets::paint_galley_vcenter(
+                            right_ui.painter(),
+                            err_rect.min.x,
+                            bar_cy,
+                            err_g,
+                            palette::STATUS_DANGER(),
+                        );
+                    }
                 }
             });
-        let codec_badge = match self.selected_profile {
-            LatencyProfile::LosslessPcm => "PCM16",
-            LatencyProfile::UltraLow => "Opus",
-            LatencyProfile::Balanced | LatencyProfile::Stable => "Opus · FEC",
-        };
+
+        if self.selected_profile != prev_profile && self.active_duplex.is_some() {
+            self.restart_active_session();
+        }
+
+        // 5. Collapsible Pro Telemetry & Advanced Settings Drawer
+        let drawer_anim = ui.ctx().animate_bool_with_time(
+            ui.id().with("pro_telemetry_drawer_anim"),
+            self.show_advanced_drawer,
+            0.16,
+        );
+        if drawer_anim > 0.01 {
+            ui.add_space(14.0 * drawer_anim);
+            if self.show_advanced_drawer {
+                self.render_advanced_telemetry_drawer(ui, link_running, st_opt.as_ref());
+            }
+        }
+    }
+
+    fn render_visual_topology_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        link_running: bool,
+        st_opt: Option<&rsrelay_core::DuplexSessionStatus>,
+    ) {
+        let lang = self.lang;
+        let t = lang.texts();
+        let time_secs = ui.ctx().input(|i| i.time);
+
+        let mut restart_requested = false;
+        let mut install_vmic_requested = false;
 
         egui::Frame::none()
             .fill(palette::BG_PANEL())
             .stroke(Stroke::new(1.0_f32, palette::LINE()))
             .rounding(Rounding::same(metrics::RADIUS_CARD))
-            .inner_margin(egui::Margin::symmetric(22.0, 16.0))
+            .inner_margin(egui::Margin::symmetric(20.0, 18.0))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 16.0;
+                let avail_w = ui.available_width().max(640.0);
+                let total_h = 314.0;
+                let (topo_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(avail_w, total_h), Sense::hover());
 
-                    // 1. Peer Avatar (`40x40` + online dot) & Peer Info
-                    let (av_rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
-                    if ui.is_rect_visible(av_rect) {
-                        let p = ui.painter();
-                        p.rect_filled(av_rect, Rounding::same(11.0), palette::BG_RAISED());
-                        draw_vector_icon(
-                            p,
-                            av_rect.shrink(10.0),
-                            IconKind::Laptop,
-                            palette::TEXT_PRIMARY(),
-                        );
-                        let badge_pos = Pos2::new(av_rect.max.x - 2.0, av_rect.max.y - 2.0);
-                        p.circle_filled(badge_pos, 6.0, palette::BG_PANEL());
-                        p.circle_filled(
-                            badge_pos,
-                            4.0,
-                            if dpx_running {
-                                palette::ACCENT()
-                            } else {
-                                palette::DOT_OFFLINE()
-                            },
-                        );
+                let bridge_w = (topo_rect.width() * 0.25).clamp(166.0, 232.0);
+                let node_w = ((topo_rect.width() - bridge_w) * 0.5).max(200.0);
+
+                let left_x0 = topo_rect.min.x;
+                let left_x1 = left_x0 + node_w;
+                let bridge_x0 = left_x1;
+                let bridge_x1 = bridge_x0 + bridge_w;
+                let right_x0 = bridge_x1;
+                let right_x1 = topo_rect.max.x;
+
+                let header_y0 = topo_rect.min.y;
+                let header_y1 = header_y0 + 46.0;
+                let slot1_y0 = header_y1 + 12.0;
+                let slot1_y1 = slot1_y0 + 120.0;
+                let slot2_y0 = slot1_y1 + 16.0;
+                let slot2_y1 = slot2_y0 + 120.0;
+
+                // =============================================================
+                // BAND 0: Node Headers (Local Machine | Bridge Status | Peer Picker)
+                // =============================================================
+                let local_hdr_rect =
+                    Rect::from_min_max(Pos2::new(left_x0, header_y0), Pos2::new(left_x1, header_y1));
+                let bridge_hdr_rect = Rect::from_min_max(
+                    Pos2::new(bridge_x0, header_y0),
+                    Pos2::new(bridge_x1, header_y1),
+                );
+                let peer_hdr_rect = Rect::from_min_max(
+                    Pos2::new(right_x0, header_y0),
+                    Pos2::new(right_x1, header_y1),
+                );
+
+                // 0A. Local Node Header
+                {
+                    let local_ip = self
+                        .local_lan_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "127.0.0.1".to_string());
+                    let p = ui.painter();
+                    p.rect(
+                        local_hdr_rect,
+                        Rounding::same(10.0),
+                        palette::BG_RAISED(),
+                        Stroke::new(1.0_f32, palette::LINE()),
+                    );
+                    let ic_rect = Rect::from_center_size(
+                        Pos2::new(local_hdr_rect.min.x + 24.0, local_hdr_rect.center().y),
+                        Vec2::splat(28.0),
+                    );
+                    p.rect_filled(ic_rect, Rounding::same(7.0), palette::BG_PANEL());
+                    let local_icon = if cfg!(target_os = "macos") {
+                        IconKind::Laptop
+                    } else {
+                        IconKind::Desktop
+                    };
+                    draw_vector_icon(p, ic_rect.shrink(6.0), local_icon, palette::TEXT_PRIMARY());
+
+                    let lcy = local_hdr_rect.center().y;
+                    paint_text_vcenter(
+                        p,
+                        Pos2::new(ic_rect.max.x + 10.0, lcy - 8.0),
+                        Align::Min,
+                        t.node_local_title,
+                        FontId::new(13.0, FontFamily::Proportional),
+                        palette::TEXT_PRIMARY(),
+                    );
+                    paint_text_vcenter(
+                        p,
+                        Pos2::new(ic_rect.max.x + 10.0, lcy + 8.5),
+                        Align::Min,
+                        &local_ip,
+                        FontId::new(11.0, FontFamily::Monospace),
+                        palette::TEXT_MUTED(),
+                    );
+
+                    let copy_rect = Rect::from_center_size(
+                        Pos2::new(local_hdr_rect.max.x - 22.0, local_hdr_rect.center().y),
+                        Vec2::splat(26.0),
+                    );
+                    let copy_resp =
+                        ui.interact(copy_rect, ui.id().with("topo_copy_local_ip"), Sense::click());
+                    if copy_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        ui.painter()
+                            .rect_filled(copy_rect, Rounding::same(6.0), palette::BG_HOVER());
+                    }
+                    draw_vector_icon(
+                        ui.painter(),
+                        copy_rect.shrink(6.0),
+                        IconKind::Copy,
+                        if copy_resp.hovered() {
+                            palette::TEXT_PRIMARY()
+                        } else {
+                            palette::TEXT_MUTED()
+                        },
+                    );
+                    if copy_resp.on_hover_text(t.lan_ip_hover).clicked() {
+                        ui.ctx().copy_text(local_ip);
+                        if let Some(ip) = self.local_lan_ip {
+                            self.last_status_msg = lang.status_copied_lan_ip(ip);
+                        }
+                    }
+                }
+
+                // 0B. Bridge Center Caption
+                {
+                    let p = ui.painter();
+                    let cap = if link_running {
+                        t.bridge_live_caption
+                    } else {
+                        t.bridge_standby_caption
+                    };
+                    paint_text_vcenter(
+                        p,
+                        bridge_hdr_rect.center(),
+                        Align::Center,
+                        cap,
+                        FontId::new(11.5, FontFamily::Proportional),
+                        if link_running {
+                            palette::ACCENT()
+                        } else {
+                            palette::TEXT_MUTED()
+                        },
+                    );
+                }
+
+                // 0C. Interactive Target Peer Header Card
+                {
+                    let live_src_ip = st_opt.and_then(|st| {
+                        st.media_rx
+                            .as_ref()
+                            .and_then(|r| r.net.source_addr)
+                            .or_else(|| st.mic_rx.as_ref().and_then(|r| r.net.source_addr))
+                            .map(|sa| sa.ip().to_string())
+                    });
+                    let display_ip = if (self.duplex_peer_ip_input.trim() == "127.0.0.1"
+                        || self.duplex_peer_ip_input.trim().is_empty())
+                        && live_src_ip.is_some()
+                    {
+                        live_src_ip.unwrap()
+                    } else {
+                        self.duplex_peer_ip_input.trim().to_string()
+                    };
+                    let (peer_name, peer_icon) = self.resolve_peer_name_and_icon(&display_ip);
+
+                    let peer_resp = ui.interact(
+                        peer_hdr_rect,
+                        ui.id().with("topo_peer_picker_card"),
+                        Sense::click(),
+                    );
+                    if peer_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let peer_popup_id = ui.make_persistent_id("topo_peer_picker_popup");
+                    if peer_resp.clicked() {
+                        ui.memory_mut(|mem| mem.toggle_popup(peer_popup_id));
                     }
 
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 3.0;
-                        ui.label(
-                            RichText::new(&peer_name)
-                                .size(14.0)
-                                .color(palette::TEXT_PRIMARY())
-                                .strong(),
-                        );
-                        let conn_sub = format!(
-                            "{} · ↓{} ↑{}",
-                            self.duplex_peer_ip_input,
-                            self.duplex_downlink_port,
-                            self.duplex_uplink_port
-                        );
-                        let sub_resp = ui.add(
-                            egui::Label::new(
-                                RichText::new(conn_sub)
+                    let p = ui.painter();
+                    let peer_bg = if peer_resp.hovered() {
+                        palette::BG_HOVER()
+                    } else {
+                        palette::BG_RAISED()
+                    };
+                    let peer_border = if link_running {
+                        palette::ACCENT().gamma_multiply(0.45)
+                    } else if peer_resp.hovered() {
+                        palette::LINE_STRONG()
+                    } else {
+                        palette::INSET_HIGHLIGHT()
+                    };
+                    p.rect(
+                        peer_hdr_rect,
+                        Rounding::same(10.0),
+                        peer_bg,
+                        Stroke::new(1.0_f32, peer_border),
+                    );
+
+                    let ic_rect = Rect::from_center_size(
+                        Pos2::new(peer_hdr_rect.min.x + 24.0, peer_hdr_rect.center().y),
+                        Vec2::splat(28.0),
+                    );
+                    p.rect_filled(ic_rect, Rounding::same(7.0), palette::BG_PANEL());
+                    draw_vector_icon(p, ic_rect.shrink(6.0), peer_icon, palette::TEXT_PRIMARY());
+
+                    // Online badge dot
+                    let badge_pos = Pos2::new(ic_rect.max.x - 1.5, ic_rect.max.y - 1.5);
+                    p.circle_filled(badge_pos, 4.8, peer_bg);
+                    p.circle_filled(
+                        badge_pos,
+                        3.2,
+                        if link_running {
+                            palette::ACCENT()
+                        } else {
+                            palette::DOT_OFFLINE()
+                        },
+                    );
+
+                    let cy = peer_hdr_rect.center().y;
+                    let text_clip = Rect::from_min_max(
+                        Pos2::new(ic_rect.max.x + 10.0, peer_hdr_rect.min.y + 2.0),
+                        Pos2::new(peer_hdr_rect.max.x - 28.0, peer_hdr_rect.max.y - 2.0),
+                    );
+                    let tp = p.with_clip_rect(text_clip);
+                    paint_text_vcenter(
+                        &tp,
+                        Pos2::new(ic_rect.max.x + 10.0, cy - 8.0),
+                        Align::Min,
+                        format!("{} · {peer_name}", t.node_peer_label),
+                        FontId::new(12.5, FontFamily::Proportional),
+                        palette::TEXT_PRIMARY(),
+                    );
+                    paint_text_vcenter(
+                        &tp,
+                        Pos2::new(ic_rect.max.x + 10.0, cy + 8.5),
+                        Align::Min,
+                        &display_ip,
+                        FontId::new(11.0, FontFamily::Monospace),
+                        palette::TEXT_MUTED(),
+                    );
+
+                    // Dropdown chevron (symmetric around `cy`)
+                    let cx = peer_hdr_rect.max.x - 16.0;
+                    let chev = Stroke::new(1.5_f32, palette::TEXT_SECONDARY());
+                    p.line_segment(
+                        [Pos2::new(cx - 3.8, cy - 1.75), Pos2::new(cx, cy + 1.75)],
+                        chev,
+                    );
+                    p.line_segment(
+                        [Pos2::new(cx, cy + 1.75), Pos2::new(cx + 3.8, cy - 1.75)],
+                        chev,
+                    );
+
+                    let _ = peer_resp.clone().on_hover_text(t.node_peer_click_hint);
+
+                    let combo_opts = self.build_target_combo_options();
+                    let mut picked_peer: Option<(String, String)> = None;
+                    let mut manual_ip_changed = false;
+                    let mut rescan_clicked = false;
+
+                    egui::popup_below_widget(
+                        ui,
+                        peer_popup_id,
+                        &peer_resp,
+                        egui::PopupCloseBehavior::CloseOnClickOutside,
+                        |ui| {
+                            ui.set_min_width(256.0);
+                            ui.label(
+                                RichText::new(t.label_target_addr)
                                     .size(11.5)
-                                    .family(FontFamily::Monospace)
                                     .color(palette::TEXT_MUTED()),
-                            )
-                            .sense(Sense::click()),
-                        );
-                        let ip_popup_id = ui.make_persistent_id("c2_peer_ip_popup");
-                        if sub_resp.clicked() {
-                            ui.memory_mut(|mem| mem.toggle_popup(ip_popup_id));
-                        }
-                        let c2_combo_opts = self.build_target_combo_options();
-                        let mut c2_selected_addr: Option<(String, String)> = None;
-                        let mut c2_edited_manually = false;
-                        let mut c2_rescan = false;
-                        egui::popup_below_widget(
-                            ui,
-                            ip_popup_id,
-                            &sub_resp,
-                            egui::PopupCloseBehavior::CloseOnClickOutside,
-                            |ui| {
-                                ui.set_min_width(240.0);
+                            );
+                            let prev_ip = self.duplex_peer_ip_input.clone();
+                            quiet_mono_input_pill(
+                                ui,
+                                "topo_peer_ip_edit",
+                                &mut self.duplex_peer_ip_input,
+                            );
+                            if self.duplex_peer_ip_input != prev_ip {
+                                manual_ip_changed = true;
+                            }
+                            ui.add_space(4.0);
+                            ui.separator();
+                            let any_remote = combo_opts.iter().any(|(_, _, r)| *r);
+                            if !any_remote {
                                 ui.label(
-                                    RichText::new(t.label_target_addr)
+                                    RichText::new(t.combo_no_lan_peers)
                                         .size(11.0)
                                         .color(palette::TEXT_MUTED()),
                                 );
-                                let prev_peer_ip = self.duplex_peer_ip_input.clone();
-                                quiet_mono_input_pill(
-                                    ui,
-                                    "c2_peer_ip_edit",
-                                    &mut self.duplex_peer_ip_input,
-                                );
-                                if self.duplex_peer_ip_input != prev_peer_ip {
-                                    c2_edited_manually = true;
-                                }
-                                ui.add_space(4.0);
                                 ui.separator();
-                                for (addr_val, display_label, _is_lan) in &c2_combo_opts {
-                                    let (host, _) =
-                                        split_host_port(addr_val, DEFAULT_AUDIO_UDP_PORT);
-                                    let selected = self.duplex_peer_ip_input.trim() == host;
-                                    if ui.selectable_label(selected, display_label).clicked() {
-                                        c2_selected_addr =
-                                            Some((addr_val.clone(), display_label.clone()));
-                                        ui.memory_mut(|mem| mem.close_popup());
-                                    }
-                                }
-                                ui.separator();
-                                if ui.selectable_label(false, t.combo_scan_lan).clicked() {
-                                    c2_rescan = true;
+                            }
+                            for (addr_val, display_lbl, is_remote) in &combo_opts {
+                                let (host, _) = split_host_port(addr_val, DEFAULT_AUDIO_UDP_PORT);
+                                let selected = self.duplex_peer_ip_input.trim() == host;
+                                let prefix = if *is_remote { "● " } else { "○ " };
+                                if ui
+                                    .selectable_label(
+                                        selected,
+                                        RichText::new(format!("{prefix}{display_lbl}"))
+                                            .size(12.0)
+                                            .color(if selected || *is_remote {
+                                                palette::ACCENT()
+                                            } else {
+                                                palette::TEXT_PRIMARY()
+                                            }),
+                                    )
+                                    .clicked()
+                                {
+                                    picked_peer = Some((host, display_lbl.clone()));
                                     ui.memory_mut(|mem| mem.close_popup());
                                 }
-                            },
-                        );
-                        if c2_edited_manually {
-                            self.target_addr_manually_edited = true;
-                            let host = self.duplex_peer_ip_input.trim();
-                            if !host.is_empty() {
-                                self.target_addr_input =
-                                    format!("{host}:{}", self.duplex_downlink_port);
                             }
-                        }
-                        if let Some((addr_val, label)) = c2_selected_addr {
-                            self.target_addr_manually_edited = true;
-                            let (host, _) = split_host_port(&addr_val, DEFAULT_AUDIO_UDP_PORT);
-                            self.duplex_peer_ip_input = host;
-                            self.target_addr_input = addr_val.clone();
-                            let peer_label = label.split(" · ").next().unwrap_or(&addr_val);
-                            self.last_status_msg =
-                                lang.status_selected_lan_peer(peer_label, &addr_val);
-                        }
-                        if c2_rescan {
-                            self.trigger_lan_scan();
-                        }
-                    });
-
-                    // Vertical Divider `.vr`
-                    let (vr1, _) = ui.allocate_exact_size(Vec2::new(8.0, 42.0), Sense::hover());
-                    ui.painter().line_segment(
-                        [
-                            Pos2::new(vr1.center().x, vr1.min.y),
-                            Pos2::new(vr1.center().x, vr1.max.y),
-                        ],
-                        Stroke::new(1.0_f32, palette::LINE()),
+                            ui.separator();
+                            if ui.selectable_label(false, t.combo_scan_lan).clicked() {
+                                rescan_clicked = true;
+                                ui.memory_mut(|mem| mem.close_popup());
+                            }
+                        },
                     );
 
-                    // 2. Round-Trip Latency (`往返延迟`)
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
-                        ui.label(
-                            RichText::new(t.stat_rtt)
-                                .size(11.5)
-                                .color(palette::TEXT_MUTED()),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 3.0;
-                            ui.label(
-                                RichText::new(&rtt_str)
-                                    .size(18.0)
-                                    .family(FontFamily::Monospace)
-                                    .color(palette::TEXT_PRIMARY()),
-                            );
-                            ui.label(
-                                RichText::new("ms")
-                                    .size(11.0)
-                                    .color(palette::TEXT_MUTED()),
-                            );
-                        });
-                    });
+                    if manual_ip_changed {
+                        self.target_addr_manually_edited = true;
+                        let h = self.duplex_peer_ip_input.trim();
+                        if !h.is_empty() {
+                            self.target_addr_input = format!("{h}:{}", self.duplex_downlink_port);
+                        }
+                    }
+                    if let Some((host, full_lbl)) = picked_peer {
+                        let short_name = full_lbl.split(" · ").next().unwrap_or(&host).to_string();
+                        self.select_peer_ip(&host, &short_name);
+                    }
+                    if rescan_clicked {
+                        self.trigger_lan_scan();
+                    }
+                }
 
-                    // Vertical Divider `.vr`
-                    let (vr2, _) = ui.allocate_exact_size(Vec2::new(8.0, 42.0), Sense::hover());
-                    ui.painter().line_segment(
-                        [
-                            Pos2::new(vr2.center().x, vr2.min.y),
-                            Pos2::new(vr2.center().x, vr2.max.y),
-                        ],
-                        Stroke::new(1.0_f32, palette::LINE()),
+                // =============================================================
+                // BAND 1: Upper Audio Bus (电脑声音: Speaker / Loopback `:49153`)
+                // =============================================================
+                let left_media_rect =
+                    Rect::from_min_max(Pos2::new(left_x0, slot1_y0), Pos2::new(left_x1, slot1_y1));
+                let bridge_media_rect = Rect::from_min_max(
+                    Pos2::new(bridge_x0, slot1_y0),
+                    Pos2::new(bridge_x1, slot1_y1),
+                );
+                let right_media_rect = Rect::from_min_max(
+                    Pos2::new(right_x0, slot1_y0),
+                    Pos2::new(right_x1, slot1_y1),
+                );
+
+                let media_mode = self.duplex_media_mode;
+                let media_enabled = media_mode != MediaBusMode::Off;
+                let media_live = link_running && media_enabled;
+
+                // 1A. Left Local Audio Port Box
+                {
+                    let border_c = if media_live && !self.speaker_muted {
+                        palette::ACCENT().gamma_multiply(0.35)
+                    } else {
+                        palette::LINE()
+                    };
+                    ui.painter().rect(
+                        left_media_rect,
+                        Rounding::same(11.0),
+                        palette::BG_RAISED(),
+                        Stroke::new(1.0_f32, border_c),
                     );
 
-                    // 3. Local Role (`本机角色`: 主机电脑 | 无线耳麦 | 双机互享)
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 5.0;
-                        ui.label(
-                            RichText::new(t.conn_local_role)
-                                .size(11.5)
-                                .color(palette::TEXT_MUTED()),
-                        );
-                        let roles = [
-                            (DuplexRole::Host, t.role_host_short),
-                            (DuplexRole::Headset, t.role_headset_short),
-                            (DuplexRole::Symmetric, t.role_symmetric_short),
-                        ];
-                        if segmented_control(ui, "c2_role_seg", &mut self.duplex_role, &roles) {
-                            let (m_mode, v_mode) = preset_bus_modes_for_role(self.duplex_role);
-                            self.duplex_media_mode = m_mode;
-                            self.duplex_mic_mode = v_mode;
-                            if self.active_duplex.is_some() {
-                                self.active_duplex = None;
-                                self.toggle_duplex();
+                    let inner = left_media_rect.shrink2(Vec2::new(13.0, 11.0));
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(inner)
+                            .layout(egui::Layout::top_down(Align::Min)),
+                    );
+                    child.spacing_mut().item_spacing.y = 7.0;
+
+                    child.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let mute_icon = if media_mode == MediaBusMode::SendLoopback {
+                            IconKind::SpeakerWave
+                        } else {
+                            IconKind::Headset
+                        };
+                        let mute_hint = if media_mode == MediaBusMode::SendLoopback {
+                            t.mute_loopback_hover
+                        } else {
+                            t.mute_speaker_hover
+                        };
+                        if draw_mute_icon_button(
+                            ui,
+                            "local_media_mute_btn",
+                            mute_icon,
+                            media_live,
+                            self.speaker_muted,
+                            mute_hint,
+                        ) {
+                            self.toggle_speaker_mute();
+                        }
+
+                        if media_mode == MediaBusMode::SendLoopback {
+                            let default_lpbk = t.c2_host_tx_default_loopback.to_string();
+                            let mut lpbk_opts = vec![(None, default_lpbk.clone())];
+                            for dev in &self.devices {
+                                let eligible = if cfg!(target_os = "windows") {
+                                    dev.is_output && !is_virtual_mic_output_sink_name(&dev.name)
+                                } else {
+                                    dev.is_input && !is_virtual_mic_input_device_name(&dev.name)
+                                };
+                                if eligible {
+                                    lpbk_opts.push((Some(dev.name.clone()), dev.name.clone()));
+                                }
+                            }
+                            let cur_lbl = self
+                                .duplex_media_tx_device
+                                .clone()
+                                .unwrap_or(default_lpbk);
+                            if flexible_select_pill(
+                                ui,
+                                "topo_media_tx_dev",
+                                &mut self.duplex_media_tx_device,
+                                &cur_lbl,
+                                &lpbk_opts,
+                            ) {
+                                restart_requested = true;
+                            }
+                        } else {
+                            let default_spk = t.device_default_speaker.to_string();
+                            let mut spk_opts = vec![(None, default_spk.clone())];
+                            for dev in &self.devices {
+                                if dev.is_output && !is_virtual_mic_output_sink_name(&dev.name) {
+                                    spk_opts.push((Some(dev.name.clone()), dev.name.clone()));
+                                }
+                            }
+                            let cur_lbl =
+                                self.duplex_media_rx_device.clone().unwrap_or(default_spk);
+                            if flexible_select_pill(
+                                ui,
+                                "topo_media_rx_dev",
+                                &mut self.duplex_media_rx_device,
+                                &cur_lbl,
+                                &spk_opts,
+                            ) {
+                                restart_requested = true;
                             }
                         }
                     });
 
-                    // 4. Quality & Latency (`音质与延迟`)
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 5.0;
-                        ui.label(
-                            RichText::new(t.label_quality_latency)
-                                .size(11.5)
-                                .color(palette::TEXT_MUTED()),
-                        );
-                        latency_profile_selector(ui, &mut self.selected_profile, lang);
-                    });
-
-                    // 5. Right-aligned Codec (`编码`)
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 5.0;
-                            ui.with_layout(egui::Layout::right_to_left(Align::Min), |ui| {
+                    // Middle control: Volume slider (when receiving) or macOS SCK permission / format badge
+                    if media_mode.receives() {
+                        if inline_volume_slider(
+                            &mut child,
+                            "topo_spk_vol",
+                            &mut self.volume,
+                            self.speaker_muted,
+                            t.status_muted,
+                        ) {
+                            if self.speaker_muted && self.volume > 0.02 {
+                                self.speaker_muted = false;
+                            }
+                            if let Some(ref dpx) = self.active_duplex {
+                                dpx.set_rx_volume(if self.speaker_muted {
+                                    0.0
+                                } else {
+                                    self.volume
+                                });
+                                dpx.set_mic_rx_gain(self.volume);
+                            }
+                        }
+                    } else if media_mode == MediaBusMode::SendLoopback {
+                        child.horizontal(|ui| {
+                            if cfg!(target_os = "macos") && !self.sck_permission_granted {
+                                if ui
+                                    .button(
+                                        RichText::new(format!("⚠ {}", t.btn_grant_perm))
+                                            .size(11.0)
+                                            .color(palette::STATUS_WARN()),
+                                    )
+                                    .on_hover_text(t.hover_grant_perm)
+                                    .clicked()
+                                {
+                                    let _ = macos_bundle::install_macos_app_bundle();
+                                    self.sck_permission_granted =
+                                        request_system_loopback_permission();
+                                    self.last_status_msg = if self.sck_permission_granted {
+                                        lang.status_sck_granted()
+                                    } else {
+                                        lang.status_sck_prompted()
+                                    };
+                                }
+                            } else {
+                                let spec = match self.selected_profile {
+                                    LatencyProfile::LosslessPcm => "PCM16 · 48 kHz · Stereo",
+                                    _ => "Opus · 48 kHz · Stereo",
+                                };
                                 ui.label(
-                                    RichText::new(t.conn_codec)
-                                        .size(11.5)
+                                    RichText::new(spec)
+                                        .size(11.0)
+                                        .family(FontFamily::Monospace)
                                         .color(palette::TEXT_MUTED()),
                                 );
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(Align::Min), |ui| {
-                                ui.label(
-                                    RichText::new(codec_badge)
-                                        .size(12.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(palette::TEXT_SECONDARY()),
-                                );
-                            });
+                            }
                         });
+                    } else {
+                        child.label(
+                            RichText::new(t.flow_off)
+                                .size(11.5)
+                                .color(palette::TEXT_MUTED()),
+                        );
+                    }
+
+                    // Bottom live stereo VU meter
+                    compact_stereo_vu_meter(
+                        &mut child,
+                        &self.duplex_rx_vu_meter,
+                        media_live,
+                        self.speaker_muted,
+                    );
+                }
+
+                // 1B. Center Animated Signal Conduit (电脑声音)
+                {
+                    let (media_dir, pill_lbl) = match media_mode {
+                        MediaBusMode::ReceiveSpeaker => {
+                            (ConduitDirection::RightToLeft, t.flow_media_recv)
+                        }
+                        MediaBusMode::SendLoopback => {
+                            (ConduitDirection::LeftToRight, t.flow_media_send)
+                        }
+                        MediaBusMode::Bidirectional => {
+                            (ConduitDirection::Bidirectional, t.flow_media_bi)
+                        }
+                        MediaBusMode::Off => (ConduitDirection::Off, t.flow_off),
+                    };
+                    let media_lvl = dbfs_to_norm(self.duplex_rx_vu_meter.smoothed_db);
+                    let pill_resp = draw_conduit_lane(
+                        ui,
+                        bridge_media_rect,
+                        "media_conduit",
+                        t.conduit_media_label,
+                        pill_lbl,
+                        media_dir,
+                        link_running,
+                        self.speaker_muted,
+                        media_lvl,
+                        time_secs,
+                        t.flow_pill_hover,
+                    );
+
+                    let popup_id = ui.make_persistent_id("media_conduit_flow_popup");
+                    if pill_resp.clicked() {
+                        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                    }
+                    let mut next_media_mode = None;
+                    egui::popup_below_widget(
+                        ui,
+                        popup_id,
+                        &pill_resp,
+                        egui::PopupCloseBehavior::CloseOnClick,
+                        |ui| {
+                            ui.set_min_width(156.0);
+                            let opts = [
+                                (MediaBusMode::ReceiveSpeaker, t.flow_media_recv),
+                                (MediaBusMode::SendLoopback, t.flow_media_send),
+                                (MediaBusMode::Bidirectional, t.flow_media_bi),
+                                (MediaBusMode::Off, t.flow_off),
+                            ];
+                            for (m_val, m_txt) in opts {
+                                let sel = self.duplex_media_mode == m_val;
+                                if ui
+                                    .selectable_label(
+                                        sel,
+                                        RichText::new(m_txt).size(12.5).color(if sel {
+                                            palette::ACCENT()
+                                        } else {
+                                            palette::TEXT_PRIMARY()
+                                        }),
+                                    )
+                                    .clicked()
+                                    && !sel
+                                {
+                                    next_media_mode = Some(m_val);
+                                }
+                            }
+                        },
+                    );
+                    if let Some(m_new) = next_media_mode {
+                        self.duplex_media_mode = m_new;
+                        self.sync_role_from_bus_modes();
+                        restart_requested = true;
+                    }
+                }
+
+                // 1C. Right Peer Mirror Card (对端声音节点)
+                {
+                    let (p_icon, p_title, p_desc) = match media_mode {
+                        MediaBusMode::ReceiveSpeaker => (
+                            IconKind::SpeakerWave,
+                            t.peer_media_recv_title,
+                            t.peer_media_recv_desc,
+                        ),
+                        MediaBusMode::SendLoopback => (
+                            IconKind::Headset,
+                            t.peer_media_send_title,
+                            t.peer_media_send_desc,
+                        ),
+                        MediaBusMode::Bidirectional => (
+                            IconKind::SendReceive,
+                            t.peer_media_bi_title,
+                            t.peer_media_bi_desc,
+                        ),
+                        MediaBusMode::Off => (
+                            IconKind::SpeakerDevice,
+                            t.peer_media_off_title,
+                            t.peer_media_off_desc,
+                        ),
+                    };
+                    let codec_tag = match self.selected_profile {
+                        LatencyProfile::LosslessPcm => "PCM16 · 48kHz",
+                        LatencyProfile::UltraLow => "Opus · 5ms",
+                        LatencyProfile::Balanced => "Opus · FEC",
+                        LatencyProfile::Stable => "Opus · 10ms",
+                    };
+                    Self::draw_peer_mirror_slot(
+                        ui,
+                        right_media_rect,
+                        p_icon,
+                        p_title,
+                        p_desc,
+                        if media_enabled { Some(codec_tag) } else { None },
+                        media_live && !self.speaker_muted,
+                        media_enabled,
+                    );
+                }
+
+                // =============================================================
+                // BAND 2: Lower Mic Bus (麦克风语音: Mic / Virtual Mic `:49155`)
+                // =============================================================
+                let left_mic_rect =
+                    Rect::from_min_max(Pos2::new(left_x0, slot2_y0), Pos2::new(left_x1, slot2_y1));
+                let bridge_mic_rect = Rect::from_min_max(
+                    Pos2::new(bridge_x0, slot2_y0),
+                    Pos2::new(bridge_x1, slot2_y1),
+                );
+                let right_mic_rect = Rect::from_min_max(
+                    Pos2::new(right_x0, slot2_y0),
+                    Pos2::new(right_x1, slot2_y1),
+                );
+
+                let mic_mode = self.duplex_mic_mode;
+                let mic_enabled = mic_mode != MicBusMode::Off;
+                let mic_live = link_running && mic_enabled;
+                let auto_vmic = select_default_virtual_mic_output_device();
+
+                // 2A. Left Local Mic / Virtual Mic Port Box
+                {
+                    let border_c = if mic_live && !self.duplex_mic_muted {
+                        palette::ACCENT().gamma_multiply(0.35)
+                    } else {
+                        palette::LINE()
+                    };
+                    ui.painter().rect(
+                        left_mic_rect,
+                        Rounding::same(11.0),
+                        palette::BG_RAISED(),
+                        Stroke::new(1.0_f32, border_c),
+                    );
+
+                    let inner = left_mic_rect.shrink2(Vec2::new(13.0, 11.0));
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(inner)
+                            .layout(egui::Layout::top_down(Align::Min)),
+                    );
+                    child.spacing_mut().item_spacing.y = 8.0;
+
+                    child.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if draw_mute_icon_button(
+                            ui,
+                            "local_mic_mute_btn",
+                            IconKind::Microphone,
+                            mic_live,
+                            self.duplex_mic_muted,
+                            t.mute_mic_hover,
+                        ) {
+                            self.toggle_mic_mute();
+                        }
+
+                        if mic_mode == MicBusMode::ReceiveVirtualMic {
+                            let default_vmic_lbl = if let Some(ref vname) = auto_vmic {
+                                format!("{} ({vname})", t.c2_host_rx_auto_vmic)
+                            } else {
+                                t.c2_vmic_guard_option.to_string()
+                            };
+                            let mut vmic_opts = vec![(None, default_vmic_lbl.clone())];
+                            for dev in &self.devices {
+                                if dev.is_output && is_virtual_mic_output_sink_name(&dev.name) {
+                                    vmic_opts.push((Some(dev.name.clone()), dev.name.clone()));
+                                }
+                            }
+                            let cur_vmic = self
+                                .duplex_mic_rx_device
+                                .clone()
+                                .unwrap_or(default_vmic_lbl);
+                            if flexible_select_pill(
+                                ui,
+                                "topo_mic_rx_dev",
+                                &mut self.duplex_mic_rx_device,
+                                &cur_vmic,
+                                &vmic_opts,
+                            ) {
+                                restart_requested = true;
+                            }
+                        } else {
+                            let default_mic = t.device_system_default.to_string();
+                            let mut mic_opts = vec![(None, default_mic.clone())];
+                            for dev in &self.devices {
+                                if dev.is_input && !is_virtual_mic_input_device_name(&dev.name) {
+                                    mic_opts.push((Some(dev.name.clone()), dev.name.clone()));
+                                }
+                            }
+                            let cur_mic =
+                                self.duplex_mic_tx_device.clone().unwrap_or(default_mic);
+                            if flexible_select_pill(
+                                ui,
+                                "topo_mic_tx_dev",
+                                &mut self.duplex_mic_tx_device,
+                                &cur_mic,
+                                &mic_opts,
+                            ) {
+                                restart_requested = true;
+                            }
+                        }
                     });
-                });
+
+                    // Bottom area: Draggable Gate VU meter (when sending mic) OR Virtual Mic status + meter (when receiving VMic)
+                    if mic_mode.sends() {
+                        if draw_interactive_gate_vu_meter(
+                            &mut child,
+                            "topo_mic_gate_vu",
+                            &self.duplex_tx_vu_meter,
+                            mic_live,
+                            self.duplex_mic_muted,
+                            &mut self.duplex_gate_db,
+                            t.c2_gate_marker_prefix,
+                            t.gate_drag_hover,
+                        ) {
+                            if let Some(ref dpx) = self.active_duplex {
+                                dpx.set_tx_noise_gate_db(Some(self.duplex_gate_db));
+                            }
+                        }
+                    } else if mic_mode == MicBusMode::ReceiveVirtualMic {
+                        let effective_vmic = self
+                            .duplex_mic_rx_device
+                            .clone()
+                            .or_else(|| auto_vmic.clone());
+                        let is_installing = self.installing_vmic_driver.load(Ordering::Relaxed);
+
+                        child.horizontal(|ui| {
+                            if let Some(ref sink_name) = effective_vmic {
+                                let app_mic = Self::app_recording_mic_name_for_sink(sink_name);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "✓ {}{}",
+                                        t.c2_vmic_ready_prefix, app_mic
+                                    ))
+                                    .size(11.0)
+                                    .color(palette::ACCENT()),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new(t.c2_vmic_missing_warn)
+                                        .size(10.5)
+                                        .color(palette::STATUS_WARN()),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    let btn_txt = if is_installing {
+                                        t.btn_installing_vmic
+                                    } else if cfg!(target_os = "macos") {
+                                        t.btn_install_macos_vmic
+                                    } else {
+                                        t.btn_install_win_vbcable
+                                    };
+                                    if ui
+                                        .add_enabled(
+                                            !is_installing,
+                                            egui::Button::new(
+                                                RichText::new(btn_txt)
+                                                    .size(11.0)
+                                                    .color(palette::TEXT_PRIMARY()),
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        install_vmic_requested = true;
+                                    }
+                                });
+                            }
+                        });
+
+                        compact_stereo_vu_meter(
+                            &mut child,
+                            &self.duplex_tx_vu_meter,
+                            mic_live,
+                            self.duplex_mic_muted,
+                        );
+                    } else {
+                        child.label(
+                            RichText::new(t.flow_off)
+                                .size(11.5)
+                                .color(palette::TEXT_MUTED()),
+                        );
+                        compact_stereo_vu_meter(&mut child, &self.duplex_tx_vu_meter, false, false);
+                    }
+                }
+
+                // 2B. Center Animated Signal Conduit (麦克风语音)
+                {
+                    let (mic_dir, pill_lbl) = match mic_mode {
+                        MicBusMode::SendMic => (ConduitDirection::LeftToRight, t.flow_mic_send),
+                        MicBusMode::ReceiveVirtualMic => {
+                            (ConduitDirection::RightToLeft, t.flow_mic_recv)
+                        }
+                        MicBusMode::Bidirectional => {
+                            (ConduitDirection::Bidirectional, t.flow_mic_bi)
+                        }
+                        MicBusMode::Off => (ConduitDirection::Off, t.flow_off),
+                    };
+                    // Only pulse bright beads when voice is above noise gate (when sending)
+                    let voice_above_gate = !mic_mode.sends()
+                        || self.duplex_tx_vu_meter.smoothed_db >= self.duplex_gate_db;
+                    let mic_lvl = if voice_above_gate {
+                        dbfs_to_norm(self.duplex_tx_vu_meter.smoothed_db)
+                    } else {
+                        0.0
+                    };
+                    let pill_resp = draw_conduit_lane(
+                        ui,
+                        bridge_mic_rect,
+                        "mic_conduit",
+                        t.conduit_mic_label,
+                        pill_lbl,
+                        mic_dir,
+                        link_running && voice_above_gate,
+                        self.duplex_mic_muted,
+                        mic_lvl,
+                        time_secs + 0.33,
+                        t.flow_pill_hover,
+                    );
+
+                    let popup_id = ui.make_persistent_id("mic_conduit_flow_popup");
+                    if pill_resp.clicked() {
+                        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                    }
+                    let mut next_mic_mode = None;
+                    egui::popup_below_widget(
+                        ui,
+                        popup_id,
+                        &pill_resp,
+                        egui::PopupCloseBehavior::CloseOnClick,
+                        |ui| {
+                            ui.set_min_width(156.0);
+                            let opts = [
+                                (MicBusMode::SendMic, t.flow_mic_send),
+                                (MicBusMode::ReceiveVirtualMic, t.flow_mic_recv),
+                                (MicBusMode::Bidirectional, t.flow_mic_bi),
+                                (MicBusMode::Off, t.flow_off),
+                            ];
+                            for (v_val, v_txt) in opts {
+                                let sel = self.duplex_mic_mode == v_val;
+                                if ui
+                                    .selectable_label(
+                                        sel,
+                                        RichText::new(v_txt).size(12.5).color(if sel {
+                                            palette::ACCENT()
+                                        } else {
+                                            palette::TEXT_PRIMARY()
+                                        }),
+                                    )
+                                    .clicked()
+                                    && !sel
+                                {
+                                    next_mic_mode = Some(v_val);
+                                }
+                            }
+                        },
+                    );
+                    if let Some(v_new) = next_mic_mode {
+                        self.duplex_mic_mode = v_new;
+                        self.sync_role_from_bus_modes();
+                        restart_requested = true;
+                    }
+                }
+
+                // 2C. Right Peer Mirror Card (对端麦克风节点)
+                {
+                    let (p_icon, p_title, p_desc) = match mic_mode {
+                        MicBusMode::SendMic => (
+                            IconKind::Microphone,
+                            t.peer_mic_send_title,
+                            t.peer_mic_send_desc,
+                        ),
+                        MicBusMode::ReceiveVirtualMic => (
+                            IconKind::Headset,
+                            t.peer_mic_recv_title,
+                            t.peer_mic_recv_desc,
+                        ),
+                        MicBusMode::Bidirectional => (
+                            IconKind::SendReceive,
+                            t.peer_mic_bi_title,
+                            t.peer_mic_bi_desc,
+                        ),
+                        MicBusMode::Off => (
+                            IconKind::Microphone,
+                            t.peer_mic_off_title,
+                            t.peer_mic_off_desc,
+                        ),
+                    };
+                    let mic_tag = if mic_mode.sends() {
+                        Some("Opus 64k · DTX")
+                    } else if mic_mode.receives() {
+                        Some("Zero-Echo VMic")
+                    } else {
+                        None
+                    };
+                    Self::draw_peer_mirror_slot(
+                        ui,
+                        right_mic_rect,
+                        p_icon,
+                        p_title,
+                        p_desc,
+                        mic_tag,
+                        mic_live && !self.duplex_mic_muted,
+                        mic_enabled,
+                    );
+                }
             });
 
-        ui.add_space(16.0);
+        if install_vmic_requested {
+            self.trigger_install_virtual_mic_driver();
+        }
+        if restart_requested && self.active_duplex.is_some() {
+            self.restart_active_session();
+        }
+    }
 
-        // Two-Column Orthogonal Bus Cards:
-        //   LEFT CARD  = 播放器共享通道 (`:49153` · SystemLoopback ⇄ Headphones/Speaker)
-        //   RIGHT CARD = 麦克风共享通道 (`:49155` · Physical Mic ⇄ Virtual Mic)
-        let target_buf_ms = self.selected_profile.default_target_buffer_ms();
-        let mut restart_duplex_requested = false;
-        let mut install_vmic_requested = false;
+    #[allow(clippy::too_many_arguments)]
+    fn draw_peer_mirror_slot(
+        ui: &mut egui::Ui,
+        rect: Rect,
+        icon: IconKind,
+        title: &str,
+        desc: &str,
+        mono_badge: Option<&str>,
+        is_live: bool,
+        is_enabled: bool,
+    ) {
+        let border_c = if is_live {
+            palette::ACCENT().gamma_multiply(0.35)
+        } else {
+            palette::LINE()
+        };
+        let p = ui.painter();
+        p.rect(
+            rect,
+            Rounding::same(11.0),
+            palette::BG_RAISED(),
+            Stroke::new(1.0_f32, border_c),
+        );
 
-        ui.columns(2, |columns| {
-            // =================================================================
-            // LEFT CARD: 播放器共享通道 (Media / Speaker Bus `:49153`)
-            // =================================================================
-            let media_mode = self.duplex_media_mode;
-            let media_active = dpx_running && media_mode != MediaBusMode::Off;
-            theme::studio_card_frame(media_active, palette::ACCENT()).show(&mut columns[0], |ui| {
-                let (media_title, media_base_sub, media_icon) = match media_mode {
-                    MediaBusMode::SendLoopback => (
-                        t.c2_host_tx_title,
-                        t.c2_host_tx_subtitle,
-                        IconKind::SpeakerDevice,
-                    ),
-                    MediaBusMode::ReceiveSpeaker => {
-                        (t.c2_listen_title, t.c2_listen_subtitle, IconKind::Headset)
-                    }
-                    MediaBusMode::Bidirectional => (
-                        t.c2_media_bi_title,
-                        t.c2_media_bi_subtitle,
-                        IconKind::Headset,
-                    ),
-                    MediaBusMode::Off => (
-                        t.c2_media_off_title,
-                        t.c2_media_off_subtitle,
-                        IconKind::SpeakerDevice,
-                    ),
-                };
+        let inner = rect.shrink2(Vec2::new(14.0, 12.0));
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(inner)
+                .layout(egui::Layout::top_down(Align::Min)),
+        );
+        child.spacing_mut().item_spacing.y = 8.0;
 
-                // 1. Card Header (`.ch`)
-                egui::Frame::none()
-                    .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 18.0,
-                        bottom: 0.0,
-                    })
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            draw_card_icon_tile(ui, media_icon);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 1.0;
-                                ui.label(
-                                    RichText::new(media_title)
-                                        .size(15.0)
-                                        .color(palette::TEXT_PRIMARY())
-                                        .strong(),
-                                );
-                                let media_sub = if let Some(src_addr) = st_opt
-                                    .as_ref()
-                                    .and_then(|st| st.media_rx.as_ref())
-                                    .and_then(|rx| rx.net.source_addr)
-                                {
-                                    let src_ip = src_addr.ip().to_string();
-                                    let src_peer = self.resolve_peer_name(&src_ip);
-                                    format!("{media_base_sub} · {src_peer}")
-                                } else {
-                                    media_base_sub.to_string()
-                                };
-                                ui.label(
-                                    RichText::new(media_sub)
-                                        .size(11.5)
-                                        .color(palette::TEXT_MUTED()),
-                                );
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                let chip_txt = if !media_active {
-                                    t.status_standby
-                                } else if media_mode == MediaBusMode::SendLoopback {
-                                    t.status_sending
-                                } else {
-                                    t.status_healthy
-                                };
-                                status_chip(ui, chip_txt, None, media_active);
-                            });
-                        });
-                    });
-
-                // 2. Stereo Meter (`.meter`)
-                egui::Frame::none()
-                    .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 20.0,
-                        bottom: 18.0,
-                    })
-                    .show(ui, |ui| {
-                        draw_stereo_vu_meter(ui, &self.duplex_rx_vu_meter, media_active, false);
-                    });
-
-                // 3. Stats Row (`.stats`)
-                let rx_stat_ref = st_opt
-                    .as_ref()
-                    .and_then(|st| st.media_rx.as_ref().or(st.mic_rx.as_ref()));
-                let (buf_val, asrc_val, lost_val, repaired_unit) = if let Some(rx_s) = rx_stat_ref {
-                    let repaired = rx_s.net.fec_recovered + rx_s.net.plc_frames;
-                    (
-                        format!("{:.1}", rx_s.net.buffer_level_ms),
-                        format!("{:.5}", rx_s.net.resample_ratio),
-                        format!("{}", rx_s.net.packets_lost),
-                        format!("/ {repaired}"),
-                    )
-                } else if let Some(tx_s) = st_opt.as_ref().and_then(|st| st.media_tx.as_ref()) {
-                    (
-                        "—".to_string(),
-                        "1.00000".to_string(),
-                        format!("{}", tx_s.net.packets_sent),
-                        t.unit_packets.to_string(),
-                    )
-                } else if self.demo_mode {
-                    (
-                        "15.2".to_string(),
-                        "1.00002".to_string(),
-                        "0".to_string(),
-                        "/ 12".to_string(),
-                    )
+        {
+            let (hdr_rect, _) = child.allocate_exact_size(
+                Vec2::new(child.available_width(), 32.0),
+                Sense::hover(),
+            );
+            let hcy = hdr_rect.center().y;
+            let ic_rect =
+                Rect::from_center_size(Pos2::new(hdr_rect.min.x + 16.0, hcy), Vec2::splat(32.0));
+            let p = child.painter();
+            p.rect_filled(
+                ic_rect,
+                Rounding::same(8.0),
+                if is_live {
+                    palette::ACCENT_TINT()
                 } else {
-                    (
-                        "—".to_string(),
-                        "1.00000".to_string(),
-                        "0".to_string(),
-                        "/ 0".to_string(),
-                    )
-                };
-                let target_buf_unit = format!("/ {target_buf_ms} ms");
+                    palette::BG_PANEL()
+                },
+            );
+            draw_vector_icon(
+                p,
+                ic_rect.shrink(7.5),
+                icon,
+                if is_live {
+                    palette::ACCENT()
+                } else if is_enabled {
+                    palette::TEXT_SECONDARY()
+                } else {
+                    palette::TEXT_MUTED()
+                },
+            );
+
+            paint_text_vcenter(
+                p,
+                Pos2::new(ic_rect.max.x + 10.0, hcy),
+                Align::Min,
+                title,
+                FontId::new(13.0, FontFamily::Proportional),
+                if is_enabled {
+                    palette::TEXT_PRIMARY()
+                } else {
+                    palette::TEXT_MUTED()
+                },
+            );
+
+            if let Some(badge) = mono_badge {
+                paint_text_vcenter(
+                    p,
+                    Pos2::new(hdr_rect.max.x, hcy),
+                    Align::Max,
+                    badge,
+                    FontId::new(10.5, FontFamily::Monospace),
+                    if is_live {
+                        palette::ACCENT()
+                    } else {
+                        palette::TEXT_MUTED()
+                    },
+                );
+            }
+        }
+
+        child.label(
+            RichText::new(desc).size(11.5).color(if is_enabled {
+                palette::TEXT_SECONDARY()
+            } else {
+                palette::TEXT_MUTED()
+            }),
+        );
+    }
+
+    fn render_advanced_telemetry_drawer(
+        &mut self,
+        ui: &mut egui::Ui,
+        link_running: bool,
+        st_opt: Option<&rsrelay_core::DuplexSessionStatus>,
+    ) {
+        let lang = self.lang;
+        let t = lang.texts();
+        let effective_buf_ms = if self.custom_buffer_enabled {
+            self.target_buffer_ms
+        } else {
+            self.selected_profile.default_target_buffer_ms()
+        };
+
+        let mut restart_requested = false;
+
+        ui.columns(2, |cols| {
+            // LEFT CARD: Real-time Jitter & Voice Waveforms + DSP Stats
+            theme::studio_card_frame(link_running, palette::ACCENT()).show(&mut cols[0], |ui| {
+                {
+                    let (ch_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 48.0),
+                        Sense::hover(),
+                    );
+                    if ui.is_rect_visible(ch_rect) {
+                        let p = ui.painter();
+                        let cy = ch_rect.center().y;
+                        paint_text_vcenter(
+                            p,
+                            Pos2::new(ch_rect.min.x + 20.0, cy),
+                            Align::Min,
+                            t.drawer_telemetry_title,
+                            FontId::new(14.0, FontFamily::Proportional),
+                            palette::TEXT_PRIMARY(),
+                        );
+                        if cfg!(target_os = "windows") && self.audiorelay_conflict_cached {
+                            paint_text_vcenter(
+                                p,
+                                Pos2::new(ch_rect.max.x - 20.0, cy),
+                                Align::Max,
+                                t.c2_vmic_audiorelay_hint,
+                                FontId::new(10.5, FontFamily::Proportional),
+                                palette::STATUS_WARN(),
+                            );
+                        }
+                    }
+                }
+
+                let rx_stat_ref =
+                    st_opt.and_then(|st| st.media_rx.as_ref().or(st.mic_rx.as_ref()));
+                let (buf_val, asrc_val, third_cap, third_val, third_unit) =
+                    if let Some(rx_s) = rx_stat_ref {
+                        let repaired = rx_s.net.fec_recovered + rx_s.net.plc_frames;
+                        (
+                            format!("{:.1}", rx_s.net.buffer_level_ms),
+                            format!("{:.5}", rx_s.net.resample_ratio),
+                            t.stat_loss_repaired,
+                            format!("{}", rx_s.net.packets_lost),
+                            format!("/ {repaired}"),
+                        )
+                    } else if let Some(tx_s) =
+                        st_opt.and_then(|st| st.mic_tx.as_ref().or(st.media_tx.as_ref()))
+                    {
+                        (
+                            "—".to_string(),
+                            "1.00000".to_string(),
+                            t.stat_gated_frames,
+                            format_with_commas(tx_s.net.gated_dtx_frames),
+                            "".to_string(),
+                        )
+                    } else if self.demo_mode {
+                        (
+                            "18.6".to_string(),
+                            "1.00001".to_string(),
+                            t.stat_loss_repaired,
+                            "0".to_string(),
+                            "/ 4".to_string(),
+                        )
+                    } else {
+                        (
+                            "—".to_string(),
+                            "1.00000".to_string(),
+                            t.stat_loss_repaired,
+                            "0".to_string(),
+                            "/ 0".to_string(),
+                        )
+                    };
+                let target_buf_unit = format!("/ {effective_buf_ms} ms");
 
                 draw_stats_row_3(
                     ui,
                     [
                         (t.stat_buffer_level, &buf_val, &target_buf_unit),
                         (t.stat_clock_comp, &asrc_val, "×"),
-                        (t.stat_loss_repaired, &lost_val, &repaired_unit),
+                        (third_cap, &third_val, &third_unit),
                     ],
-                    media_active,
+                    link_running,
                 );
 
-                // 4. Jitter Buffer Sparkline Chart (`.chart`)
+                let jb_summary = lang.format_buffer_summary(effective_buf_ms);
                 draw_sparkline(
                     ui,
                     t.c2_jb_chart_title,
-                    "±0.6 ms",
+                    &jb_summary,
                     t.chart_rx_idle_hint,
                     &self.duplex_buffer_sparkline,
                     0.0,
-                    (target_buf_ms as f32 * 2.0).max(30.0),
-                    Some(target_buf_ms as f32),
+                    (effective_buf_ms as f32 * 2.0).max(32.0),
+                    Some(effective_buf_ms as f32),
                     palette::ACCENT(),
                 );
 
-                // 5. Settings List (`.set`)
-                settings_row(ui, t.label_bus_direction, true, |ui| {
-                    let media_modes = [
-                        (MediaBusMode::Off, t.bus_off),
-                        (MediaBusMode::SendLoopback, t.media_mode_send),
-                        (MediaBusMode::ReceiveSpeaker, t.media_mode_recv),
-                        (MediaBusMode::Bidirectional, t.media_mode_bi),
-                    ];
-                    if segmented_control(
-                        ui,
-                        "c2_media_mode_seg",
-                        &mut self.duplex_media_mode,
-                        &media_modes,
-                    ) && self.active_duplex.is_some()
-                    {
-                        restart_duplex_requested = true;
-                    }
-                });
-
-                if self.duplex_media_mode.sends() {
-                    let default_lpbk = t.c2_host_tx_default_loopback.to_string();
-                    let mut lpbk_opts = vec![(None, default_lpbk.clone())];
-                    for dev in &self.devices {
-                        let eligible = if cfg!(target_os = "windows") {
-                            dev.is_output && !is_virtual_mic_output_sink_name(&dev.name)
-                        } else {
-                            dev.is_input && !is_virtual_mic_input_device_name(&dev.name)
-                        };
-                        if eligible {
-                            lpbk_opts.push((Some(dev.name.clone()), dev.name.clone()));
-                        }
-                    }
-                    let cur_lpbk = self
-                        .duplex_media_tx_device
-                        .clone()
-                        .unwrap_or(default_lpbk);
-                    settings_row(ui, t.c2_host_tx_device_label, true, |ui| {
-                        if quiet_select_pill(
-                            ui,
-                            "c2_media_tx_dev_combo",
-                            &mut self.duplex_media_tx_device,
-                            &cur_lpbk,
-                            &lpbk_opts,
-                        ) && self.active_duplex.is_some()
-                        {
-                            restart_duplex_requested = true;
-                        }
-                    });
-                }
-
-                if self.duplex_media_mode.receives() {
-                    let default_spk = t.device_default_speaker.to_string();
-                    let mut spk_opts = vec![(None, default_spk.clone())];
-                    for dev in &self.devices {
-                        if dev.is_output && !is_virtual_mic_output_sink_name(&dev.name) {
-                            spk_opts.push((Some(dev.name.clone()), dev.name.clone()));
-                        }
-                    }
-                    let cur_spk = self
-                        .duplex_media_rx_device
-                        .clone()
-                        .unwrap_or(default_spk);
-                    settings_row(ui, t.label_output_device, true, |ui| {
-                        if quiet_select_pill(
-                            ui,
-                            "c2_media_rx_dev_combo",
-                            &mut self.duplex_media_rx_device,
-                            &cur_spk,
-                            &spk_opts,
-                        ) && self.active_duplex.is_some()
-                        {
-                            restart_duplex_requested = true;
-                        }
-                    });
-                }
-
-                let gain_fmt = format_gain_db(self.volume);
-                settings_row(ui, t.label_output_gain, true, |ui| {
-                    if quiet_slider_f32(ui, &mut self.volume, 0.0..=2.0, &gain_fmt) {
-                        if let Some(ref rx) = self.active_receiver {
-                            rx.set_volume(self.volume);
-                        }
-                        if let Some(ref dpx) = self.active_duplex {
-                            dpx.set_rx_volume(self.volume);
-                            dpx.set_mic_rx_gain(self.volume);
-                        }
-                    }
-                });
-
-                settings_row(ui, t.label_channels, false, |ui| {
-                    let ch_opts = [
-                        (ChannelLayout::Stereo, t.channel_stereo),
-                        (ChannelLayout::Mono, t.channel_mono),
-                    ];
-                    if segmented_control(
-                        ui,
-                        "c2_channels_seg",
-                        &mut self.duplex_rx_channels,
-                        &ch_opts,
-                    ) && self.active_duplex.is_some()
-                    {
-                        restart_duplex_requested = true;
-                    }
-                });
-            });
-
-            // =================================================================
-            // RIGHT CARD: 麦克风共享通道 (Mic ⇄ Virtual Mic Bus `:49155`)
-            // =================================================================
-            let mic_mode = self.duplex_mic_mode;
-            let mic_active = dpx_running && mic_mode != MicBusMode::Off;
-            theme::studio_card_frame(mic_active, palette::ACCENT()).show(&mut columns[1], |ui| {
-                let (mic_title, mic_sub) = match mic_mode {
-                    MicBusMode::SendMic => (t.c2_mic_title, t.c2_mic_subtitle),
-                    MicBusMode::ReceiveVirtualMic => (t.c2_host_rx_title, t.c2_host_rx_subtitle),
-                    MicBusMode::Bidirectional => (t.c2_mic_bi_title, t.c2_mic_bi_subtitle),
-                    MicBusMode::Off => (t.c2_mic_off_title, t.c2_mic_off_subtitle),
-                };
-
-                // 1. Card Header (`.ch`)
-                egui::Frame::none()
-                    .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 18.0,
-                        bottom: 0.0,
-                    })
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            draw_card_icon_tile(ui, IconKind::Microphone);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 1.0;
-                                ui.label(
-                                    RichText::new(mic_title)
-                                        .size(15.0)
-                                        .color(palette::TEXT_PRIMARY())
-                                        .strong(),
-                                );
-                                let sub_str = if let Some(src_addr) = st_opt
-                                    .as_ref()
-                                    .and_then(|st| st.mic_rx.as_ref())
-                                    .and_then(|rx| rx.net.source_addr)
-                                {
-                                    let src_ip = src_addr.ip().to_string();
-                                    let src_peer = self.resolve_peer_name(&src_ip);
-                                    format!("{mic_sub} · {src_peer}")
-                                } else {
-                                    mic_sub.to_string()
-                                };
-                                ui.label(
-                                    RichText::new(sub_str)
-                                        .size(11.5)
-                                        .color(palette::TEXT_MUTED()),
-                                );
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                let chip_label = if !mic_active {
-                                    t.status_standby
-                                } else if mic_mode.sends() && self.duplex_mic_muted {
-                                    t.status_muted
-                                } else if mic_mode == MicBusMode::ReceiveVirtualMic {
-                                    t.status_receiving
-                                } else {
-                                    t.status_speaking
-                                };
-                                status_chip(
-                                    ui,
-                                    chip_label,
-                                    None,
-                                    mic_active && !(mic_mode == MicBusMode::SendMic && self.duplex_mic_muted),
-                                );
-                            });
-                        });
-                    });
-
-                // 2. Mono VU Meter with Noise Gate Marker (`.meter`)
-                egui::Frame::none()
-                    .inner_margin(egui::Margin {
-                        left: 20.0,
-                        right: 20.0,
-                        top: 18.0,
-                        bottom: 18.0,
-                    })
-                    .show(ui, |ui| {
-                        draw_mono_gate_vu_meter(
-                            ui,
-                            &self.duplex_tx_vu_meter,
-                            mic_active,
-                            mic_mode == MicBusMode::SendMic && self.duplex_mic_muted,
-                            self.duplex_gate_db,
-                            t.c2_gate_marker_prefix,
-                        );
-                    });
-
-                // 3. Stats Row (`.stats`)
-                let (lvl_val, gated_val, sent_val) = if let Some(ref st) = st_opt {
-                    let db_str = if (mic_mode == MicBusMode::SendMic && self.duplex_mic_muted)
-                        || self.duplex_tx_vu_meter.smoothed_db <= -59.5
-                    {
-                        "-∞".to_string()
-                    } else {
-                        format!("{:.1}", self.duplex_tx_vu_meter.smoothed_db)
-                    };
-                    let gated = st
-                        .mic_tx
-                        .as_ref()
-                        .map(|tx| tx.net.gated_dtx_frames)
-                        .unwrap_or(0);
-                    let pkts = st
-                        .mic_tx
-                        .as_ref()
-                        .map(|tx| tx.net.packets_sent)
-                        .or_else(|| st.mic_rx.as_ref().map(|rx| rx.net.packets_received))
-                        .unwrap_or(0);
-                    (db_str, format_with_commas(gated), format_with_commas(pkts))
-                } else if self.demo_mode {
-                    (
-                        "-14.2".to_string(),
-                        "18,420".to_string(),
-                        "142,910".to_string(),
-                    )
-                } else {
-                    ("—".to_string(), "0".to_string(), "0".to_string())
-                };
-
-                draw_stats_row_3(
-                    ui,
-                    [
-                        (t.stat_level, &lvl_val, "dB"),
-                        (t.stat_gated_frames, &gated_val, ""),
-                        (t.stat_packets_sent, &sent_val, t.unit_packets),
-                    ],
-                    mic_active,
-                );
-
-                // 4. Voice Envelope Sparkline Chart (`.chart`)
                 draw_sparkline(
                     ui,
                     t.c2_voice_chart_title,
-                    "Opus 64 kbps",
+                    &format!("{} kbps", self.opus_bitrate_kbps),
                     t.chart_tx_idle_hint,
                     &self.duplex_tx_envelope_sparkline,
                     -60.0,
                     0.0,
-                    Some(self.duplex_gate_db),
+                    if self.duplex_mic_mode.sends() {
+                        Some(self.duplex_gate_db)
+                    } else {
+                        None
+                    },
                     palette::ACCENT(),
                 );
+            });
 
-                // 4.5 Smart Virtual Mic Health & One-Click Driver Banner (when receiving into Virtual Mic)
-                let auto_vmic = select_default_virtual_mic_output_device();
-                let effective_vmic = self
-                    .duplex_mic_rx_device
-                    .clone()
-                    .or_else(|| auto_vmic.clone());
+            // RIGHT CARD: Advanced Network & Codec Settings
+            theme::studio_card_frame(false, palette::LINE()).show(&mut cols[1], |ui| {
+                {
+                    let (ch_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 48.0),
+                        Sense::hover(),
+                    );
+                    if ui.is_rect_visible(ch_rect) {
+                        paint_text_vcenter(
+                            ui.painter(),
+                            Pos2::new(ch_rect.min.x + 20.0, ch_rect.center().y),
+                            Align::Min,
+                            t.drawer_advanced_title,
+                            FontId::new(14.0, FontFamily::Proportional),
+                            palette::TEXT_PRIMARY(),
+                        );
+                    }
+                }
+                draw_hairline(ui);
 
-                if self.duplex_mic_mode.receives() {
-                    let is_installing = self.installing_vmic_driver.load(Ordering::Relaxed);
-                    egui::Frame::none()
-                        .fill(palette::BG_RAISED())
-                        .inner_margin(egui::Margin::symmetric(20.0, 10.0))
-                        .show(ui, |ui| {
-                            if let Some(ref sink_name) = effective_vmic {
-                                let app_mic_name = Self::app_recording_mic_name_for_sink(sink_name);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "✓ {}{}",
-                                            t.c2_vmic_ready_prefix, app_mic_name
-                                        ))
-                                        .size(11.5)
-                                        .color(palette::ACCENT()),
-                                    );
-                                });
-                                if cfg!(target_os = "windows")
-                                    && self.audiorelay_conflict_cached
-                                    && sink_name.to_ascii_lowercase().contains("audiorelay")
-                                {
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        RichText::new(t.c2_vmic_audiorelay_hint)
-                                            .size(11.0)
-                                            .color(palette::TEXT_MUTED()),
-                                    );
-                                }
-                            } else {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(t.c2_vmic_missing_warn)
-                                            .size(11.5)
-                                            .color(palette::STATUS_WARN()),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(Align::Center),
-                                        |ui| {
-                                            let btn_txt = if is_installing {
-                                                t.btn_installing_vmic
-                                            } else if cfg!(target_os = "macos") {
-                                                t.btn_install_macos_vmic
-                                            } else {
-                                                t.btn_install_win_vbcable
-                                            };
-                                            if ui
-                                                .add_enabled(
-                                                    !is_installing,
-                                                    egui::Button::new(
-                                                        RichText::new(btn_txt)
-                                                            .size(11.5)
-                                                            .color(palette::TEXT_PRIMARY()),
-                                                    ),
-                                                )
-                                                .clicked()
-                                            {
-                                                install_vmic_requested = true;
-                                            }
-                                        },
-                                    );
-                                });
-                            }
-                        });
-                    draw_hairline(ui);
+                let prev_m_port = self.media_port_input.clone();
+                settings_row(ui, t.label_media_port, true, |ui| {
+                    quiet_mono_input_pill(ui, "adv_media_port", &mut self.media_port_input);
+                });
+                if self.media_port_input != prev_m_port {
+                    if let Ok(p) = self.media_port_input.trim().parse::<u16>() {
+                        if p > 1024 {
+                            self.duplex_downlink_port = p;
+                            self.sync_lan_advertiser();
+                        }
+                    }
                 }
 
-                // 5. Settings List (`.set`)
-                settings_row(ui, t.label_bus_direction, true, |ui| {
-                    let mic_modes = [
-                        (MicBusMode::Off, t.bus_off),
-                        (MicBusMode::SendMic, t.mic_mode_send),
-                        (MicBusMode::ReceiveVirtualMic, t.mic_mode_recv),
-                        (MicBusMode::Bidirectional, t.mic_mode_bi),
-                    ];
-                    if segmented_control(
-                        ui,
-                        "c2_mic_mode_seg",
-                        &mut self.duplex_mic_mode,
-                        &mic_modes,
-                    ) && self.active_duplex.is_some()
-                    {
-                        restart_duplex_requested = true;
+                let prev_v_port = self.mic_port_input.clone();
+                settings_row(ui, t.label_mic_port, true, |ui| {
+                    quiet_mono_input_pill(ui, "adv_mic_port", &mut self.mic_port_input);
+                });
+                if self.mic_port_input != prev_v_port {
+                    if let Ok(p) = self.mic_port_input.trim().parse::<u16>() {
+                        if p > 1024 {
+                            self.duplex_uplink_port = p;
+                        }
+                    }
+                }
+
+                settings_row(ui, t.label_custom_buffer, true, |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if self.custom_buffer_enabled {
+                        let buf_fmt = format!("{} ms", self.target_buffer_ms);
+                        if quiet_slider_u16(ui, &mut self.target_buffer_ms, 5..=80, &buf_fmt) {
+                            restart_requested = true;
+                        }
+                    } else {
+                        let txt = format!(
+                            "{} ({} ms)",
+                            t.buffer_auto_profile,
+                            self.selected_profile.default_target_buffer_ms()
+                        );
+                        let g = ui.painter().layout_no_wrap(
+                            txt,
+                            FontId::new(12.0, FontFamily::Proportional),
+                            palette::TEXT_MUTED(),
+                        );
+                        let (lbl_r, _) =
+                            ui.allocate_exact_size(Vec2::new(g.size().x, 22.0), Sense::hover());
+                        crate::widgets::paint_galley_vcenter(
+                            ui.painter(),
+                            lbl_r.min.x,
+                            lbl_r.center().y,
+                            g,
+                            palette::TEXT_MUTED(),
+                        );
+                    }
+                    if pill_toggle(ui, &mut self.custom_buffer_enabled) {
+                        restart_requested = true;
                     }
                 });
 
-                if self.duplex_mic_mode.sends() {
-                    let default_mic = t.device_system_default.to_string();
-                    let mut mic_opts = vec![(None, default_mic.clone())];
-                    for dev in &self.devices {
-                        if dev.is_input && !is_virtual_mic_input_device_name(&dev.name) {
-                            mic_opts.push((Some(dev.name.clone()), dev.name.clone()));
-                        }
+                settings_row(ui, t.label_channels, true, |ui| {
+                    let ch_opts = [
+                        (ChannelLayout::Stereo, t.channel_stereo),
+                        (ChannelLayout::Mono, t.channel_mono),
+                    ];
+                    if segmented_control(ui, "adv_channels_seg", &mut self.duplex_rx_channels, &ch_opts)
+                    {
+                        restart_requested = true;
                     }
-                    let cur_mic = self.duplex_mic_tx_device.clone().unwrap_or(default_mic);
-                    settings_row(ui, t.label_microphone, true, |ui| {
-                        if quiet_select_pill(
-                            ui,
-                            "c2_mic_tx_dev_combo",
-                            &mut self.duplex_mic_tx_device,
-                            &cur_mic,
-                            &mic_opts,
-                        ) && self.active_duplex.is_some()
-                        {
-                            restart_duplex_requested = true;
-                        }
-                    });
-                }
+                });
 
-                if self.duplex_mic_mode.receives() {
-                    let default_vmic_lbl = if let Some(ref vname) = auto_vmic {
-                        format!("{} ({vname})", t.c2_host_rx_auto_vmic)
-                    } else {
-                        t.c2_vmic_guard_option.to_string()
-                    };
-                    let mut vmic_opts = vec![(None, default_vmic_lbl.clone())];
-                    for dev in &self.devices {
-                        if dev.is_output && is_virtual_mic_output_sink_name(&dev.name) {
-                            vmic_opts.push((Some(dev.name.clone()), dev.name.clone()));
-                        }
+                let br_fmt = format!("{} kbps", self.opus_bitrate_kbps);
+                settings_row(ui, t.label_opus_bitrate, true, |ui| {
+                    if quiet_slider_u16(ui, &mut self.opus_bitrate_kbps, 64..=256, &br_fmt) {
+                        restart_requested = true;
                     }
-                    let cur_vmic = self
-                        .duplex_mic_rx_device
-                        .clone()
-                        .unwrap_or(default_vmic_lbl);
-                    settings_row(
-                        ui,
-                        t.c2_host_rx_device_label,
-                        self.duplex_mic_mode.sends(),
-                        |ui| {
-                            if quiet_select_pill(
-                                ui,
-                                "c2_mic_rx_dev_combo",
-                                &mut self.duplex_mic_rx_device,
-                                &cur_vmic,
-                                &vmic_opts,
-                            ) && self.active_duplex.is_some()
-                            {
-                                restart_duplex_requested = true;
-                            }
-                        },
+                });
+
+                settings_row(ui, t.label_test_tone, true, |ui| {
+                    if pill_toggle(ui, &mut self.use_test_tone) {
+                        restart_requested = true;
+                    }
+                });
+
+                settings_row(ui, t.label_status_log, false, |ui| {
+                    let g = ui.painter().layout_no_wrap(
+                        self.last_status_msg.clone(),
+                        FontId::new(11.5, FontFamily::Proportional),
+                        palette::TEXT_SECONDARY(),
                     );
-                }
-
-                if self.duplex_mic_mode.sends() {
-                    let gate_fmt = format!("{:.0} dB", self.duplex_gate_db);
-                    settings_row(ui, t.label_noise_gate_threshold, true, |ui| {
-                        if quiet_slider_f32(ui, &mut self.duplex_gate_db, -65.0..=-20.0, &gate_fmt)
-                        {
-                            if let Some(ref dpx) = self.active_duplex {
-                                dpx.set_tx_noise_gate_db(Some(self.duplex_gate_db));
-                            }
-                        }
-                    });
-
-                    settings_row(ui, t.label_mic_mute, false, |ui| {
-                        if pill_toggle(ui, &mut self.duplex_mic_muted) {
-                            if let Some(ref dpx) = self.active_duplex {
-                                dpx.set_tx_muted(self.duplex_mic_muted);
-                            }
-                        }
-                    });
-                }
+                    let max_w = ui.available_width().max(60.0);
+                    let (lbl_r, _) = ui.allocate_exact_size(
+                        Vec2::new(g.size().x.min(max_w), 22.0),
+                        Sense::hover(),
+                    );
+                    let cp = ui.painter().with_clip_rect(lbl_r);
+                    crate::widgets::paint_galley_vcenter(
+                        &cp,
+                        lbl_r.min.x,
+                        lbl_r.center().y,
+                        g,
+                        palette::TEXT_SECONDARY(),
+                    );
+                });
             });
         });
 
-        if install_vmic_requested {
-            self.trigger_install_virtual_mic_driver();
-        }
-        if restart_duplex_requested && self.active_duplex.is_some() {
-            self.active_duplex = None;
-            self.toggle_duplex();
-        }
-    }
-
-    /// Map an internal Virtual Mic output sink name to the corresponding OS recording device name
-    /// that applications (Zoom, Chrome, WeChat, Discord, OBS) should select as their Microphone.
-    fn app_recording_mic_name_for_sink(sink_name: &str) -> String {
-        let lower = sink_name.to_ascii_lowercase();
-        if lower.contains("rsrelay virtual mic") {
-            MACOS_RSRELAY_VMIC_INPUT_NAME.to_string()
-        } else if lower.contains("cable input") {
-            sink_name.replace("CABLE Input", "CABLE Output")
-        } else if lower.contains("voicemeeter input") {
-            "VoiceMeeter Out B1".to_string()
-        } else {
-            sink_name.to_string()
+        if restart_requested && self.active_duplex.is_some() {
+            self.restart_active_session();
         }
     }
 
     // =========================================================================
-    // Tab 3: 音频设备 (`HardwareMatrix` Tab) in Quiet Graphite Style
+    // Tab 2: 音频设备 (`HardwareMatrix` Tab)
     // =========================================================================
 
     fn render_hardware_matrix_tab(&mut self, ui: &mut egui::Ui) {
         let t = self.lang.texts();
 
-        // Top Page Header
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 3.0;
-                ui.label(
-                    RichText::new(t.page_hw_title)
-                        .size(20.0)
-                        .color(palette::TEXT_PRIMARY())
-                        .strong(),
+        {
+            let (hdr_rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::hover());
+            let hcy = hdr_rect.center().y;
+            if ui.is_rect_visible(hdr_rect) {
+                let p = ui.painter();
+                paint_text_vcenter(
+                    p,
+                    Pos2::new(hdr_rect.min.x, hcy - 11.5),
+                    Align::Min,
+                    t.page_hw_title,
+                    FontId::new(20.0, FontFamily::Proportional),
+                    palette::TEXT_PRIMARY(),
                 );
-                ui.label(
-                    RichText::new(t.page_hw_subtitle)
-                        .size(13.0)
-                        .color(palette::TEXT_SECONDARY()),
+                paint_text_vcenter(
+                    p,
+                    Pos2::new(hdr_rect.min.x, hcy + 12.5),
+                    Align::Min,
+                    t.page_hw_subtitle,
+                    FontId::new(13.0, FontFamily::Proportional),
+                    palette::TEXT_SECONDARY(),
                 );
-            });
-            ui.with_layout(egui::Layout::right_to_left(Align::Max), |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if ui
-                    .button(
-                        RichText::new(t.btn_refresh_ports)
-                            .size(12.5)
-                            .color(palette::TEXT_PRIMARY()),
+            }
+            let mut right_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(hdr_rect)
+                    .layout(egui::Layout::right_to_left(Align::Center)),
+            );
+            right_ui.spacing_mut().item_spacing.x = 8.0;
+            if right_ui
+                .button(
+                    RichText::new(t.btn_refresh_ports)
+                        .size(12.5)
+                        .color(palette::TEXT_PRIMARY()),
+                )
+                .on_hover_text(t.btn_refresh_ports_hover)
+                .clicked()
+            {
+                self.refresh_audio_devices(true);
+            }
+            if (cfg!(target_os = "macos") && !is_macos_rsrelay_driver_installed())
+                || (cfg!(target_os = "windows")
+                    && select_default_virtual_mic_output_device().is_none())
+            {
+                let installing = self.installing_vmic_driver.load(Ordering::Relaxed);
+                let drv_btn = if installing {
+                    t.btn_installing_vmic
+                } else if cfg!(target_os = "macos") {
+                    t.btn_install_macos_vmic
+                } else {
+                    t.btn_install_win_vbcable
+                };
+                if right_ui
+                    .add_enabled(
+                        !installing,
+                        egui::Button::new(RichText::new(drv_btn).size(12.5).color(palette::ACCENT())),
                     )
-                    .on_hover_text(t.btn_refresh_ports_hover)
                     .clicked()
                 {
-                    self.refresh_audio_devices(true);
+                    self.trigger_install_virtual_mic_driver();
                 }
-                if (cfg!(target_os = "macos") && !is_macos_rsrelay_driver_installed())
-                    || (cfg!(target_os = "windows")
-                        && select_default_virtual_mic_output_device().is_none())
-                {
-                    let installing = self.installing_vmic_driver.load(Ordering::Relaxed);
-                    let drv_btn = if installing {
-                        t.btn_installing_vmic
-                    } else if cfg!(target_os = "macos") {
-                        t.btn_install_macos_vmic
-                    } else {
-                        t.btn_install_win_vbcable
-                    };
-                    if ui
-                        .add_enabled(
-                            !installing,
-                            egui::Button::new(
-                                RichText::new(drv_btn)
-                                    .size(12.5)
-                                    .color(palette::ACCENT()),
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.trigger_install_virtual_mic_driver();
-                    }
-                }
-            });
-        });
+            }
+        }
 
         ui.add_space(18.0);
 
@@ -3601,34 +3622,47 @@ impl RsRelayGuiApp {
             // Left Card: Input Devices
             theme::studio_card_frame(false, palette::LINE()).show(&mut cols[0], |ui| {
                 egui::Frame::none()
-                    .inner_margin(egui::Margin::symmetric(20.0, 18.0))
+                    .inner_margin(egui::Margin::symmetric(20.0, 16.0))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            draw_card_icon_tile(ui, IconKind::Microphone);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 1.0;
-                                ui.label(
-                                    RichText::new(t.hw_input_title)
-                                        .size(15.0)
-                                        .color(palette::TEXT_PRIMARY())
-                                        .strong(),
-                                );
-                                ui.label(
-                                    RichText::new(t.hw_input_subtitle)
-                                        .size(11.5)
-                                        .color(palette::TEXT_MUTED()),
-                                );
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                status_chip(
-                                    ui,
-                                    &format!("{}", in_devices.len()),
-                                    None,
-                                    !in_devices.is_empty(),
-                                );
-                            });
-                        });
+                        let (ch_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 36.0),
+                            Sense::hover(),
+                        );
+                        let cy = ch_rect.center().y;
+                        let mut left_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(ch_rect)
+                                .layout(egui::Layout::left_to_right(Align::Center)),
+                        );
+                        draw_card_icon_tile(&mut left_ui, IconKind::Microphone);
+                        let p = ui.painter();
+                        paint_text_vcenter(
+                            p,
+                            Pos2::new(ch_rect.min.x + 44.0, cy - 8.5),
+                            Align::Min,
+                            t.hw_input_title,
+                            FontId::new(15.0, FontFamily::Proportional),
+                            palette::TEXT_PRIMARY(),
+                        );
+                        paint_text_vcenter(
+                            p,
+                            Pos2::new(ch_rect.min.x + 44.0, cy + 9.0),
+                            Align::Min,
+                            t.hw_input_subtitle,
+                            FontId::new(11.5, FontFamily::Proportional),
+                            palette::TEXT_MUTED(),
+                        );
+                        let mut right_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(ch_rect)
+                                .layout(egui::Layout::right_to_left(Align::Center)),
+                        );
+                        status_chip(
+                            &mut right_ui,
+                            &format!("{}", in_devices.len()),
+                            None,
+                            !in_devices.is_empty(),
+                        );
                     });
 
                 draw_hairline(ui);
@@ -3657,34 +3691,47 @@ impl RsRelayGuiApp {
             // Right Card: Output Devices
             theme::studio_card_frame(false, palette::LINE()).show(&mut cols[1], |ui| {
                 egui::Frame::none()
-                    .inner_margin(egui::Margin::symmetric(20.0, 18.0))
+                    .inner_margin(egui::Margin::symmetric(20.0, 16.0))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            draw_card_icon_tile(ui, IconKind::SpeakerDevice);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 1.0;
-                                ui.label(
-                                    RichText::new(t.hw_output_title)
-                                        .size(15.0)
-                                        .color(palette::TEXT_PRIMARY())
-                                        .strong(),
-                                );
-                                ui.label(
-                                    RichText::new(t.hw_output_subtitle)
-                                        .size(11.5)
-                                        .color(palette::TEXT_MUTED()),
-                                );
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                status_chip(
-                                    ui,
-                                    &format!("{}", out_devices.len()),
-                                    None,
-                                    !out_devices.is_empty(),
-                                );
-                            });
-                        });
+                        let (ch_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 36.0),
+                            Sense::hover(),
+                        );
+                        let cy = ch_rect.center().y;
+                        let mut left_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(ch_rect)
+                                .layout(egui::Layout::left_to_right(Align::Center)),
+                        );
+                        draw_card_icon_tile(&mut left_ui, IconKind::SpeakerDevice);
+                        let p = ui.painter();
+                        paint_text_vcenter(
+                            p,
+                            Pos2::new(ch_rect.min.x + 44.0, cy - 8.5),
+                            Align::Min,
+                            t.hw_output_title,
+                            FontId::new(15.0, FontFamily::Proportional),
+                            palette::TEXT_PRIMARY(),
+                        );
+                        paint_text_vcenter(
+                            p,
+                            Pos2::new(ch_rect.min.x + 44.0, cy + 9.0),
+                            Align::Min,
+                            t.hw_output_subtitle,
+                            FontId::new(11.5, FontFamily::Proportional),
+                            palette::TEXT_MUTED(),
+                        );
+                        let mut right_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(ch_rect)
+                                .layout(egui::Layout::right_to_left(Align::Center)),
+                        );
+                        status_chip(
+                            &mut right_ui,
+                            &format!("{}", out_devices.len()),
+                            None,
+                            !out_devices.is_empty(),
+                        );
                     });
 
                 draw_hairline(ui);
@@ -3747,18 +3794,18 @@ impl RsRelayGuiApp {
         let tray_ids = self.tray.as_ref().map(|t| {
             (
                 t.toggle_window_id.clone(),
-                t.toggle_tx_id.clone(),
-                t.toggle_rx_id.clone(),
-                t.toggle_duplex_id.clone(),
+                t.toggle_link_id.clone(),
+                t.mute_speaker_id.clone(),
+                t.mute_mic_id.clone(),
                 t.stop_all_id.clone(),
                 t.quit_id.clone(),
             )
         });
         if let Some((
             toggle_window_id,
-            toggle_tx_id,
-            toggle_rx_id,
-            toggle_duplex_id,
+            toggle_link_id,
+            mute_speaker_id,
+            mute_mic_id,
             stop_all_id,
             quit_id,
         )) = tray_ids
@@ -3776,12 +3823,12 @@ impl RsRelayGuiApp {
                     } else {
                         self.restore_from_tray(ctx);
                     }
-                } else if event_id == toggle_tx_id {
-                    self.toggle_sender();
-                } else if event_id == toggle_rx_id {
-                    self.toggle_receiver();
-                } else if event_id == toggle_duplex_id {
+                } else if event_id == toggle_link_id {
                     self.toggle_duplex();
+                } else if event_id == mute_speaker_id {
+                    self.toggle_speaker_mute();
+                } else if event_id == mute_mic_id {
+                    self.toggle_mic_mute();
                 } else if event_id == stop_all_id {
                     self.stop_all_streams();
                     self.last_status_msg = self.lang.status_all_stopped_tray();
@@ -3855,17 +3902,15 @@ impl RsRelayGuiApp {
             }
         }
 
-        if self.active_sender.is_some()
-            || self.active_receiver.is_some()
-            || self.active_duplex.is_some()
+        if self.active_duplex.is_some()
+            || self.demo_mode
             || self.scanning_lan.load(Ordering::Relaxed)
         {
-            ctx.request_repaint_after(Duration::from_millis(33));
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
 
         self.update_live_telemetry();
 
-        // Left Sidebar + Main Workspace Canvas (Quiet Graphite C & C2 layout)
         self.render_sidebar(ctx);
 
         egui::CentralPanel::default()
@@ -3876,15 +3921,14 @@ impl RsRelayGuiApp {
                         left: metrics::MAIN_PADDING_X,
                         right: metrics::MAIN_PADDING_X,
                         top: metrics::MAIN_PADDING_Y,
-                        bottom: 24.0,
+                        bottom: 20.0,
                     }),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.active_tab {
-                        WorkspaceTab::DualConsole => self.render_dual_console_tab(ui),
-                        WorkspaceTab::FullDuplex => self.render_full_duplex_tab(ui),
+                        WorkspaceTab::AudioLink => self.render_audio_link_tab(ui),
                         WorkspaceTab::HardwareMatrix => self.render_hardware_matrix_tab(ui),
                     });
             });
@@ -3919,14 +3963,13 @@ fn save_color_image_png(img: &egui::ColorImage, path: &str) -> std::io::Result<(
     let h = img.height() as u32;
     let mut raw = Vec::with_capacity((w as usize * 4 + 1) * h as usize);
     for y in 0..h as usize {
-        raw.push(0u8); // filter type 0 (None)
+        raw.push(0u8);
         let row_start = y * (w as usize);
         for c in &img.pixels[row_start..row_start + (w as usize)] {
             raw.extend_from_slice(&c.to_array());
         }
     }
 
-    // Zlib stream with uncompressed deflate blocks + Adler32
     let mut zlib = Vec::with_capacity(raw.len() + (raw.len() / 65535 + 1) * 5 + 6);
     zlib.extend_from_slice(&[0x78, 0x01]);
     let chunks: Vec<&[u8]> = raw.chunks(65535).collect();
@@ -4015,6 +4058,10 @@ fn main() -> anyhow::Result<()> {
     let start_in_tray = std::env::args().any(|a| a == "--tray" || a == "--background");
 
     let (icon_rgba, icon_w, icon_h) = build_app_icon_rgba();
+    let init_h = std::env::args()
+        .find_map(|a| a.strip_prefix("--height=").and_then(|v| v.parse::<f32>().ok()))
+        .unwrap_or(760.0);
+
     let viewport = if start_in_tray {
         egui::ViewportBuilder::default()
             .with_title("rsrelay")
@@ -4029,7 +4076,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         egui::ViewportBuilder::default()
             .with_title("rsrelay")
-            .with_inner_size([1220.0, 760.0])
+            .with_inner_size([1220.0, init_h])
             .with_min_inner_size([980.0, 660.0])
             .with_icon(egui::IconData {
                 rgba: icon_rgba,
@@ -4059,11 +4106,24 @@ fn main() -> anyhow::Result<()> {
             }
         } else if let Some(tab_val) = arg.strip_prefix("--tab=") {
             match tab_val.to_ascii_lowercase().as_str() {
-                "0" | "c" | "dual" | "txrx" => app.active_tab = WorkspaceTab::DualConsole,
-                "1" | "c2" | "duplex" | "headset" => app.active_tab = WorkspaceTab::FullDuplex,
                 "2" | "hw" | "devices" | "matrix" => app.active_tab = WorkspaceTab::HardwareMatrix,
+                _ => app.active_tab = WorkspaceTab::AudioLink,
+            }
+        } else if let Some(preset_val) = arg.strip_prefix("--preset=") {
+            match preset_val.to_ascii_lowercase().as_str() {
+                "headset" => app.apply_scene_preset(ScenePreset::Headset),
+                "host" => app.apply_scene_preset(ScenePreset::Host),
+                "speaker" => app.apply_scene_preset(ScenePreset::SpeakerOnly),
+                "mic" => app.apply_scene_preset(ScenePreset::MicOnly),
+                "bi" | "symmetric" => {
+                    app.duplex_role = DuplexRole::Symmetric;
+                    app.duplex_media_mode = MediaBusMode::Bidirectional;
+                    app.duplex_mic_mode = MicBusMode::Bidirectional;
+                }
                 _ => {}
             }
+        } else if arg == "--drawer" {
+            app.show_advanced_drawer = true;
         } else if let Some(val) = arg.strip_prefix("--theme=") {
             if let Some(tm) = ThemeMode::from_str_opt(val) {
                 app.theme_mode = tm;
@@ -4084,7 +4144,6 @@ fn main() -> anyhow::Result<()> {
             let toggle_id = tray.toggle_window_id.clone();
             let quit_id = tray.quit_id.clone();
             thread::spawn(move || {
-                // 1. Wait until app is HiddenInTray, then simulate clicking "显示主页面" in tray menu
                 thread::sleep(Duration::from_millis(500));
                 let (tx, _) = global_tray_event_queue();
                 let _ = tx.send(toggle_id.clone());
@@ -4096,7 +4155,6 @@ fn main() -> anyhow::Result<()> {
                 #[cfg(target_os = "windows")]
                 win32_tray::wake_main_window();
 
-                // 2. Wait while window is restored & visible, then simulate hiding back to tray
                 thread::sleep(Duration::from_millis(500));
                 let _ = tx.send(toggle_id);
                 if let Ok(guard) = global_egui_wakeup_ctx().lock() {
@@ -4107,7 +4165,6 @@ fn main() -> anyhow::Result<()> {
                 #[cfg(target_os = "windows")]
                 win32_tray::wake_main_window();
 
-                // 3. Wait until HiddenInTray again, then simulate clicking "退出" in tray menu
                 thread::sleep(Duration::from_millis(500));
                 let _ = tx.send(quit_id);
                 if let Ok(guard) = global_egui_wakeup_ctx().lock() {
@@ -4151,7 +4208,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_headless_render_all_workspace_tabs_bilingual() {
+    fn test_headless_render_all_workspace_tabs_and_presets_bilingual() {
         let mut app = RsRelayGuiApp::new_with_tray(false).expect("init app");
         let ctx = egui::Context::default();
 
@@ -4161,24 +4218,55 @@ mod tests {
 
             for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
                 app.theme_mode = mode;
-                for tab in [
-                    WorkspaceTab::DualConsole,
-                    WorkspaceTab::FullDuplex,
-                    WorkspaceTab::HardwareMatrix,
-                ] {
+                for tab in [WorkspaceTab::AudioLink, WorkspaceTab::HardwareMatrix] {
                     app.active_tab = tab;
-                    for role in [DuplexRole::Host, DuplexRole::Headset, DuplexRole::Symmetric] {
-                        app.duplex_role = role;
-                        let (m, v) = preset_bus_modes_for_role(role);
-                        app.duplex_media_mode = m;
-                        app.duplex_mic_mode = v;
-                        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                            app.render_ui(ctx);
-                        });
+                    for preset in [
+                        ScenePreset::Headset,
+                        ScenePreset::Host,
+                        ScenePreset::SpeakerOnly,
+                        ScenePreset::MicOnly,
+                    ] {
+                        app.apply_scene_preset(preset);
+                        for drawer_open in [false, true] {
+                            app.show_advanced_drawer = drawer_open;
+                            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                                app.render_ui(ctx);
+                            });
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_scene_presets_and_mute_toggles() {
+        let mut app = RsRelayGuiApp::new_with_tray(false).expect("init app");
+        assert_eq!(
+            ScenePreset::from_bus_modes(app.duplex_media_mode, app.duplex_mic_mode),
+            Some(ScenePreset::Headset)
+        );
+
+        app.apply_scene_preset(ScenePreset::SpeakerOnly);
+        assert_eq!(app.duplex_media_mode, MediaBusMode::ReceiveSpeaker);
+        assert_eq!(app.duplex_mic_mode, MicBusMode::Off);
+        assert_eq!(
+            ScenePreset::from_bus_modes(app.duplex_media_mode, app.duplex_mic_mode),
+            Some(ScenePreset::SpeakerOnly)
+        );
+
+        app.apply_scene_preset(ScenePreset::Host);
+        assert_eq!(app.duplex_role, DuplexRole::Host);
+        assert_eq!(app.duplex_media_mode, MediaBusMode::SendLoopback);
+        assert_eq!(app.duplex_mic_mode, MicBusMode::ReceiveVirtualMic);
+
+        assert!(!app.speaker_muted);
+        app.toggle_speaker_mute();
+        assert!(app.speaker_muted);
+
+        assert!(!app.duplex_mic_muted);
+        app.toggle_mic_mute();
+        assert!(app.duplex_mic_muted);
     }
 
     #[test]
@@ -4235,12 +4323,10 @@ mod tests {
             });
         }
 
-        // Auto-recognition fills the first discovered LAN peer when still on default loopback
         app.apply_auto_discovered_target();
         assert_eq!(app.target_addr_input, "192.168.3.110:49153");
         assert_eq!(app.duplex_peer_ip_input, "192.168.3.110");
 
-        // Dropdown options include both discovered LAN peers + local options
         let opts = app.build_target_combo_options();
         assert!(opts
             .iter()
@@ -4249,7 +4335,6 @@ mod tests {
             .iter()
             .any(|(addr, _, is_lan)| addr == "192.168.3.151:49153" && *is_lan));
 
-        // Flexible manual input parsing allows bare IP without port
         let parsed = parse_socket_addr_flexible(
             "192.168.3.151",
             IpAddr::from([127, 0, 0, 1]),

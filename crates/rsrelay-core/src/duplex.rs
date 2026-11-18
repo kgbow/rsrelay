@@ -51,6 +51,15 @@ impl MediaBusMode {
     pub const fn receives(self) -> bool {
         matches!(self, Self::ReceiveSpeaker | Self::Bidirectional)
     }
+
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::ReceiveSpeaker => Self::SendLoopback,
+            Self::SendLoopback => Self::Bidirectional,
+            Self::Bidirectional => Self::Off,
+            Self::Off => Self::ReceiveSpeaker,
+        }
+    }
 }
 
 /// Routing mode for the Microphone / Virtual Mic Bus (`:49155`).
@@ -74,6 +83,15 @@ impl MicBusMode {
 
     pub const fn receives(self) -> bool {
         matches!(self, Self::ReceiveVirtualMic | Self::Bidirectional)
+    }
+
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::SendMic => Self::ReceiveVirtualMic,
+            Self::ReceiveVirtualMic => Self::Bidirectional,
+            Self::Bidirectional => Self::Off,
+            Self::Off => Self::SendMic,
+        }
     }
 }
 
@@ -118,6 +136,8 @@ pub struct DuplexSessionConfig {
     pub mic_rx_gain: f32,
     pub advertise_mdns: bool,
     pub synthetic_source_override: bool,
+    pub target_buffer_ms_override: Option<u16>,
+    pub media_opus_bitrate_bps_override: Option<u32>,
 }
 
 impl DuplexSessionConfig {
@@ -144,6 +164,8 @@ impl DuplexSessionConfig {
             mic_rx_gain: 1.0,
             advertise_mdns: true,
             synthetic_source_override: false,
+            target_buffer_ms_override: None,
+            media_opus_bitrate_bps_override: None,
         }
     }
 
@@ -240,6 +262,10 @@ impl DuplexSession {
             }
         };
 
+        let effective_buffer_ms = cfg
+            .target_buffer_ms_override
+            .unwrap_or_else(|| cfg.profile.default_target_buffer_ms());
+
         // 1. Media RX (`:49153` -> Physical Headphones / Speaker)
         let media_rx = if cfg.media_mode.receives() {
             let dev = cfg.media_rx_device.clone().or_else(|| {
@@ -253,7 +279,7 @@ impl DuplexSession {
                 bind_addr: SocketAddr::new(unspecified_ip, cfg.downlink_udp_port),
                 device_name: dev,
                 channels: cfg.media_channels,
-                target_buffer_ms: cfg.profile.default_target_buffer_ms(),
+                target_buffer_ms: effective_buffer_ms,
                 initial_volume: cfg.initial_volume,
                 advertise_mdns: take_mdns(),
                 node_name: format!("rsrelay-media-{:?}", cfg.role).to_lowercase(),
@@ -294,7 +320,7 @@ impl DuplexSession {
                 bind_addr: SocketAddr::new(unspecified_ip, cfg.uplink_udp_port),
                 device_name: Some(resolved_vmic),
                 channels: cfg.mic_channels,
-                target_buffer_ms: cfg.profile.default_target_buffer_ms(),
+                target_buffer_ms: effective_buffer_ms,
                 initial_volume: cfg.mic_rx_gain,
                 advertise_mdns: take_mdns(),
                 node_name: format!("rsrelay-vmic-{:?}", cfg.role).to_lowercase(),
@@ -324,7 +350,7 @@ impl DuplexSession {
                 codec: cfg.profile.default_codec(),
                 channels: cfg.media_channels,
                 frame_duration: cfg.profile.default_frame_duration(),
-                opus_bitrate_bps: 128_000,
+                opus_bitrate_bps: cfg.media_opus_bitrate_bps_override.unwrap_or(128_000),
                 enable_fec: cfg.profile.default_fec(),
                 noise_gate_db: None,
             };

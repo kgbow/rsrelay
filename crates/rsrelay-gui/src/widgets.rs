@@ -63,6 +63,50 @@ pub fn dbfs_to_norm(db: f32) -> f32 {
     ((db.clamp(-60.0, 0.0) + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
+/// Return the true rendered ink vertical center of a single-line [`egui::Galley`],
+/// falling back to `galley.size().y * 0.5` when the string has no visible glyph outlines.
+#[inline]
+pub fn galley_ink_center_y(galley: &egui::Galley) -> f32 {
+    if galley.mesh_bounds.is_finite() && galley.mesh_bounds.height() > 1.0 {
+        galley.mesh_bounds.center().y
+    } else {
+        galley.size().y * 0.5
+    }
+}
+
+/// Paint a pre-laid-out [`egui::Galley`] with its true ink vertical midpoint aligned to `cy`.
+#[inline]
+pub fn paint_galley_vcenter(
+    painter: &egui::Painter,
+    x: f32,
+    cy: f32,
+    galley: std::sync::Arc<egui::Galley>,
+    color: Color32,
+) {
+    let ink_cy = galley_ink_center_y(&galley);
+    painter.galley(Pos2::new(x, cy - ink_cy), galley, color);
+}
+
+/// Layout and paint a single-line string whose true rendered ink midpoint is centered at `pos.y`.
+#[inline]
+pub fn paint_text_vcenter(
+    painter: &egui::Painter,
+    pos: Pos2,
+    h_align: Align,
+    text: impl Into<String>,
+    font_id: FontId,
+    color: Color32,
+) {
+    let galley = painter.layout_no_wrap(text.into(), font_id, color);
+    let ink_cy = galley_ink_center_y(&galley);
+    let x = match h_align {
+        Align::Min => pos.x,
+        Align::Center => pos.x - galley.size().x * 0.5,
+        Align::Max => pos.x - galley.size().x,
+    };
+    painter.galley(Pos2::new(x, pos.y - ink_cy), galley, color);
+}
+
 // =============================================================================
 // Vector Iconography (Painted directly via egui::Painter, zero external assets)
 // =============================================================================
@@ -73,6 +117,7 @@ pub enum IconKind {
     SendReceive,
     Headset,
     SpeakerDevice,
+    SpeakerWave,
     ArrowUpRight,
     ArrowDownLeft,
     Microphone,
@@ -82,6 +127,7 @@ pub enum IconKind {
     Refresh,
     Copy,
     MinimizeTray,
+    Sliders,
 }
 
 /// Paint a crisp 1.8px-stroke vector icon inside `rect`.
@@ -321,6 +367,44 @@ pub fn draw_vector_icon(painter: &egui::Painter, rect: Rect, kind: IconKind, col
                 stroke,
             );
         }
+        IconKind::SpeakerWave => {
+            // Speaker cone polygon + 2 curved sound arcs
+            let cone = vec![
+                Pos2::new(c.x - s * 0.68, c.y - s * 0.24),
+                Pos2::new(c.x - s * 0.36, c.y - s * 0.24),
+                Pos2::new(c.x + s * 0.06, c.y - s * 0.60),
+                Pos2::new(c.x + s * 0.06, c.y + s * 0.60),
+                Pos2::new(c.x - s * 0.36, c.y + s * 0.24),
+                Pos2::new(c.x - s * 0.68, c.y + s * 0.24),
+                Pos2::new(c.x - s * 0.68, c.y - s * 0.24),
+            ];
+            painter.add(egui::Shape::line(cone, stroke));
+            for &(rad, span) in &[(s * 0.42, 0.70_f32), (s * 0.72, 0.88_f32)] {
+                let mut arc = Vec::with_capacity(9);
+                for i in 0..=8 {
+                    let a = -span + (i as f32 / 8.0) * (2.0 * span);
+                    arc.push(Pos2::new(
+                        c.x + s * 0.06 + rad * a.cos(),
+                        c.y + rad * a.sin(),
+                    ));
+                }
+                painter.add(egui::Shape::line(arc, stroke));
+            }
+        }
+        IconKind::Sliders => {
+            // 3 horizontal equalizer tracks with offset fader knobs
+            let ys = [-0.52_f32, 0.0, 0.52];
+            let knobs = [-0.26_f32, 0.32, -0.10];
+            for (&ny, &nk) in ys.iter().zip(knobs.iter()) {
+                let y = c.y + ny * s;
+                painter.line_segment(
+                    [Pos2::new(c.x - s * 0.70, y), Pos2::new(c.x + s * 0.70, y)],
+                    stroke,
+                );
+                let kx = c.x + nk * s;
+                painter.circle_filled(Pos2::new(kx, y), 2.3, color);
+            }
+        }
     }
 }
 
@@ -344,8 +428,23 @@ pub fn draw_card_icon_tile(ui: &mut Ui, kind: IconKind) {
 // =============================================================================
 
 /// Render a Quiet Graphite status chip (`.chip.live` or `.chip.idle`).
-/// Allocates a single atomic `Rect` so the indicator dot always stays on the left in both LTR and RTL parents.
 pub fn status_chip(ui: &mut Ui, label: &str, mono_suffix: Option<&str>, active: bool) {
+    status_chip_with_height(ui, label, mono_suffix, active, 22.0, false);
+}
+
+/// Render a `31px`-tall header status pill that aligns at identical height with header buttons.
+pub fn header_status_chip(ui: &mut Ui, label: &str, mono_suffix: Option<&str>, active: bool) {
+    status_chip_with_height(ui, label, mono_suffix, active, 31.0, true);
+}
+
+fn status_chip_with_height(
+    ui: &mut Ui,
+    label: &str,
+    mono_suffix: Option<&str>,
+    active: bool,
+    chip_h: f32,
+    bordered: bool,
+) {
     let bg = if active {
         palette::ACCENT_TINT()
     } else {
@@ -357,41 +456,52 @@ pub fn status_chip(ui: &mut Ui, label: &str, mono_suffix: Option<&str>, active: 
         palette::TEXT_SECONDARY()
     };
 
-    let prop_font = FontId::new(11.0, FontFamily::Proportional);
-    let mono_font = FontId::new(11.0, FontFamily::Monospace);
+    let font_sz = if chip_h >= 28.0 { 11.5 } else { 11.0 };
+    let prop_font = FontId::new(font_sz, FontFamily::Proportional);
+    let mono_font = FontId::new(font_sz, FontFamily::Monospace);
     let p = ui.painter();
-    let label_galley = p.layout_no_wrap(label.to_string(), prop_font.clone(), fg);
-    let mut total_w = 8.5 + 5.5 + 6.0 + label_galley.size().x + 8.5;
+    let label_galley = p.layout_no_wrap(label.to_string(), prop_font, fg);
+    let pad_x = if chip_h >= 28.0 { 11.0 } else { 8.5 };
+    let mut total_w = pad_x + 6.0 + 6.5 + label_galley.size().x + pad_x;
 
-    let suffix_galleys = mono_suffix.map(|mono| {
-        let dot_g = p.layout_no_wrap("·".to_string(), prop_font.clone(), fg);
-        let mono_g = p.layout_no_wrap(mono.to_string(), mono_font.clone(), fg);
-        total_w += 5.0 + dot_g.size().x + 5.0 + mono_g.size().x;
-        (dot_g, mono_g)
+    let suffix_galley = mono_suffix.map(|mono| {
+        let mono_g = p.layout_no_wrap(mono.to_string(), mono_font, fg);
+        total_w += 6.0 + 2.6 + 6.0 + mono_g.size().x;
+        mono_g
     });
 
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_w, 20.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_w, chip_h), Sense::hover());
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        p.rect_filled(rect, Rounding::same(metrics::RADIUS_CHIP), bg);
+        let rounding = if bordered {
+            Rounding::same(metrics::RADIUS_BUTTON)
+        } else {
+            Rounding::same(chip_h * 0.5)
+        };
+        if bordered {
+            let stroke_col = if active {
+                palette::ACCENT().gamma_multiply(0.35)
+            } else {
+                palette::LINE_STRONG()
+            };
+            p.rect(rect, rounding, bg, Stroke::new(1.0_f32, stroke_col));
+        } else {
+            p.rect_filled(rect, rounding, bg);
+        }
+
         let cy = rect.center().y;
-        let mut x = rect.min.x + 8.5;
-        p.circle_filled(Pos2::new(x + 2.5, cy), 2.5, fg);
-        x += 5.5 + 6.0;
+        let mut x = rect.min.x + pad_x;
+        p.circle_filled(Pos2::new(x + 2.8, cy), 2.8, fg);
+        x += 6.0 + 6.5;
         let lbl_w = label_galley.size().x;
-        p.galley(
-            Pos2::new(x, cy - label_galley.size().y * 0.5),
-            label_galley,
-            fg,
-        );
+        paint_galley_vcenter(p, x, cy, label_galley, fg);
         x += lbl_w;
 
-        if let Some((dot_g, mono_g)) = suffix_galleys {
-            x += 5.0;
-            let dw = dot_g.size().x;
-            p.galley(Pos2::new(x, cy - dot_g.size().y * 0.5), dot_g, fg);
-            x += dw + 5.0;
-            p.galley(Pos2::new(x, cy - mono_g.size().y * 0.5), mono_g, fg);
+        if let Some(mono_g) = suffix_galley {
+            x += 6.0;
+            p.circle_filled(Pos2::new(x + 1.3, cy), 1.3, fg.gamma_multiply(0.60));
+            x += 2.6 + 6.0;
+            paint_galley_vcenter(p, x, cy, mono_g, fg);
         }
     }
 }
@@ -425,6 +535,7 @@ pub fn header_action_button(
 
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
+        let cy = rect.center().y;
         if is_running {
             let fill = if resp.hovered() {
                 palette::BG_HOVER()
@@ -437,14 +548,12 @@ pub fn header_action_button(
                 fill,
                 Stroke::new(1.0_f32, palette::LINE_STRONG()),
             );
-            let sq_rect = Rect::from_center_size(
-                Pos2::new(rect.min.x + 17.0, rect.center().y),
-                Vec2::splat(9.0),
-            );
+            let sq_rect = Rect::from_center_size(Pos2::new(rect.min.x + 17.0, cy), Vec2::splat(9.0));
             p.rect_filled(sq_rect, Rounding::same(2.0), palette::STATUS_DANGER());
-            p.text(
-                Pos2::new(rect.min.x + 29.0, rect.center().y),
-                egui::Align2::LEFT_CENTER,
+            paint_text_vcenter(
+                p,
+                Pos2::new(rect.min.x + 29.0, cy),
+                Align::Min,
                 text,
                 font_id,
                 palette::TEXT_PRIMARY(),
@@ -457,18 +566,17 @@ pub fn header_action_button(
             };
             let fg = palette::BTN_PRIMARY_FG();
             p.rect_filled(rect, Rounding::same(metrics::RADIUS_BUTTON), fill);
-            // Play triangle
             let cx = rect.min.x + 17.5;
-            let cy = rect.center().y;
             let tri = vec![
                 Pos2::new(cx - 3.2, cy - 4.2),
                 Pos2::new(cx + 4.4, cy),
                 Pos2::new(cx - 3.2, cy + 4.2),
             ];
             p.add(egui::Shape::convex_polygon(tri, fg, Stroke::NONE));
-            p.text(
-                Pos2::new(rect.min.x + 28.0, rect.center().y),
-                egui::Align2::LEFT_CENTER,
+            paint_text_vcenter(
+                p,
+                Pos2::new(rect.min.x + 28.0, cy),
+                Align::Min,
                 text,
                 font_id,
                 fg,
@@ -897,26 +1005,42 @@ pub fn draw_stats_row_3(ui: &mut Ui, stats: [(&str, &str, &str); 3], active: boo
                 );
             }
             let pad_x = x0 + 20.0;
-            p.text(
-                Pos2::new(pad_x, rect.min.y + 21.0),
-                egui::Align2::LEFT_CENTER,
+            paint_text_vcenter(
+                p,
+                Pos2::new(pad_x, rect.min.y + 20.5),
+                Align::Min,
                 caption,
                 FontId::new(11.5, FontFamily::Proportional),
                 palette::TEXT_MUTED(),
             );
 
             let val_font = FontId::new(16.0, FontFamily::Monospace);
-            let val_galley = p.layout_no_wrap(val.to_string(), val_font.clone(), val_color);
-            let val_pos = Pos2::new(pad_x, rect.min.y + 43.0 - val_galley.size().y * 0.5);
+            let val_galley = p.layout_no_wrap(val.to_string(), val_font, val_color);
+            let val_cy = rect.min.y + 44.0;
+            let val_ink_cy = galley_ink_center_y(&val_galley);
+            let val_top_y = val_cy - val_ink_cy;
+            let val_bottom_y = if val_galley.mesh_bounds.is_finite() {
+                val_top_y + val_galley.mesh_bounds.max.y
+            } else {
+                val_cy + 5.5
+            };
             let val_w = val_galley.size().x;
-            p.galley(val_pos, val_galley, val_color);
+            p.galley(Pos2::new(pad_x, val_top_y), val_galley, val_color);
 
             if !unit.is_empty() {
-                p.text(
-                    Pos2::new(pad_x + val_w + 4.0, rect.min.y + 44.5),
-                    egui::Align2::LEFT_CENTER,
-                    unit,
-                    FontId::new(11.0, FontFamily::Proportional),
+                let unit_font = FontId::new(11.0, FontFamily::Monospace);
+                let unit_galley =
+                    p.layout_no_wrap(unit.to_string(), unit_font, palette::TEXT_MUTED());
+                let unit_top_y = if unit == "×" {
+                    val_cy - galley_ink_center_y(&unit_galley)
+                } else if unit_galley.mesh_bounds.is_finite() {
+                    val_bottom_y - unit_galley.mesh_bounds.max.y
+                } else {
+                    val_cy - unit_galley.size().y * 0.5
+                };
+                p.galley(
+                    Pos2::new(pad_x + val_w + 5.0, unit_top_y),
+                    unit_galley,
                     palette::TEXT_MUTED(),
                 );
             }
@@ -980,18 +1104,20 @@ pub fn draw_tx_waveform_chart(
         let inner_x1 = rect.max.x - 20.0;
         let head_y = rect.min.y + 22.0;
 
-        p.text(
+        paint_text_vcenter(
+            p,
             Pos2::new(inner_x0, head_y),
-            egui::Align2::LEFT_CENTER,
+            Align::Min,
             left_caption,
             FontId::new(11.5, FontFamily::Proportional),
             palette::TEXT_MUTED(),
         );
-        p.text(
+        paint_text_vcenter(
+            p,
             Pos2::new(inner_x1, head_y),
-            egui::Align2::RIGHT_CENTER,
+            Align::Max,
             right_caption,
-            FontId::new(11.5, FontFamily::Monospace),
+            FontId::new(11.5, FontFamily::Proportional),
             palette::TEXT_MUTED(),
         );
 
@@ -1070,9 +1196,10 @@ fn draw_idle_chart_grid(
             Vec2::new(galley.size().x + 20.0, galley.size().y + 6.0),
         );
         painter.rect_filled(bg_rect, Rounding::same(4.0), palette::BG_PANEL());
-        painter.text(
+        paint_text_vcenter(
+            painter,
             chart_rect.center(),
-            egui::Align2::CENTER_CENTER,
+            Align::Center,
             placeholder,
             font,
             palette::TEXT_MUTED(),
@@ -1120,18 +1247,20 @@ pub fn draw_sparkline(
         let inner_x1 = rect.max.x - 20.0;
         let head_y = rect.min.y + 22.0;
 
-        p.text(
+        paint_text_vcenter(
+            p,
             Pos2::new(inner_x0, head_y),
-            egui::Align2::LEFT_CENTER,
+            Align::Min,
             title,
             FontId::new(11.5, FontFamily::Proportional),
             palette::TEXT_MUTED(),
         );
-        p.text(
+        paint_text_vcenter(
+            p,
             Pos2::new(inner_x1, head_y),
-            egui::Align2::RIGHT_CENTER,
+            Align::Max,
             right_summary,
-            FontId::new(11.5, FontFamily::Monospace),
+            FontId::new(11.5, FontFamily::Proportional),
             palette::TEXT_MUTED(),
         );
 
@@ -1287,13 +1416,7 @@ pub fn segmented_control<T: Copy + PartialEq>(
             } else {
                 palette::TEXT_SECONDARY()
             };
-            p.text(
-                seg_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                label,
-                font.clone(),
-                fg,
-            );
+            paint_text_vcenter(p, seg_rect.center(), Align::Center, label, font.clone(), fg);
             x += w + 2.0;
         }
     }
@@ -1403,9 +1526,10 @@ pub fn quiet_slider_f32(
         p.circle_filled(thumb_center, 7.0, Color32::from_rgb(248, 248, 250));
         p.circle_stroke(thumb_center, 7.0, Stroke::new(1.0_f32, palette::LINE_STRONG()));
 
-        p.text(
+        paint_text_vcenter(
+            p,
             Pos2::new(val_rect.max.x, val_rect.center().y),
-            egui::Align2::RIGHT_CENTER,
+            Align::Max,
             formatted_val,
             FontId::new(12.0, FontFamily::Monospace),
             palette::TEXT_PRIMARY(),
@@ -1471,23 +1595,24 @@ pub fn quiet_select_pill<T: Clone + PartialEq>(
             fill,
             Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
         );
-        p.text(
-            Pos2::new(rect.min.x + 12.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
+        let cy = rect.center().y;
+        paint_text_vcenter(
+            p,
+            Pos2::new(rect.min.x + 12.0, cy),
+            Align::Min,
             selected_label,
             font,
             palette::TEXT_PRIMARY(),
         );
-        // Chevron `⌄` on right
+        // Chevron `⌄` symmetrically centered around `cy`
         let cx = rect.max.x - 14.0;
-        let cy = rect.center().y;
         let chev_stroke = Stroke::new(1.5_f32, palette::TEXT_MUTED());
         p.line_segment(
-            [Pos2::new(cx - 3.5, cy - 1.5), Pos2::new(cx, cy + 2.0)],
+            [Pos2::new(cx - 3.5, cy - 1.75), Pos2::new(cx, cy + 1.75)],
             chev_stroke,
         );
         p.line_segment(
-            [Pos2::new(cx, cy + 2.0), Pos2::new(cx + 3.5, cy - 1.5)],
+            [Pos2::new(cx, cy + 1.75), Pos2::new(cx + 3.5, cy - 1.75)],
             chev_stroke,
         );
     }
@@ -1541,16 +1666,25 @@ pub fn quiet_mono_input_pill(ui: &mut Ui, id_salt: &str, text: &mut String) {
         );
     }
 
-    let inner_rect = rect.shrink2(Vec2::new(10.0, 4.0));
+    let probe_g = ui
+        .painter()
+        .layout_no_wrap("09".to_string(), font.clone(), Color32::WHITE);
+    let row_h = probe_g.rect.height().max(12.0);
+    let ink_dy = galley_ink_center_y(&probe_g) - probe_g.rect.center().y;
+    let inner_rect = Rect::from_center_size(
+        Pos2::new(rect.center().x, rect.center().y - ink_dy),
+        Vec2::new((rect.width() - 20.0).max(40.0), row_h),
+    );
     let mut child_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(inner_rect)
-            .layout(egui::Layout::left_to_right(Align::Center)),
+            .layout(egui::Layout::left_to_right(Align::Min)),
     );
     child_ui.push_id(id_salt, |ui| {
         ui.add(
             egui::TextEdit::singleline(text)
                 .frame(false)
+                .margin(egui::Margin::ZERO)
                 .clip_text(false)
                 .font(font)
                 .text_color(palette::TEXT_PRIMARY())
@@ -1663,20 +1797,27 @@ pub fn quiet_mono_combo_pill(
         }
     }
 
-    let text_rect = Rect::from_min_max(
-        Pos2::new(rect.min.x + 10.0, rect.min.y + 4.0),
-        Pos2::new(drop_rect.min.x - 6.0, rect.max.y - 4.0),
+    let probe_g = ui
+        .painter()
+        .layout_no_wrap("09".to_string(), font.clone(), Color32::WHITE);
+    let row_h = probe_g.rect.height().max(12.0);
+    let ink_dy = galley_ink_center_y(&probe_g) - probe_g.rect.center().y;
+    let avail_w = (drop_rect.min.x - 6.0 - (rect.min.x + 10.0)).max(36.0);
+    let text_rect = Rect::from_min_size(
+        Pos2::new(rect.min.x + 10.0, rect.center().y - row_h * 0.5 - ink_dy),
+        Vec2::new(avail_w, row_h),
     );
     let mut child_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(text_rect)
-            .layout(egui::Layout::left_to_right(Align::Center)),
+            .layout(egui::Layout::left_to_right(Align::Min)),
     );
     child_ui.push_id(id_salt, |ui| {
         let resp = ui.add(
             egui::TextEdit::singleline(text)
                 .frame(false)
-                .clip_text(true)
+                .margin(egui::Margin::ZERO)
+                .clip_text(false)
                 .font(font)
                 .text_color(palette::TEXT_PRIMARY())
                 .desired_width(text_rect.width()),
@@ -1822,9 +1963,10 @@ pub fn settings_row(
 
     if ui.is_rect_visible(row_rect) {
         let p = ui.painter();
-        p.text(
+        paint_text_vcenter(
+            p,
             Pos2::new(row_rect.min.x + 20.0, row_rect.center().y),
-            egui::Align2::LEFT_CENTER,
+            Align::Min,
             label,
             FontId::new(12.5, FontFamily::Proportional),
             palette::TEXT_SECONDARY(),
@@ -1885,6 +2027,1026 @@ pub fn metric_tile(
                 );
             });
         });
+}
+
+// =============================================================================
+// Unified Visual Topology Widgets (Graphical Signal Conduit, Mute Icons, Presets)
+// =============================================================================
+
+/// Visual flow direction for a signal conduit between Local Node (Left) and Peer Node (Right).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConduitDirection {
+    /// Channel disabled (`✕`).
+    Off,
+    /// Local -> Peer (`▶`).
+    LeftToRight,
+    /// Peer -> Local (`◀`).
+    RightToLeft,
+    /// Simultaneous bidirectional (`⇄`).
+    Bidirectional,
+}
+
+/// Render a compact 4-bar graphical signal health pill in the top header (`📶 0.4 ms · 极佳`).
+/// Clicking toggles the Live Waveforms & Advanced drawer.
+pub fn draw_signal_health_pill(
+    ui: &mut Ui,
+    is_live: bool,
+    rtt_ms: Option<f32>,
+    lost_pkts: u64,
+    status_label: &str,
+    hover_text: &str,
+) -> bool {
+    let (lit_bars, sig_color, mono_part) = if !is_live {
+        (0u8, palette::TEXT_MUTED(), None)
+    } else if lost_pkts > 0 {
+        (
+            2u8,
+            palette::STATUS_WARN(),
+            rtt_ms.map(|ms| format!("{ms:.1} ms")),
+        )
+    } else if let Some(ms) = rtt_ms {
+        let bars = if ms < 18.0 { 4 } else { 3 };
+        (bars, palette::ACCENT(), Some(format!("{ms:.1} ms")))
+    } else {
+        (4u8, palette::ACCENT(), None)
+    };
+
+    let prop_font = FontId::new(11.5, FontFamily::Proportional);
+    let mono_font = FontId::new(11.5, FontFamily::Monospace);
+    let p = ui.painter();
+    let status_g = p.layout_no_wrap(status_label.to_string(), prop_font.clone(), sig_color);
+    let mono_g = mono_part.map(|m| p.layout_no_wrap(m, mono_font.clone(), palette::TEXT_PRIMARY()));
+
+    let bars_w = 15.0;
+    let mut total_w = 11.0 + bars_w + 7.0 + status_g.size().x + 11.0;
+    if let Some(ref mg) = mono_g {
+        total_w += mg.size().x + 6.0;
+    }
+
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(total_w, 31.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let bg = if resp.hovered() {
+            palette::BG_HOVER()
+        } else if is_live {
+            palette::BG_PANEL()
+        } else {
+            palette::BG_RAISED()
+        };
+        let border = if is_live {
+            sig_color.gamma_multiply(0.40)
+        } else {
+            palette::LINE_STRONG()
+        };
+        p.rect(
+            rect,
+            Rounding::same(metrics::RADIUS_BUTTON),
+            bg,
+            Stroke::new(1.0_f32, border),
+        );
+
+        // 4 ascending signal bars (`11.5px` max height centered symmetrically on `cy`)
+        let cy = rect.center().y;
+        let base_y = cy + 5.75;
+        let mut bx = rect.min.x + 11.0;
+        let heights = [3.5_f32, 6.0, 8.8, 11.5];
+        for (idx, &bh) in heights.iter().enumerate() {
+            let bar_col = if (idx as u8) < lit_bars {
+                sig_color
+            } else {
+                palette::TEXT_MUTED().gamma_multiply(0.38)
+            };
+            let bar_rect = Rect::from_min_max(Pos2::new(bx, base_y - bh), Pos2::new(bx + 2.5, base_y));
+            p.rect_filled(bar_rect, Rounding::same(0.8), bar_col);
+            bx += 3.8;
+        }
+
+        let mut tx = rect.min.x + 11.0 + bars_w + 7.0;
+        if let Some(mg) = mono_g {
+            let mw = mg.size().x;
+            paint_galley_vcenter(p, tx, cy, mg, palette::TEXT_PRIMARY());
+            tx += mw + 6.0;
+        }
+        paint_galley_vcenter(p, tx, cy, status_g, sig_color);
+    }
+
+    resp.on_hover_text(hover_text).clicked()
+}
+
+/// Render an interactive Scene Preset card (`当无线耳麦` | `作为主机电脑` | `仅当无线音箱` | `仅当无线麦克风`).
+pub fn scene_preset_card(
+    ui: &mut Ui,
+    id_salt: &str,
+    icon: IconKind,
+    title: &str,
+    desc: &str,
+    selected: bool,
+) -> bool {
+    let avail_w = ui.available_width().max(120.0);
+    let card_h = 56.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(avail_w, card_h), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let anim_t = ui
+        .ctx()
+        .animate_bool_with_time(ui.id().with(("preset_anim", id_salt)), selected, 0.14);
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let bg = if selected {
+            palette::BG_PANEL()
+        } else if resp.hovered() {
+            palette::BG_HOVER()
+        } else {
+            palette::BG_PANEL()
+        };
+        let border_col = if selected {
+            palette::ACCENT().gamma_multiply(0.55 + 0.35 * anim_t)
+        } else if resp.hovered() {
+            palette::LINE_STRONG()
+        } else {
+            palette::LINE()
+        };
+        p.rect(
+            rect,
+            Rounding::same(11.0),
+            bg,
+            Stroke::new(if selected { 1.25_f32 } else { 1.0_f32 }, border_col),
+        );
+
+        // Left icon badge (`32x32`)
+        let ic_rect = Rect::from_center_size(
+            Pos2::new(rect.min.x + 26.0, rect.center().y),
+            Vec2::splat(32.0),
+        );
+        let ic_bg = if selected {
+            palette::ACCENT_TINT()
+        } else {
+            palette::BG_RAISED()
+        };
+        let ic_fg = if selected {
+            palette::ACCENT()
+        } else {
+            palette::TEXT_SECONDARY()
+        };
+        p.rect_filled(ic_rect, Rounding::same(8.0), ic_bg);
+        draw_vector_icon(p, ic_rect.shrink(7.5), icon, ic_fg);
+
+        // Clipped title + flow summary (`±9.0px` symmetric around `rect.center().y`)
+        let text_clip = Rect::from_min_max(
+            Pos2::new(ic_rect.max.x + 10.0, rect.min.y + 4.0),
+            Pos2::new(rect.max.x - 18.0, rect.max.y - 4.0),
+        );
+        let tp = p.with_clip_rect(text_clip);
+        paint_text_vcenter(
+            &tp,
+            Pos2::new(text_clip.min.x, rect.center().y - 9.0),
+            Align::Min,
+            title,
+            FontId::new(13.0, FontFamily::Proportional),
+            if selected {
+                palette::TEXT_PRIMARY()
+            } else {
+                palette::TEXT_SECONDARY()
+            },
+        );
+        paint_text_vcenter(
+            &tp,
+            Pos2::new(text_clip.min.x, rect.center().y + 9.0),
+            Align::Min,
+            desc,
+            FontId::new(11.0, FontFamily::Proportional),
+            if selected {
+                palette::ACCENT()
+            } else {
+                palette::TEXT_MUTED()
+            },
+        );
+
+        if selected {
+            p.circle_filled(
+                Pos2::new(rect.max.x - 11.0, rect.min.y + 11.0),
+                3.2,
+                palette::ACCENT(),
+            );
+        }
+    }
+
+    resp.clicked()
+}
+
+/// Render a `34x34` graphical Mute/Unmute icon button with a crisp diagonal slash when `muted == true`.
+pub fn draw_mute_icon_button(
+    ui: &mut Ui,
+    id_salt: &str,
+    icon: IconKind,
+    active: bool,
+    muted: bool,
+    hover_text: &str,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let _ = ui
+        .ctx()
+        .animate_bool_with_time(ui.id().with(("mute_btn", id_salt)), muted, 0.12);
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let (bg, border, fg) = if muted {
+            (
+                palette::STATUS_DANGER().gamma_multiply(0.16),
+                palette::STATUS_DANGER().gamma_multiply(0.55),
+                palette::STATUS_DANGER(),
+            )
+        } else if active {
+            (
+                if resp.hovered() {
+                    palette::BG_HOVER()
+                } else {
+                    palette::ACCENT_TINT()
+                },
+                palette::ACCENT().gamma_multiply(0.45),
+                palette::ACCENT(),
+            )
+        } else {
+            (
+                if resp.hovered() {
+                    palette::BG_HOVER()
+                } else {
+                    palette::BG_PANEL()
+                },
+                palette::INSET_HIGHLIGHT(),
+                palette::TEXT_PRIMARY(),
+            )
+        };
+
+        p.rect(rect, Rounding::same(9.0), bg, Stroke::new(1.0_f32, border));
+        draw_vector_icon(p, rect.shrink(8.0), icon, fg);
+
+        if muted {
+            let p0 = Pos2::new(rect.min.x + 7.5, rect.min.y + 7.5);
+            let p1 = Pos2::new(rect.max.x - 7.5, rect.max.y - 7.5);
+            p.line_segment([p0, p1], Stroke::new(3.6_f32, bg));
+            p.line_segment([p0, p1], Stroke::new(1.85_f32, palette::STATUS_DANGER()));
+        }
+    }
+
+    resp.on_hover_text(hover_text).clicked()
+}
+
+/// Render a width-responsive dropdown selector pill that clips long device names cleanly.
+pub fn flexible_select_pill<T: Clone + PartialEq>(
+    ui: &mut Ui,
+    id_salt: &str,
+    current: &mut T,
+    selected_label: &str,
+    options: &[(T, String)],
+) -> bool {
+    let mut changed = false;
+    let pill_w = ui.available_width().max(96.0);
+    let pill_h = 34.0;
+
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(pill_w, pill_h), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let popup_id = ui.make_persistent_id(id_salt);
+    if resp.clicked() {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let fill = if resp.hovered() {
+            palette::BG_HOVER()
+        } else {
+            palette::BG_PANEL()
+        };
+        p.rect(
+            rect,
+            Rounding::same(8.0),
+            fill,
+            Stroke::new(1.0_f32, palette::INSET_HIGHLIGHT()),
+        );
+        let cy = rect.center().y;
+        let text_clip = Rect::from_min_max(
+            Pos2::new(rect.min.x + 11.0, rect.min.y + 2.0),
+            Pos2::new(rect.max.x - 26.0, rect.max.y - 2.0),
+        );
+        let tp = p.with_clip_rect(text_clip);
+        paint_text_vcenter(
+            &tp,
+            Pos2::new(text_clip.min.x, cy),
+            Align::Min,
+            selected_label,
+            FontId::new(12.5, FontFamily::Proportional),
+            palette::TEXT_PRIMARY(),
+        );
+        let cx = rect.max.x - 13.5;
+        let chev_stroke = Stroke::new(1.5_f32, palette::TEXT_MUTED());
+        p.line_segment(
+            [Pos2::new(cx - 3.5, cy - 1.75), Pos2::new(cx, cy + 1.75)],
+            chev_stroke,
+        );
+        p.line_segment(
+            [Pos2::new(cx, cy + 1.75), Pos2::new(cx + 3.5, cy - 1.75)],
+            chev_stroke,
+        );
+    }
+
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &resp,
+        egui::PopupCloseBehavior::CloseOnClick,
+        |ui| {
+            ui.set_min_width(pill_w.max(210.0));
+            for (val, label) in options {
+                let is_sel = *current == *val;
+                let r = ui.selectable_label(
+                    is_sel,
+                    RichText::new(label)
+                        .size(12.5)
+                        .color(if is_sel {
+                            palette::ACCENT()
+                        } else {
+                            palette::TEXT_PRIMARY()
+                        }),
+                );
+                if r.clicked() && !is_sel {
+                    *current = val.clone();
+                    changed = true;
+                }
+            }
+        },
+    );
+
+    changed
+}
+
+/// Render a responsive inline volume slider (`0.0..=2.0`) inside a topology port slot.
+pub fn inline_volume_slider(
+    ui: &mut Ui,
+    id_salt: &str,
+    volume: &mut f32,
+    muted: bool,
+    muted_label: &str,
+) -> bool {
+    let mut changed = false;
+    let avail_w = ui.available_width().max(110.0);
+    let val_w = 56.0;
+    let gap = 8.0;
+    let track_w = (avail_w - val_w - gap).max(52.0);
+
+    let (full_rect, _) = ui.allocate_exact_size(Vec2::new(avail_w, 22.0), Sense::hover());
+    let s_rect = Rect::from_min_size(full_rect.min, Vec2::new(track_w, full_rect.height()));
+    let val_rect = Rect::from_min_size(
+        Pos2::new(full_rect.min.x + track_w + gap, full_rect.min.y),
+        Vec2::new(val_w, full_rect.height()),
+    );
+
+    let resp = ui.interact(
+        s_rect,
+        ui.id().with(("inline_vol", id_salt)),
+        Sense::click_and_drag(),
+    );
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    if (resp.dragged() || resp.clicked()) && s_rect.width() > 1.0 {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let norm = ((pos.x - s_rect.min.x) / s_rect.width()).clamp(0.0, 1.0);
+            let new_v = norm * 2.0;
+            if (new_v - *volume).abs() > 1e-4 {
+                *volume = new_v;
+                changed = true;
+            }
+        }
+    }
+
+    if ui.is_rect_visible(full_rect) {
+        let p = ui.painter();
+        let norm = (*volume / 2.0).clamp(0.0, 1.0);
+        let bar_rect = Rect::from_min_size(
+            Pos2::new(s_rect.min.x, s_rect.center().y - 2.0),
+            Vec2::new(s_rect.width(), 4.0),
+        );
+        p.rect_filled(bar_rect, Rounding::same(2.0), palette::SLIDER_TRACK_BG());
+        let fill_col = if muted {
+            palette::STATUS_DANGER().gamma_multiply(0.55)
+        } else {
+            palette::ACCENT()
+        };
+        let fill_rect = Rect::from_min_size(
+            bar_rect.min,
+            Vec2::new(norm * bar_rect.width(), bar_rect.height()),
+        );
+        p.rect_filled(fill_rect, Rounding::same(2.0), fill_col);
+
+        let thumb_x = bar_rect.min.x + norm * bar_rect.width();
+        let thumb_center = Pos2::new(thumb_x, bar_rect.center().y);
+        p.circle_filled(thumb_center, 6.0, Color32::from_rgb(248, 248, 250));
+        p.circle_stroke(thumb_center, 6.0, Stroke::new(1.0_f32, palette::LINE_STRONG()));
+
+        let (label_txt, val_font) = if muted {
+            (
+                muted_label.to_string(),
+                FontId::new(11.0, FontFamily::Proportional),
+            )
+        } else {
+            (
+                format_gain_db(*volume),
+                FontId::new(11.0, FontFamily::Monospace),
+            )
+        };
+        paint_text_vcenter(
+            p,
+            Pos2::new(val_rect.max.x, val_rect.center().y),
+            Align::Max,
+            label_txt,
+            val_font,
+            if muted {
+                palette::STATUS_DANGER()
+            } else {
+                palette::TEXT_SECONDARY()
+            },
+        );
+    }
+
+    changed
+}
+
+/// Compact `24px`-tall Stereo (`L` / `R`) segmented VU meter for Topology Port Cards.
+pub fn compact_stereo_vu_meter(ui: &mut Ui, meter: &VuMeterState, active: bool, muted: bool) {
+    let avail_w = ui.available_width().max(80.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(avail_w, 24.0), Sense::hover());
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let label_w = 14.0;
+        let track_x0 = rect.min.x + label_w;
+        let track_w = (rect.width() - label_w).max(20.0);
+        let font = FontId::new(9.5, FontFamily::Monospace);
+
+        let (norm_l, peak_l, norm_r, peak_r) = if active && !muted {
+            (
+                dbfs_to_norm(meter.smoothed_db),
+                dbfs_to_norm(meter.peak_hold_db),
+                dbfs_to_norm(meter.smoothed_db_r),
+                dbfs_to_norm(meter.peak_hold_db_r),
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+
+        let l_y = rect.center().y - 5.5;
+        paint_text_vcenter(
+            p,
+            Pos2::new(rect.min.x, l_y),
+            Align::Min,
+            "L",
+            font.clone(),
+            palette::TEXT_MUTED(),
+        );
+        draw_segmented_meter_track(
+            p,
+            Rect::from_min_size(Pos2::new(track_x0, l_y - 2.5), Vec2::new(track_w, 5.0)),
+            norm_l,
+            peak_l,
+            None,
+        );
+
+        let r_y = rect.center().y + 5.5;
+        paint_text_vcenter(
+            p,
+            Pos2::new(rect.min.x, r_y),
+            Align::Min,
+            "R",
+            font,
+            palette::TEXT_MUTED(),
+        );
+        draw_segmented_meter_track(
+            p,
+            Rect::from_min_size(Pos2::new(track_x0, r_y - 2.5), Vec2::new(track_w, 5.0)),
+            norm_r,
+            peak_r,
+            None,
+        );
+    }
+}
+
+/// Interactive Mono VU meter where the user can directly click/drag the `▼ 噪声门 -42 dB` marker!
+/// Segments below the gate threshold dim automatically when voice is gated, lighting up Mint above gate.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_interactive_gate_vu_meter(
+    ui: &mut Ui,
+    id_salt: &str,
+    meter: &VuMeterState,
+    active: bool,
+    muted: bool,
+    gate_threshold_db: &mut f32,
+    gate_label_prefix: &str,
+    drag_hover_hint: &str,
+) -> bool {
+    let mut changed = false;
+    let avail_w = ui.available_width().max(90.0);
+    let total_h = 38.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(avail_w, total_h), Sense::hover());
+
+    let label_w = 14.0;
+    let track_x0 = rect.min.x + label_w;
+    let track_w = (rect.width() - label_w).max(24.0);
+
+    let drag_rect = Rect::from_min_max(
+        Pos2::new(track_x0 - 4.0, rect.min.y),
+        Pos2::new(rect.max.x, rect.min.y + 30.0),
+    );
+    let resp = ui.interact(
+        drag_rect,
+        ui.id().with(("interactive_gate_vu", id_salt)),
+        Sense::click_and_drag(),
+    );
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+
+    if (resp.dragged() || resp.clicked()) && track_w > 4.0 {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let norm = ((pos.x - track_x0) / track_w).clamp(0.0, 1.0);
+            let new_db = (-60.0 + norm * 60.0).clamp(-58.0, -18.0).round();
+            if (new_db - *gate_threshold_db).abs() > 0.2 {
+                *gate_threshold_db = new_db;
+                changed = true;
+            }
+        }
+    }
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let gate_norm = dbfs_to_norm(*gate_threshold_db);
+        let gate_x = track_x0 + gate_norm * track_w;
+        let is_interacting = resp.hovered() || resp.dragged();
+
+        // Top draggable label with crisp painted triangle + level text
+        let clean_prefix = gate_label_prefix.trim_start_matches(['▼', ' ']);
+        let gate_text = format!("{clean_prefix} {:.0} dB", *gate_threshold_db);
+        let lbl_font = FontId::new(10.5, FontFamily::Proportional);
+        let lbl_col = if is_interacting {
+            palette::ACCENT()
+        } else {
+            palette::TEXT_SECONDARY()
+        };
+        let galley = p.layout_no_wrap(gate_text, lbl_font, lbl_col);
+        let header_cy = rect.min.y + 7.5;
+        let tri_w = 6.0;
+        let total_lbl_w = tri_w + 4.0 + galley.size().x;
+        let lbl_x = (gate_x - 3.0).clamp(track_x0, (rect.max.x - total_lbl_w).max(track_x0));
+        let tri = vec![
+            Pos2::new(lbl_x, header_cy - 2.2),
+            Pos2::new(lbl_x + tri_w, header_cy - 2.2),
+            Pos2::new(lbl_x + tri_w * 0.5, header_cy + 2.6),
+        ];
+        p.add(egui::Shape::convex_polygon(tri, lbl_col, Stroke::NONE));
+        paint_galley_vcenter(p, lbl_x + tri_w + 4.0, header_cy, galley, lbl_col);
+
+        // Meter track row
+        let m_y = rect.min.y + 24.5;
+        paint_text_vcenter(
+            p,
+            Pos2::new(rect.min.x, m_y),
+            Align::Min,
+            "M",
+            FontId::new(9.5, FontFamily::Monospace),
+            palette::TEXT_MUTED(),
+        );
+        let track_rect = Rect::from_min_size(Pos2::new(track_x0, m_y - 3.0), Vec2::new(track_w, 6.0));
+        p.rect_filled(track_rect, Rounding::same(3.0), palette::CHIP_IDLE_BG());
+
+        let (active_norm, peak_norm) = if active && !muted {
+            (
+                dbfs_to_norm(meter.smoothed_db),
+                dbfs_to_norm(meter.peak_hold_db),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let voice_open = meter.smoothed_db >= *gate_threshold_db;
+
+        if active_norm > 0.005 && track_w > 4.0 {
+            let seg_w = 3.0_f32;
+            let step = 4.0_f32;
+            let max_x = track_rect.min.x + (active_norm * track_w).min(track_w);
+            let mut x = track_rect.min.x;
+            while x + 1.0 <= max_x {
+                let x_end = (x + seg_w).min(max_x);
+                let pos_norm = (x - track_rect.min.x) / track_w;
+                let col = if !voice_open {
+                    palette::TEXT_MUTED().gamma_multiply(0.55)
+                } else if pos_norm >= 0.94 {
+                    palette::STATUS_DANGER()
+                } else if pos_norm >= 0.78 {
+                    palette::STATUS_WARN()
+                } else {
+                    palette::ACCENT()
+                };
+                p.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(x, track_rect.min.y),
+                        Pos2::new(x_end, track_rect.max.y),
+                    ),
+                    Rounding::same(0.8),
+                    col,
+                );
+                x += step;
+            }
+        }
+
+        if peak_norm > 0.015 && voice_open {
+            let px = (track_rect.min.x + peak_norm * track_w)
+                .clamp(track_rect.min.x, track_rect.max.x - 2.0);
+            p.rect_filled(
+                Rect::from_min_size(Pos2::new(px, track_rect.min.y), Vec2::new(2.0, 6.0)),
+                Rounding::same(1.0),
+                palette::PEAK_HOLD_TICK(),
+            );
+        }
+
+        // Crisp draggable gate cursor bar + small top triangle pointer
+        let cursor_col = if is_interacting {
+            palette::ACCENT()
+        } else {
+            palette::TEXT_PRIMARY().gamma_multiply(0.80)
+        };
+        p.line_segment(
+            [
+                Pos2::new(gate_x, track_rect.min.y - 4.5),
+                Pos2::new(gate_x, track_rect.max.y + 4.5),
+            ],
+            Stroke::new(if is_interacting { 2.2_f32 } else { 1.6_f32 }, cursor_col),
+        );
+    }
+
+    let _ = resp.on_hover_text(drag_hover_hint);
+    changed
+}
+
+fn draw_arrow_head(painter: &egui::Painter, tip: Pos2, points_right: bool, color: Color32) {
+    let dir = if points_right { -1.0_f32 } else { 1.0_f32 };
+    let wing_x = tip.x + dir * 6.0;
+    let tri = vec![
+        tip,
+        Pos2::new(wing_x, tip.y - 4.0),
+        Pos2::new(wing_x, tip.y + 4.0),
+    ];
+    painter.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
+}
+
+/// Draw an animated horizontal signal conduit lane between a Left Local Port and Right Peer Port,
+/// returning the interactive `egui::Response` of the center direction selector pill.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_conduit_lane(
+    ui: &mut Ui,
+    lane_rect: Rect,
+    id_salt: &str,
+    channel_caption: &str,
+    pill_label: &str,
+    direction: ConduitDirection,
+    session_active: bool,
+    muted: bool,
+    level_norm: f32,
+    time_secs: f64,
+    hover_hint: &str,
+) -> egui::Response {
+    let cy = lane_rect.center().y + 5.0;
+    let left_x = lane_rect.min.x + 7.0;
+    let right_x = lane_rect.max.x - 7.0;
+
+    let font = FontId::new(11.5, FontFamily::Proportional);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(pill_label.to_string(), font.clone(), palette::TEXT_PRIMARY());
+    let pill_w = (galley.size().x + 48.0).clamp(108.0, (lane_rect.width() - 44.0).max(98.0));
+    let pill_h = 28.0;
+    let pill_rect = Rect::from_center_size(Pos2::new(lane_rect.center().x, cy), Vec2::new(pill_w, pill_h));
+
+    let resp = ui.interact(
+        pill_rect,
+        ui.id().with(("conduit_pill", id_salt)),
+        Sense::click(),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    if ui.is_rect_visible(lane_rect) {
+        let p = ui.painter();
+
+        // Channel caption above pill
+        p.text(
+            Pos2::new(lane_rect.center().x, cy - 23.0),
+            egui::Align2::CENTER_CENTER,
+            channel_caption,
+            FontId::new(11.0, FontFamily::Proportional),
+            palette::TEXT_MUTED(),
+        );
+
+        let is_enabled = direction != ConduitDirection::Off;
+        let is_flowing = session_active && is_enabled && !muted;
+
+        let wire_col = if !is_enabled {
+            palette::LINE()
+        } else if muted {
+            palette::STATUS_DANGER().gamma_multiply(0.50)
+        } else if is_flowing {
+            palette::ACCENT().gamma_multiply(0.52)
+        } else {
+            palette::LINE_STRONG()
+        };
+
+        let seg_l0 = left_x + 6.5;
+        let seg_l1 = (pill_rect.min.x - 5.0).max(seg_l0 + 2.0);
+        let seg_r0 = (pill_rect.max.x + 5.0).min(right_x - 6.5);
+        let seg_r1 = (right_x - 6.5).max(seg_r0 + 2.0);
+
+        // Wire segments
+        if direction == ConduitDirection::Off || muted {
+            draw_dashed_hline(p, seg_l0, seg_l1, cy, wire_col);
+            draw_dashed_hline(p, seg_r0, seg_r1, cy, wire_col);
+        } else if direction == ConduitDirection::Bidirectional {
+            for dy in [-3.2_f32, 3.2_f32] {
+                p.line_segment(
+                    [Pos2::new(seg_l0, cy + dy), Pos2::new(seg_l1, cy + dy)],
+                    Stroke::new(1.5_f32, wire_col),
+                );
+                p.line_segment(
+                    [Pos2::new(seg_r0, cy + dy), Pos2::new(seg_r1, cy + dy)],
+                    Stroke::new(1.5_f32, wire_col),
+                );
+            }
+        } else {
+            let w_stroke = Stroke::new(if is_flowing { 2.0_f32 } else { 1.5_f32 }, wire_col);
+            p.line_segment([Pos2::new(seg_l0, cy), Pos2::new(seg_l1, cy)], w_stroke);
+            p.line_segment([Pos2::new(seg_r0, cy), Pos2::new(seg_r1, cy)], w_stroke);
+        }
+
+        // Animated audio pulse beads when live & unmuted
+        if is_flowing {
+            let amp = level_norm.clamp(0.12, 1.0);
+            let core_r = 2.2 + 1.8 * amp;
+            let halo_r = 5.0 + 3.8 * amp;
+
+            let draw_beads = |x_start: f32, x_end: f32, y_line: f32, left_to_right: bool| {
+                let span = x_end - x_start;
+                if span < 12.0 {
+                    return;
+                }
+                for idx in 0..2 {
+                    let raw_t = (time_secs * 0.90 + (idx as f64) * 0.50).fract() as f32;
+                    let t = if left_to_right { raw_t } else { 1.0 - raw_t };
+                    let bx = x_start + t * span;
+                    let pos = Pos2::new(bx, y_line);
+                    p.circle_filled(pos, halo_r, palette::ACCENT_TINT());
+                    p.circle_filled(pos, core_r, palette::ACCENT());
+                }
+            };
+
+            match direction {
+                ConduitDirection::LeftToRight => {
+                    draw_beads(seg_l0, seg_l1, cy, true);
+                    draw_beads(seg_r0, seg_r1, cy, true);
+                }
+                ConduitDirection::RightToLeft => {
+                    draw_beads(seg_r0, seg_r1, cy, false);
+                    draw_beads(seg_l0, seg_l1, cy, false);
+                }
+                ConduitDirection::Bidirectional => {
+                    draw_beads(seg_l0, seg_l1, cy - 3.2, true);
+                    draw_beads(seg_r0, seg_r1, cy - 3.2, true);
+                    draw_beads(seg_r0, seg_r1, cy + 3.2, false);
+                    draw_beads(seg_l0, seg_l1, cy + 3.2, false);
+                }
+                ConduitDirection::Off => {}
+            }
+        }
+
+        // Destination arrowheads & terminal port sockets
+        let arrow_col = if is_flowing {
+            palette::ACCENT()
+        } else {
+            wire_col
+        };
+        match direction {
+            ConduitDirection::LeftToRight => {
+                draw_arrow_head(p, Pos2::new(right_x - 6.0, cy), true, arrow_col);
+            }
+            ConduitDirection::RightToLeft => {
+                draw_arrow_head(p, Pos2::new(left_x + 6.0, cy), false, arrow_col);
+            }
+            ConduitDirection::Bidirectional => {
+                draw_arrow_head(p, Pos2::new(right_x - 6.0, cy - 3.2), true, arrow_col);
+                draw_arrow_head(p, Pos2::new(left_x + 6.0, cy + 3.2), false, arrow_col);
+            }
+            ConduitDirection::Off => {}
+        }
+
+        let sock_col = if is_flowing {
+            palette::ACCENT()
+        } else if is_enabled {
+            palette::LINE_STRONG()
+        } else {
+            palette::LINE()
+        };
+        for sx in [left_x, right_x] {
+            p.circle_filled(Pos2::new(sx, cy), 4.0, palette::BG_PANEL());
+            p.circle_stroke(Pos2::new(sx, cy), 4.0, Stroke::new(1.5_f32, sock_col));
+        }
+
+        // Center interactive direction selector pill
+        let pill_bg = if resp.hovered() {
+            palette::BG_HOVER()
+        } else if is_flowing {
+            palette::ACCENT_TINT()
+        } else {
+            palette::BG_RAISED()
+        };
+        let pill_border = if is_flowing {
+            palette::ACCENT().gamma_multiply(0.55)
+        } else if is_enabled || resp.hovered() {
+            palette::LINE_STRONG()
+        } else {
+            palette::LINE()
+        };
+        let pill_fg = if !is_enabled {
+            palette::TEXT_MUTED()
+        } else if muted {
+            palette::STATUS_DANGER()
+        } else if is_flowing {
+            palette::ACCENT()
+        } else {
+            palette::TEXT_PRIMARY()
+        };
+
+        p.rect(
+            pill_rect,
+            Rounding::same(14.0),
+            pill_bg,
+            Stroke::new(1.0_f32, pill_border),
+        );
+
+        // Crisp vector direction glyph on pill left (`←` / `→` / `⇄` / `×`)
+        let gx = pill_rect.min.x + 14.5;
+        let gs = Stroke::new(1.5_f32, pill_fg);
+        match direction {
+            ConduitDirection::RightToLeft => {
+                p.line_segment([Pos2::new(gx - 4.2, cy), Pos2::new(gx + 4.2, cy)], gs);
+                p.line_segment([Pos2::new(gx - 4.2, cy), Pos2::new(gx - 1.2, cy - 3.0)], gs);
+                p.line_segment([Pos2::new(gx - 4.2, cy), Pos2::new(gx - 1.2, cy + 3.0)], gs);
+            }
+            ConduitDirection::LeftToRight => {
+                p.line_segment([Pos2::new(gx - 4.2, cy), Pos2::new(gx + 4.2, cy)], gs);
+                p.line_segment([Pos2::new(gx + 4.2, cy), Pos2::new(gx + 1.2, cy - 3.0)], gs);
+                p.line_segment([Pos2::new(gx + 4.2, cy), Pos2::new(gx + 1.2, cy + 3.0)], gs);
+            }
+            ConduitDirection::Bidirectional => {
+                p.line_segment(
+                    [Pos2::new(gx - 4.2, cy - 2.2), Pos2::new(gx + 4.2, cy - 2.2)],
+                    gs,
+                );
+                p.line_segment(
+                    [Pos2::new(gx - 4.2, cy - 2.2), Pos2::new(gx - 1.8, cy - 4.4)],
+                    gs,
+                );
+                p.line_segment(
+                    [Pos2::new(gx - 4.2, cy + 2.2), Pos2::new(gx + 4.2, cy + 2.2)],
+                    gs,
+                );
+                p.line_segment(
+                    [Pos2::new(gx + 4.2, cy + 2.2), Pos2::new(gx + 1.8, cy + 4.4)],
+                    gs,
+                );
+            }
+            ConduitDirection::Off => {
+                p.line_segment(
+                    [Pos2::new(gx - 3.0, cy - 3.0), Pos2::new(gx + 3.0, cy + 3.0)],
+                    gs,
+                );
+                p.line_segment(
+                    [Pos2::new(gx - 3.0, cy + 3.0), Pos2::new(gx + 3.0, cy - 3.0)],
+                    gs,
+                );
+            }
+        }
+
+        let text_clip = Rect::from_min_max(
+            Pos2::new(pill_rect.min.x + 24.0, pill_rect.min.y),
+            Pos2::new(pill_rect.max.x - 19.0, pill_rect.max.y),
+        );
+        let tp = p.with_clip_rect(text_clip);
+        paint_text_vcenter(
+            &tp,
+            Pos2::new(text_clip.center().x, cy),
+            Align::Center,
+            pill_label,
+            font,
+            pill_fg,
+        );
+        // Tiny dropdown chevron inside pill right side (symmetric around `cy`)
+        let cx = pill_rect.max.x - 11.5;
+        let chev_s = Stroke::new(1.3_f32, palette::TEXT_MUTED());
+        p.line_segment(
+            [Pos2::new(cx - 2.8, cy - 1.5), Pos2::new(cx, cy + 1.5)],
+            chev_s,
+        );
+        p.line_segment(
+            [Pos2::new(cx, cy + 1.5), Pos2::new(cx + 2.8, cy - 1.5)],
+            chev_s,
+        );
+    }
+
+    resp.on_hover_text(hover_hint)
+}
+
+/// Render an expandable pill button (`实时波形与高级参数 ▾` / `▴`) for the bottom bar.
+pub fn drawer_toggle_button(
+    ui: &mut Ui,
+    is_open: bool,
+    open_label: &str,
+    close_label: &str,
+) -> bool {
+    let label = if is_open { close_label } else { open_label };
+    let font = FontId::new(12.0, FontFamily::Proportional);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font.clone(), palette::TEXT_PRIMARY());
+    let w = (galley.size().x + 50.0).max(130.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let cy = rect.center().y;
+        let bg = if resp.hovered() || is_open {
+            palette::BG_HOVER()
+        } else {
+            palette::BG_RAISED()
+        };
+        let border = if is_open {
+            palette::ACCENT().gamma_multiply(0.45)
+        } else {
+            palette::INSET_HIGHLIGHT()
+        };
+        p.rect(rect, Rounding::same(8.0), bg, Stroke::new(1.0_f32, border));
+
+        let ic_rect = Rect::from_center_size(Pos2::new(rect.min.x + 16.0, cy), Vec2::splat(14.0));
+        draw_vector_icon(
+            p,
+            ic_rect,
+            IconKind::Sliders,
+            if is_open {
+                palette::ACCENT()
+            } else {
+                palette::TEXT_SECONDARY()
+            },
+        );
+
+        paint_text_vcenter(
+            p,
+            Pos2::new(rect.min.x + 28.0, cy),
+            Align::Min,
+            label,
+            font,
+            if is_open {
+                palette::TEXT_PRIMARY()
+            } else {
+                palette::TEXT_SECONDARY()
+            },
+        );
+
+        let cx = rect.max.x - 13.0;
+        let chev = Stroke::new(1.5_f32, palette::TEXT_MUTED());
+        if is_open {
+            p.line_segment([Pos2::new(cx - 3.5, cy + 1.75), Pos2::new(cx, cy - 1.75)], chev);
+            p.line_segment([Pos2::new(cx, cy - 1.75), Pos2::new(cx + 3.5, cy + 1.75)], chev);
+        } else {
+            p.line_segment([Pos2::new(cx - 3.5, cy - 1.75), Pos2::new(cx, cy + 1.75)], chev);
+            p.line_segment([Pos2::new(cx, cy + 1.75), Pos2::new(cx + 3.5, cy - 1.75)], chev);
+        }
+    }
+
+    resp.clicked()
 }
 
 #[cfg(test)]

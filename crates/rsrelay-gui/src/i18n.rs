@@ -1,13 +1,11 @@
-//! Internationalization (`i18n`) module for `rsrelay-gui` (Quiet Graphite edition).
+//! Internationalization (`i18n`) module for `rsrelay-gui` (Unified Visual Topology edition).
 //!
 //! Follows the Quiet Graphite copywriting guidelines:
-//! - Natural, concise Chinese-first labels in `Language::Zh` (matching Frames C & C2)
+//! - Natural, concise Chinese-first labels in `Language::Zh`
 //! - Clean, concise English labels in `Language::En`
-//! - Technical tokens (`Opus`, `FEC`, `PCM16`, `kbps`, `dB`, `ms`, `kHz`, `pkt/s`) kept universal
+//! - Technical tokens (`Opus`, `FEC`, `PCM16`, `kbps`, `dB`, `ms`, `kHz`, `ASRC`) kept universal
 
-use std::net::{IpAddr, SocketAddr};
-
-use rsrelay_core::DuplexRole;
+use std::net::IpAddr;
 
 /// Supported UI languages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,8 +123,8 @@ impl Language {
 
     pub fn status_ready(self) -> String {
         match self {
-            Self::En => "Ready.".to_string(),
-            Self::Zh => "就绪".to_string(),
+            Self::En => "Ready — choose a preset and click Connect.".to_string(),
+            Self::Zh => "就绪 — 选择场景或设备后点击「开始连接」".to_string(),
         }
     }
 
@@ -137,17 +135,10 @@ impl Language {
         }
     }
 
-    pub fn status_hotswapped_output(self, dev_name: &str) -> String {
+    pub fn status_hotswapped_device(self, dev_name: &str) -> String {
         match self {
-            Self::En => format!("Switched output to default device '{dev_name}'"),
-            Self::Zh => format!("已自动切换输出设备至 '{dev_name}'"),
-        }
-    }
-
-    pub fn status_hotswapped_input(self, dev_name: &str) -> String {
-        match self {
-            Self::En => format!("Switched input to default device '{dev_name}'"),
-            Self::Zh => format!("已自动切换输入设备至 '{dev_name}'"),
+            Self::En => format!("Auto-switched to default audio device '{dev_name}'."),
+            Self::Zh => format!("已自动跟随默认音频设备 '{dev_name}'"),
         }
     }
 
@@ -160,119 +151,43 @@ impl Language {
 
     pub fn status_all_stopped(self) -> String {
         match self {
-            Self::En => "All audio streams stopped.".to_string(),
-            Self::Zh => "已停止全部音频流".to_string(),
+            Self::En => "Audio link disconnected.".to_string(),
+            Self::Zh => "已断开音频连接".to_string(),
         }
     }
 
     pub fn status_all_stopped_tray(self) -> String {
         match self {
-            Self::En => "All streams stopped from System Tray.".to_string(),
-            Self::Zh => "已从系统托盘停止全部音频流".to_string(),
-        }
-    }
-
-    pub fn status_sender_stopped(self) -> String {
-        match self {
-            Self::En => "Transmitter stopped.".to_string(),
-            Self::Zh => "已停止发送".to_string(),
-        }
-    }
-
-    pub fn status_invalid_target_addr(self, err: &impl std::fmt::Display) -> String {
-        match self {
-            Self::En => format!("Invalid target address: {err}"),
-            Self::Zh => format!("目标地址格式无效: {err}"),
-        }
-    }
-
-    pub fn status_sender_streaming(
-        self,
-        device_name: &str,
-        sample_rate: u32,
-        target_addr: SocketAddr,
-    ) -> String {
-        match self {
-            Self::En => format!("Sending '{device_name}' ({sample_rate} Hz) -> {target_addr}"),
-            Self::Zh => format!("正在发送 '{device_name}' ({sample_rate} Hz) -> {target_addr}"),
-        }
-    }
-
-    pub fn status_sender_failed(self, err: &impl std::fmt::Display) -> String {
-        match self {
-            Self::En => format!("Failed to start sender: {err}"),
-            Self::Zh => format!("启动发送失败: {err}"),
-        }
-    }
-
-    pub fn status_receiver_stopped(self) -> String {
-        match self {
-            Self::En => "Receiver stopped.".to_string(),
-            Self::Zh => "已停止接收".to_string(),
-        }
-    }
-
-    pub fn status_invalid_bind_addr(self, err: &impl std::fmt::Display) -> String {
-        match self {
-            Self::En => format!("Invalid listen address: {err}"),
-            Self::Zh => format!("监听地址格式无效: {err}"),
-        }
-    }
-
-    pub fn status_receiver_listening(
-        self,
-        bind_addr: SocketAddr,
-        device_name: &str,
-        sample_rate: u32,
-    ) -> String {
-        match self {
-            Self::En => format!("Listening on {bind_addr} -> '{device_name}' ({sample_rate} Hz)"),
-            Self::Zh => format!("正在监听 {bind_addr} -> '{device_name}' ({sample_rate} Hz)"),
-        }
-    }
-
-    pub fn status_receiver_failed(self, err: &impl std::fmt::Display) -> String {
-        match self {
-            Self::En => format!("Failed to start receiver: {err}"),
-            Self::Zh => format!("启动接收失败: {err}"),
-        }
-    }
-
-    pub fn status_duplex_stopped(self) -> String {
-        match self {
-            Self::En => "Duplex call ended.".to_string(),
-            Self::Zh => "已结束双工通话".to_string(),
+            Self::En => "Disconnected from System Tray.".to_string(),
+            Self::Zh => "已从系统托盘断开音频连接".to_string(),
         }
     }
 
     pub fn status_invalid_peer_ip(self, err: &impl std::fmt::Display) -> String {
         match self {
-            Self::En => format!("Invalid peer IP: {err}"),
-            Self::Zh => format!("对端 IP 地址无效: {err}"),
+            Self::En => format!("Invalid peer IP address: {err}"),
+            Self::Zh => format!("对端 IP 地址格式无效: {err}"),
         }
     }
 
-    pub fn status_duplex_active(
-        self,
-        role: DuplexRole,
-        peer_ip: IpAddr,
-        tx_dev: &str,
-        rx_dev: &str,
-    ) -> String {
+    pub fn status_both_buses_off(self) -> String {
         match self {
-            Self::En => {
-                format!("Duplex [{role:?}] active <-> {peer_ip} (TX: '{tx_dev}', RX: '{rx_dev}')")
-            }
-            Self::Zh => {
-                format!("双工耳麦 [{role:?}] 通话中 <-> {peer_ip} (TX: '{tx_dev}', RX: '{rx_dev}')")
-            }
+            Self::En => "Enable at least System Audio or Mic Voice before connecting.".to_string(),
+            Self::Zh => "请至少开启「电脑声音」或「麦克风语音」中的一路再连接".to_string(),
         }
     }
 
-    pub fn status_duplex_failed(self, err: &impl std::fmt::Display) -> String {
+    pub fn status_link_active(self, peer_ip: IpAddr, summary: &str) -> String {
         match self {
-            Self::En => format!("Failed to start duplex session: {err}"),
-            Self::Zh => format!("启动双工耳麦失败: {err}"),
+            Self::En => format!("Connected <-> {peer_ip} ({summary})"),
+            Self::Zh => format!("已建立连接 <-> {peer_ip} ({summary})"),
+        }
+    }
+
+    pub fn status_link_failed(self, err: &impl std::fmt::Display) -> String {
+        match self {
+            Self::En => format!("Failed to start audio link: {err}"),
+            Self::Zh => format!("启动音频连接失败: {err}"),
         }
     }
 
@@ -283,24 +198,10 @@ impl Language {
         }
     }
 
-    pub fn status_copied_rx_endpoint(self, endpoint: &str) -> String {
-        match self {
-            Self::En => format!("Copied receiver endpoint '{endpoint}' to clipboard."),
-            Self::Zh => format!("已复制接收地址 '{endpoint}'"),
-        }
-    }
-
-    pub fn hover_copy_rx_endpoint(self, endpoint: &str) -> String {
-        match self {
-            Self::En => format!("Copy receiver address ({endpoint})"),
-            Self::Zh => format!("复制接收端地址 ({endpoint})"),
-        }
-    }
-
     pub fn status_selected_lan_peer(self, hostname: &str, addr_str: &str) -> String {
         match self {
             Self::En => format!("Selected peer '{hostname}' ({addr_str})"),
-            Self::Zh => format!("已选择附近设备 '{hostname}' ({addr_str})"),
+            Self::Zh => format!("已选择目标设备 '{hostname}' ({addr_str})"),
         }
     }
 
@@ -325,17 +226,10 @@ impl Language {
         }
     }
 
-    pub fn status_installed_macos_app(self, path: &str) -> String {
-        match self {
-            Self::En => format!("Installed '{path}' and revealed in Finder."),
-            Self::Zh => format!("已安装 '{path}' 并在 Finder 中打开"),
-        }
-    }
-
     pub fn status_installing_vmic_driver(self) -> String {
         match self {
             Self::En => "Installing virtual microphone driver...".to_string(),
-            Self::Zh => "正在编译并安装虚拟麦克风驱动，请在系统弹窗中确认授权...".to_string(),
+            Self::Zh => "正在安装虚拟麦克风驱动，请在系统弹窗中确认授权...".to_string(),
         }
     }
 
@@ -381,30 +275,29 @@ impl Language {
         }
     }
 
-    pub fn format_buffer_summary(self, current_ms: Option<f32>, target_ms: u16) -> String {
-        match (self, current_ms) {
-            (Self::En, Some(_)) | (Self::En, None) => format!("Target {target_ms} ms"),
-            (Self::Zh, Some(_)) | (Self::Zh, None) => format!("目标 {target_ms} ms"),
+    pub fn format_buffer_summary(self, target_ms: u16) -> String {
+        match self {
+            Self::En => format!("Target {target_ms} ms"),
+            Self::Zh => format!("目标 {target_ms} ms"),
         }
     }
 }
 
-/// Compile-time verified UI string table for Quiet Graphite (Frames C & C2).
+/// Compile-time verified UI string table for the Unified Visual Topology GUI.
 pub struct Texts {
     // Window & System Tray
     pub tray_title: &'static str,
     pub tray_show_console: &'static str,
     pub tray_hide_console: &'static str,
-    pub tray_toggle_tx: &'static str,
-    pub tray_toggle_rx: &'static str,
-    pub tray_toggle_duplex: &'static str,
+    pub tray_toggle_link: &'static str,
+    pub tray_mute_speaker: &'static str,
+    pub tray_mute_mic: &'static str,
     pub tray_stop_all: &'static str,
     pub tray_quit: &'static str,
 
     // Sidebar Navigation & Footer
     pub nav_section_mode: &'static str,
-    pub tab_dual_console: &'static str,
-    pub tab_full_duplex: &'static str,
+    pub tab_audio_link: &'static str,
     pub tab_hardware_matrix: &'static str,
     pub nav_section_nearby: &'static str,
     pub sidebar_local_addr: &'static str,
@@ -419,112 +312,56 @@ pub struct Texts {
     pub btn_refresh_ports_hover: &'static str,
     pub discovered_peer_hover: &'static str,
 
-    // Page Headers (C, C2, Audio Devices)
-    pub page_c_title: &'static str,
-    pub page_c_subtitle: &'static str,
-    pub page_c2_title: &'static str,
-    pub page_c2_subtitle: &'static str,
-    pub page_hw_title: &'static str,
-    pub page_hw_subtitle: &'static str,
-    pub btn_stop_all: &'static str,
-
-    // Status Chips & Common Labels
-    pub status_sending: &'static str,
-    pub status_receiving: &'static str,
-    pub status_in_call: &'static str,
-    pub status_healthy: &'static str,
-    pub status_speaking: &'static str,
-    pub status_muted: &'static str,
+    // Unified Audio Link Header & Scene Presets
+    pub page_link_title: &'static str,
+    pub page_link_subtitle: &'static str,
+    pub btn_connect: &'static str,
+    pub btn_disconnect: &'static str,
+    pub status_connected: &'static str,
     pub status_standby: &'static str,
+    pub status_muted: &'static str,
+    pub signal_idle: &'static str,
+    pub signal_excellent: &'static str,
+    pub signal_good: &'static str,
+    pub signal_loss: &'static str,
+    pub signal_hover: &'static str,
+
+    pub preset_headset_title: &'static str,
+    pub preset_headset_desc: &'static str,
+    pub preset_host_title: &'static str,
+    pub preset_host_desc: &'static str,
+    pub preset_speaker_title: &'static str,
+    pub preset_speaker_desc: &'static str,
+    pub preset_mic_title: &'static str,
+    pub preset_mic_desc: &'static str,
+
+    // Visual Topology Nodes, Ports & Conduits
+    pub node_local_title: &'static str,
+    pub node_peer_label: &'static str,
+    pub node_peer_click_hint: &'static str,
+    pub bridge_live_caption: &'static str,
+    pub bridge_standby_caption: &'static str,
+
+    pub conduit_media_label: &'static str,
+    pub conduit_mic_label: &'static str,
+    pub flow_media_recv: &'static str,
+    pub flow_media_send: &'static str,
+    pub flow_media_bi: &'static str,
+    pub flow_mic_send: &'static str,
+    pub flow_mic_recv: &'static str,
+    pub flow_mic_bi: &'static str,
+    pub flow_off: &'static str,
+    pub flow_pill_hover: &'static str,
+
+    pub mute_speaker_hover: &'static str,
+    pub mute_loopback_hover: &'static str,
+    pub mute_mic_hover: &'static str,
+    pub gate_drag_hover: &'static str,
+    pub c2_gate_marker_prefix: &'static str,
+
     pub device_system_default: &'static str,
     pub device_default_speaker: &'static str,
-    pub channel_stereo: &'static str,
-    pub channel_mono: &'static str,
-
-    // Frame C — Left Card: 发送 (Transmitter)
-    pub tx_card_title: &'static str,
-    pub btn_start_tx: &'static str,
-    pub btn_stop_tx: &'static str,
-    pub hero_send_to: &'static str,
-    pub stat_bitrate: &'static str,
-    pub stat_rtt: &'static str,
-    pub stat_packets_sent: &'static str,
-    pub unit_packets: &'static str,
-    pub chart_last_20s: &'static str,
-    pub chart_tx_idle_hint: &'static str,
-    pub label_audio_source: &'static str,
-    pub source_system_loopback: &'static str,
-    pub source_microphone: &'static str,
-    pub source_synthetic_tone: &'static str,
-    pub label_input_device: &'static str,
-    pub label_target_addr: &'static str,
-    pub combo_scan_lan: &'static str,
-    pub combo_no_lan_peers: &'static str,
-    pub combo_local_loopback: &'static str,
-    pub combo_local_lan: &'static str,
-    pub label_quality_latency: &'static str,
-    pub profile_ultra_low: &'static str,
-    pub profile_balanced: &'static str,
-    pub profile_stable: &'static str,
-    pub profile_lossless: &'static str,
-    pub macos_sck_ready: &'static str,
-    pub macos_perm_required: &'static str,
-    pub btn_grant_perm: &'static str,
-    pub hover_grant_perm: &'static str,
-    pub btn_install_macos_app: &'static str,
-    pub hover_install_macos_app: &'static str,
-
-    // Frame C — Right Card: 接收 (Receiver)
-    pub rx_card_title: &'static str,
-    pub btn_start_rx: &'static str,
-    pub btn_stop_rx: &'static str,
-    pub hero_listen_any: &'static str,
-    pub hero_listen_waiting: &'static str,
-    pub hero_receiving_from: &'static str,
-    pub label_source_addr: &'static str,
-    pub source_waiting_any: &'static str,
-    pub source_addr_hover: &'static str,
-    pub route_adaptive_jb: &'static str,
-    pub stat_buffer_level: &'static str,
-    pub stat_clock_comp: &'static str,
-    pub stat_loss_repaired: &'static str,
-    pub chart_jitter_buffer: &'static str,
-    pub chart_rx_idle_hint: &'static str,
-    pub label_listen_port: &'static str,
-    pub label_output_device: &'static str,
-    pub label_target_buffer: &'static str,
-    pub label_output_gain: &'static str,
-    pub chk_advertise_mdns: &'static str,
-
-    // Frame C2 — 双工耳麦 / 跨机共享 (Full-Duplex & Symmetric Win+Mac Sharing)
-    pub btn_start_duplex: &'static str,
-    pub btn_stop_duplex: &'static str,
-    pub conn_local_role: &'static str,
-    pub role_host_short: &'static str,
-    pub role_headset_short: &'static str,
-    pub role_symmetric_short: &'static str,
-    pub conn_codec: &'static str,
-    pub label_bus_direction: &'static str,
-    pub bus_off: &'static str,
-    pub media_mode_send: &'static str,
-    pub media_mode_recv: &'static str,
-    pub media_mode_bi: &'static str,
-    pub mic_mode_send: &'static str,
-    pub mic_mode_recv: &'static str,
-    pub mic_mode_bi: &'static str,
-    pub c2_listen_title: &'static str,
-    pub c2_listen_subtitle: &'static str,
-    pub c2_media_bi_title: &'static str,
-    pub c2_media_bi_subtitle: &'static str,
-    pub c2_media_off_title: &'static str,
-    pub c2_media_off_subtitle: &'static str,
-    pub c2_host_rx_title: &'static str,
-    pub c2_host_rx_subtitle: &'static str,
-    pub c2_mic_bi_title: &'static str,
-    pub c2_mic_bi_subtitle: &'static str,
-    pub c2_mic_off_title: &'static str,
-    pub c2_mic_off_subtitle: &'static str,
-    pub c2_host_rx_device_label: &'static str,
+    pub c2_host_tx_default_loopback: &'static str,
     pub c2_host_rx_auto_vmic: &'static str,
     pub c2_vmic_guard_option: &'static str,
     pub c2_vmic_missing_warn: &'static str,
@@ -533,44 +370,89 @@ pub struct Texts {
     pub btn_install_macos_vmic: &'static str,
     pub btn_install_win_vbcable: &'static str,
     pub btn_installing_vmic: &'static str,
-    pub c2_jb_chart_title: &'static str,
-    pub label_channels: &'static str,
-    pub c2_mic_title: &'static str,
-    pub c2_mic_subtitle: &'static str,
-    pub c2_host_tx_title: &'static str,
-    pub c2_host_tx_subtitle: &'static str,
-    pub c2_host_tx_device_label: &'static str,
-    pub c2_host_tx_default_loopback: &'static str,
-    pub c2_gate_marker_prefix: &'static str,
-    pub stat_level: &'static str,
-    pub stat_gated_frames: &'static str,
-    pub c2_voice_chart_title: &'static str,
-    pub label_microphone: &'static str,
-    pub label_noise_gate_threshold: &'static str,
-    pub label_mic_mute: &'static str,
+    pub macos_perm_required: &'static str,
+    pub btn_grant_perm: &'static str,
+    pub hover_grant_perm: &'static str,
 
-    // Tab 3 — 音频设备 (Hardware Matrix)
+    // Remote Peer Mirror Cards
+    pub peer_media_recv_title: &'static str,
+    pub peer_media_recv_desc: &'static str,
+    pub peer_media_send_title: &'static str,
+    pub peer_media_send_desc: &'static str,
+    pub peer_media_bi_title: &'static str,
+    pub peer_media_bi_desc: &'static str,
+    pub peer_media_off_title: &'static str,
+    pub peer_media_off_desc: &'static str,
+
+    pub peer_mic_send_title: &'static str,
+    pub peer_mic_send_desc: &'static str,
+    pub peer_mic_recv_title: &'static str,
+    pub peer_mic_recv_desc: &'static str,
+    pub peer_mic_bi_title: &'static str,
+    pub peer_mic_bi_desc: &'static str,
+    pub peer_mic_off_title: &'static str,
+    pub peer_mic_off_desc: &'static str,
+
+    // Bottom Bar & Collapsible Pro Telemetry / Advanced Drawer
+    pub label_quality_latency: &'static str,
+    pub profile_ultra_low: &'static str,
+    pub profile_balanced: &'static str,
+    pub profile_stable: &'static str,
+    pub profile_lossless: &'static str,
+    pub btn_drawer_open: &'static str,
+    pub btn_drawer_close: &'static str,
+
+    pub drawer_telemetry_title: &'static str,
+    pub drawer_advanced_title: &'static str,
+    pub stat_buffer_level: &'static str,
+    pub stat_clock_comp: &'static str,
+    pub stat_loss_repaired: &'static str,
+    pub stat_gated_frames: &'static str,
+    pub c2_jb_chart_title: &'static str,
+    pub c2_voice_chart_title: &'static str,
+    pub chart_rx_idle_hint: &'static str,
+    pub chart_tx_idle_hint: &'static str,
+
+    pub label_target_addr: &'static str,
+    pub combo_scan_lan: &'static str,
+    pub combo_no_lan_peers: &'static str,
+    pub combo_local_loopback: &'static str,
+    pub combo_local_lan: &'static str,
+    pub label_media_port: &'static str,
+    pub label_mic_port: &'static str,
+    pub label_custom_buffer: &'static str,
+    pub buffer_auto_profile: &'static str,
+    pub label_channels: &'static str,
+    pub channel_stereo: &'static str,
+    pub channel_mono: &'static str,
+    pub label_opus_bitrate: &'static str,
+    pub label_test_tone: &'static str,
+    pub label_status_log: &'static str,
+
+    // Tab 2 — 音频设备 (Hardware Matrix)
+    pub page_hw_title: &'static str,
+    pub page_hw_subtitle: &'static str,
     pub hw_input_title: &'static str,
     pub hw_input_subtitle: &'static str,
     pub hw_output_title: &'static str,
     pub hw_output_subtitle: &'static str,
     pub badge_default_in: &'static str,
     pub badge_default_out: &'static str,
+    pub chk_advertise_mdns: &'static str,
 }
 
 pub const TEXTS_ZH: Texts = Texts {
-    tray_title: "rsrelay — 实时音频中继",
+    tray_title: "rsrelay — 实时音频连接",
     tray_show_console: "打开主窗口",
     tray_hide_console: "最小化到托盘",
-    tray_toggle_tx: "开始 / 停止发送",
-    tray_toggle_rx: "开始 / 停止接收",
-    tray_toggle_duplex: "开始 / 结束双工通话",
-    tray_stop_all: "全部停止",
+    tray_toggle_link: "开始 / 断开音频连接",
+    tray_mute_speaker: "静音 / 恢复本机播放",
+    tray_mute_mic: "静音 / 恢复麦克风",
+    tray_stop_all: "断开连接",
     tray_quit: "退出 rsrelay",
 
-    nav_section_mode: "工作模式",
-    tab_dual_console: "收发",
-    tab_full_duplex: "双工耳麦",
+    nav_section_mode: "控制台",
+    tab_audio_link: "音频连接",
     tab_hardware_matrix: "音频设备",
     nav_section_nearby: "附近设备",
     sidebar_local_addr: "本机地址",
@@ -583,154 +465,144 @@ pub const TEXTS_ZH: Texts = Texts {
     btn_scan_lan_hover: "扫描局域网内的附近设备",
     btn_refresh_ports: "刷新设备",
     btn_refresh_ports_hover: "重新枚举本机音频输入与输出设备",
-    discovered_peer_hover: "点击选择此设备作为目标地址",
+    discovered_peer_hover: "点击选择此设备作为连接目标",
 
-    page_c_title: "收发",
-    page_c_subtitle: "把本机声音推送到局域网内的另一台设备，或接收它传来的声音",
-    page_c2_title: "双工耳麦",
-    page_c2_subtitle: "把这台设备当作另一台电脑的无线耳麦：听它的声音，同时把你的麦克风传回去",
-    page_hw_title: "音频设备",
-    page_hw_subtitle: "管理本机输入采集与输出播放硬件、默认路由及局域网广播设置",
-    btn_stop_all: "全部停止",
-
-    status_sending: "正在发送",
-    status_receiving: "正在接收",
-    status_in_call: "通话中",
-    status_healthy: "正常",
-    status_speaking: "正在说话",
-    status_muted: "已静音",
+    page_link_title: "音频连接",
+    page_link_subtitle: "直观连接局域网电脑，按需组合电脑声音收听与无线麦克风",
+    btn_connect: "开始连接",
+    btn_disconnect: "断开连接",
+    status_connected: "已连接",
     status_standby: "待机",
-    device_system_default: "系统默认输入",
-    device_default_speaker: "系统默认扬声器",
-    channel_stereo: "立体声",
-    channel_mono: "单声道",
+    status_muted: "已静音",
+    signal_idle: "等待连接",
+    signal_excellent: "极佳",
+    signal_good: "稳定",
+    signal_loss: "有丢包",
+    signal_hover: "点击展开或收起实时波形与高级参数",
 
-    tx_card_title: "发送",
-    btn_start_tx: "开始发送",
-    btn_stop_tx: "停止",
-    hero_send_to: "发送到",
-    stat_bitrate: "码率",
-    stat_rtt: "往返延迟",
-    stat_packets_sent: "已发送",
-    unit_packets: "包",
-    chart_last_20s: "最近 20 秒",
-    chart_tx_idle_hint: "开始发送后将在此显示音频波形",
-    label_audio_source: "音频来源",
-    source_system_loopback: "系统内录",
-    source_microphone: "麦克风",
-    source_synthetic_tone: "测试信号 (440Hz)",
-    label_input_device: "输入设备",
-    label_target_addr: "目标地址",
-    combo_scan_lan: "↻ 重新扫描局域网设备",
-    combo_no_lan_peers: "暂未发现其他局域网设备 (可手动输入)",
-    combo_local_loopback: "本机回环",
-    combo_local_lan: "本机节点 (LAN)",
+    preset_headset_title: "当无线耳麦",
+    preset_headset_desc: "听对方声音 · 发本机麦克风",
+    preset_host_title: "作为主机电脑",
+    preset_host_desc: "发本机声音 · 收进虚拟麦",
+    preset_speaker_title: "仅当无线音箱",
+    preset_speaker_desc: "只听对方声音 · 麦克风关闭",
+    preset_mic_title: "仅当无线麦克风",
+    preset_mic_desc: "只发本机麦 · 声音通道关闭",
+
+    node_local_title: "本机",
+    node_peer_label: "目标电脑",
+    node_peer_click_hint: "点击切换局域网设备或手动输入 IP",
+    bridge_live_caption: "UDP 低延迟实时传输中",
+    bridge_standby_caption: "就绪 · 点击右上角开始连接",
+
+    conduit_media_label: "电脑声音",
+    conduit_mic_label: "麦克风语音",
+    flow_media_recv: "听对方声音",
+    flow_media_send: "发本机声音",
+    flow_media_bi: "双向共享",
+    flow_mic_send: "发本机麦克风",
+    flow_mic_recv: "收进虚拟麦",
+    flow_mic_bi: "双向互享",
+    flow_off: "已关闭",
+    flow_pill_hover: "点击切换此通道流向或开关",
+
+    mute_speaker_hover: "点击图标静音 / 恢复本机耳机播放",
+    mute_loopback_hover: "点击图标静音 / 恢复发送本机系统声音",
+    mute_mic_hover: "点击图标静音 / 恢复本机麦克风",
+    gate_drag_hover: "左右拖动 ▼ 游标直接调节噪声门阈值（低于此音量的环境底噪自动静音省流）",
+    c2_gate_marker_prefix: "▼ 噪声门",
+
+    device_system_default: "系统默认麦克风",
+    device_default_speaker: "系统默认扬声器",
+    c2_host_tx_default_loopback: "系统默认内录",
+    c2_host_rx_auto_vmic: "自动 · 虚拟麦克风",
+    c2_vmic_guard_option: "防回声保护 (待安装虚拟麦)",
+    c2_vmic_missing_warn: "未检测到虚拟声卡 · 已启用防回声保护",
+    c2_vmic_audiorelay_hint: "检测到 AudioRelay 后台运行中，如遇抢占可退出它",
+    c2_vmic_ready_prefix: "会议/游戏麦请选：",
+    btn_install_macos_vmic: "一键安装虚拟麦",
+    btn_install_win_vbcable: "安装 VB-CABLE",
+    btn_installing_vmic: "正在安装...",
+    macos_perm_required: "需要系统内录权限",
+    btn_grant_perm: "点击授权系统内录",
+    hover_grant_perm: "打开 macOS 系统设置授权录屏与系统录音权限",
+
+    peer_media_recv_title: "对端系统内录",
+    peer_media_recv_desc: "采集对方电脑正在播放的游戏、影音或会议声，传到本机耳机收听",
+    peer_media_send_title: "对端耳机 / 扬声器",
+    peer_media_send_desc: "把本机正在播放的系统声音实时推送到对方电脑播放",
+    peer_media_bi_title: "对端内录 ⇄ 扬声器",
+    peer_media_bi_desc: "两台电脑同时互相收听对方的系统声音",
+    peer_media_off_title: "声音通道已关闭",
+    peer_media_off_desc: "当前不传输系统声音，点击中间胶囊按钮可开启",
+
+    peer_mic_send_title: "对端虚拟麦克风",
+    peer_mic_send_desc: "在对方微信 / 腾讯会议 / Discord / 游戏中选虚拟麦，即可用本机麦说话",
+    peer_mic_recv_title: "对端物理麦克风",
+    peer_mic_recv_desc: "接收对方耳麦语音并注入本机虚拟麦（不外放零回声）",
+    peer_mic_bi_title: "对端物理麦 ⇄ 虚拟麦",
+    peer_mic_bi_desc: "两台电脑互相把物理麦克风注入对方的虚拟麦克风",
+    peer_mic_off_title: "麦克风通道已关闭",
+    peer_mic_off_desc: "当前不传输麦克风语音，点击中间胶囊按钮可开启",
+
     label_quality_latency: "音质与延迟",
     profile_ultra_low: "极低延迟",
-    profile_balanced: "均衡",
-    profile_stable: "稳定",
-    profile_lossless: "无损",
-    macos_sck_ready: "macOS 内录已就绪",
-    macos_perm_required: "需要系统录音权限",
-    btn_grant_perm: "授权权限",
-    hover_grant_perm: "打开 macOS 系统设置授权系统录音权限",
-    btn_install_macos_app: "安装到应用程序",
-    hover_install_macos_app: "将 rsrelay.app 安装到 /Applications 并在 Finder 中显示",
+    profile_balanced: "均衡抗抖动",
+    profile_stable: "穿墙稳定",
+    profile_lossless: "无损 PCM",
+    btn_drawer_open: "实时波形与高级参数",
+    btn_drawer_close: "收起波形与高级参数",
 
-    rx_card_title: "接收",
-    btn_start_rx: "开始接收",
-    btn_stop_rx: "停止",
-    hero_listen_any: "监听地址 · 接受任意来源",
-    hero_listen_waiting: "监听地址 · 等待来源接入",
-    hero_receiving_from: "正在接收来自",
-    label_source_addr: "来源地址",
-    source_waiting_any: "等待接入 (任意来源)",
-    source_addr_hover: "点击复制此来源地址并设为发送目标",
-    route_adaptive_jb: "自适应抖动缓冲",
+    drawer_telemetry_title: "实时声学与网络遥测",
+    drawer_advanced_title: "高级网络与声学参数",
     stat_buffer_level: "缓冲水位",
     stat_clock_comp: "时钟补偿",
     stat_loss_repaired: "丢包 / 修复",
-    chart_jitter_buffer: "抖动缓冲",
-    chart_rx_idle_hint: "开始接收后将在此显示缓冲曲线",
-    label_listen_port: "监听端口",
-    label_output_device: "输出设备",
-    label_target_buffer: "目标缓冲",
-    label_output_gain: "输出增益",
-    chk_advertise_mdns: "在局域网广播此节点 (自动发现)",
+    stat_gated_frames: "降噪省流帧",
+    c2_jb_chart_title: "抖动缓冲水位 · 最近 20 秒",
+    c2_voice_chart_title: "人声 / 音频包络 · 最近 20 秒",
+    chart_rx_idle_hint: "连接接收后将在此显示实时抖动缓冲曲线",
+    chart_tx_idle_hint: "连接发送后将在此显示实时声学包络波形",
 
-    btn_start_duplex: "开始通话",
-    btn_stop_duplex: "结束通话",
-    conn_local_role: "本机角色",
-    role_host_short: "主机电脑",
-    role_headset_short: "无线耳麦",
-    role_symmetric_short: "双机互享",
-    conn_codec: "编码",
-    label_bus_direction: "通道流向",
-    bus_off: "关闭",
-    media_mode_send: "发内录",
-    media_mode_recv: "收听",
-    media_mode_bi: "双向",
-    mic_mode_send: "发本机麦",
-    mic_mode_recv: "进虚拟麦",
-    mic_mode_bi: "双向",
-    c2_listen_title: "播放器收听",
-    c2_listen_subtitle: "播放器通道 · 收听对端声音至本机耳机",
-    c2_media_bi_title: "播放器双向共享",
-    c2_media_bi_subtitle: "播放器通道 · 同时发送本机内录并收听对端声音",
-    c2_media_off_title: "播放器通道 (未启用)",
-    c2_media_off_subtitle: "仅使用右侧麦克风共享通道",
-    c2_host_rx_title: "虚拟麦克风接收",
-    c2_host_rx_subtitle: "麦克风通道 · 接收对端语音并注入虚拟麦 (零外放回声)",
-    c2_mic_bi_title: "麦克风双向互享",
-    c2_mic_bi_subtitle: "麦克风通道 · 发送物理麦克风 + 接收进本机虚拟麦",
-    c2_mic_off_title: "麦克风通道 (未启用)",
-    c2_mic_off_subtitle: "仅使用左侧播放器共享通道",
-    c2_host_rx_device_label: "虚拟麦注入目标",
-    c2_host_rx_auto_vmic: "自动 · 虚拟麦克风 (零回声)",
-    c2_vmic_guard_option: "防回声静音保护 (待安装虚拟麦)",
-    c2_vmic_missing_warn: "未检测到虚拟声卡 · 已启用防回声保护 (不外放对端语音)",
-    c2_vmic_audiorelay_hint: "提示：检测到 AudioRelay 后台正在运行，如遇抢占可退出 AudioRelay (驱动仍保留)",
-    c2_vmic_ready_prefix: "会议/浏览器麦克风请选：",
-    btn_install_macos_vmic: "一键安装虚拟麦克风",
-    btn_install_win_vbcable: "安装 VB-CABLE 驱动",
-    btn_installing_vmic: "正在安装...",
-    c2_jb_chart_title: "抖动缓冲 · 最近 20 秒",
-    label_channels: "声道",
-    c2_mic_title: "麦克风发送",
-    c2_mic_subtitle: "麦克风通道 · 采集本机物理麦发往对端虚拟麦",
-    c2_host_tx_title: "系统声音发送",
-    c2_host_tx_subtitle: "播放器通道 · 采集本机系统内录发往对端耳机",
-    c2_host_tx_device_label: "系统内录声卡",
-    c2_host_tx_default_loopback: "系统默认扬声器 (内录)",
-    c2_gate_marker_prefix: "▼ 噪声门",
-    stat_level: "电平",
-    stat_gated_frames: "静音帧（已省流）",
-    c2_voice_chart_title: "人声包络 · 最近 20 秒",
-    label_microphone: "本机物理麦",
-    label_noise_gate_threshold: "噪声门阈值",
-    label_mic_mute: "麦克风静音",
+    label_target_addr: "目标电脑地址",
+    combo_scan_lan: "↻ 重新扫描局域网设备",
+    combo_no_lan_peers: "暂未发现其他局域网设备 (可直接输入 IP)",
+    combo_local_loopback: "本机回环测试",
+    combo_local_lan: "本机局域网节点",
+    label_media_port: "声音通道 UDP 端口",
+    label_mic_port: "麦克风通道 UDP 端口",
+    label_custom_buffer: "自定义目标缓冲",
+    buffer_auto_profile: "跟随延迟档位",
+    label_channels: "声音声道",
+    channel_stereo: "立体声",
+    channel_mono: "单声道",
+    label_opus_bitrate: "Opus 声音码率",
+    label_test_tone: "440Hz 测试正弦波",
+    label_status_log: "最近状态",
 
+    page_hw_title: "音频设备",
+    page_hw_subtitle: "查看本机输入采集与输出播放硬件、默认路由及局域网自动发现设置",
     hw_input_title: "输入设备",
-    hw_input_subtitle: "本机麦克风与环回采集硬件",
+    hw_input_subtitle: "本机麦克风与虚拟音频采集硬件",
     hw_output_title: "输出设备",
-    hw_output_subtitle: "本机扬声器与耳机播放硬件",
+    hw_output_subtitle: "本机扬声器、耳机与虚拟声卡接收端",
     badge_default_in: "默认",
     badge_default_out: "默认",
+    chk_advertise_mdns: "在局域网广播此节点 (供其他电脑自动发现)",
 };
 
 pub const TEXTS_EN: Texts = Texts {
-    tray_title: "rsrelay — Audio Relay",
+    tray_title: "rsrelay — Audio Link",
     tray_show_console: "Open Window",
     tray_hide_console: "Minimize to Tray",
-    tray_toggle_tx: "Start / Stop Transmit",
-    tray_toggle_rx: "Start / Stop Receive",
-    tray_toggle_duplex: "Start / End Duplex Call",
-    tray_stop_all: "Stop All",
+    tray_toggle_link: "Connect / Disconnect Audio Link",
+    tray_mute_speaker: "Mute / Unmute Speaker",
+    tray_mute_mic: "Mute / Unmute Microphone",
+    tray_stop_all: "Disconnect",
     tray_quit: "Quit rsrelay",
 
-    nav_section_mode: "MODE",
-    tab_dual_console: "Send & Receive",
-    tab_full_duplex: "Duplex Headset",
+    nav_section_mode: "WORKSPACE",
+    tab_audio_link: "Audio Link",
     tab_hardware_matrix: "Audio Devices",
     nav_section_nearby: "NEARBY DEVICES",
     sidebar_local_addr: "Local Address",
@@ -743,142 +615,131 @@ pub const TEXTS_EN: Texts = Texts {
     btn_scan_lan_hover: "Scan LAN for nearby devices",
     btn_refresh_ports: "Refresh Devices",
     btn_refresh_ports_hover: "Re-enumerate system audio input and output devices",
-    discovered_peer_hover: "Click to select this peer as target",
+    discovered_peer_hover: "Click to select this device as target peer",
 
-    page_c_title: "Send & Receive",
-    page_c_subtitle:
-        "Stream this machine's audio to another device on the LAN, or listen to incoming audio",
-    page_c2_title: "Duplex Headset",
-    page_c2_subtitle:
-        "Use this device as a wireless headset for another computer: listen to its audio and send your mic back",
-    page_hw_title: "Audio Devices",
-    page_hw_subtitle:
-        "Inspect local capture and playback hardware, default routing, and LAN discovery settings",
-    btn_stop_all: "Stop All",
-
-    status_sending: "Sending",
-    status_receiving: "Receiving",
-    status_in_call: "In Call",
-    status_healthy: "Healthy",
-    status_speaking: "Speaking",
-    status_muted: "Muted",
+    page_link_title: "Audio Link",
+    page_link_subtitle: "Visually route desktop audio and microphone voice across your LAN",
+    btn_connect: "Connect",
+    btn_disconnect: "Disconnect",
+    status_connected: "Connected",
     status_standby: "Standby",
-    device_system_default: "System Default Input",
+    status_muted: "Muted",
+    signal_idle: "Standby",
+    signal_excellent: "Excellent",
+    signal_good: "Good",
+    signal_loss: "Loss",
+    signal_hover: "Click to toggle live waveforms & advanced parameters",
+
+    preset_headset_title: "Wireless Headset",
+    preset_headset_desc: "Listen to peer · Send mic",
+    preset_host_title: "Host PC",
+    preset_host_desc: "Send audio · Recv Virtual Mic",
+    preset_speaker_title: "Speaker Only",
+    preset_speaker_desc: "Listen to peer · Mic off",
+    preset_mic_title: "Mic Only",
+    preset_mic_desc: "Send mic · Audio off",
+
+    node_local_title: "This Machine",
+    node_peer_label: "Target Peer",
+    node_peer_click_hint: "Click to choose peer or enter IP",
+    bridge_live_caption: "Low-Latency UDP Streaming",
+    bridge_standby_caption: "Ready · Click Connect to start",
+
+    conduit_media_label: "System Audio",
+    conduit_mic_label: "Mic Voice",
+    flow_media_recv: "Listen",
+    flow_media_send: "Send Audio",
+    flow_media_bi: "Both Ways",
+    flow_mic_send: "Send Mic",
+    flow_mic_recv: "Into VMic",
+    flow_mic_bi: "Both Ways",
+    flow_off: "Off",
+    flow_pill_hover: "Click to change direction or disable channel",
+
+    mute_speaker_hover: "Click icon to mute / unmute local playback",
+    mute_loopback_hover: "Click icon to mute / unmute local system audio send",
+    mute_mic_hover: "Click icon to mute / unmute microphone",
+    gate_drag_hover: "Drag ▼ marker left/right to set Noise Gate threshold",
+    c2_gate_marker_prefix: "▼ Gate",
+
+    device_system_default: "System Default Mic",
     device_default_speaker: "System Default Speaker",
-    channel_stereo: "Stereo",
-    channel_mono: "Mono",
-
-    tx_card_title: "Transmit",
-    btn_start_tx: "Start Sending",
-    btn_stop_tx: "Stop",
-    hero_send_to: "Send to",
-    stat_bitrate: "Bitrate",
-    stat_rtt: "Round-Trip",
-    stat_packets_sent: "Sent",
-    unit_packets: "pkts",
-    chart_last_20s: "Last 20s",
-    chart_tx_idle_hint: "Audio waveform will appear when sending",
-    label_audio_source: "Audio Source",
-    source_system_loopback: "System Loopback",
-    source_microphone: "Microphone",
-    source_synthetic_tone: "Test Tone (440Hz)",
-    label_input_device: "Input Device",
-    label_target_addr: "Target Address",
-    combo_scan_lan: "↻ Rescan LAN Devices",
-    combo_no_lan_peers: "No other LAN peers found yet (manual input ready)",
-    combo_local_loopback: "Localhost",
-    combo_local_lan: "This Machine (LAN)",
-    label_quality_latency: "Quality & Latency",
-    profile_ultra_low: "Ultra-Low",
-    profile_balanced: "Balanced",
-    profile_stable: "Stable",
-    profile_lossless: "Lossless",
-    macos_sck_ready: "macOS SCK Ready",
-    macos_perm_required: "Audio Permission Needed",
-    btn_grant_perm: "Grant Permission",
-    hover_grant_perm: "Open macOS System Settings for Screen & System Audio Recording",
-    btn_install_macos_app: "Install App",
-    hover_install_macos_app: "Install /Applications/rsrelay.app and reveal in Finder",
-
-    rx_card_title: "Receive",
-    btn_start_rx: "Start Receiving",
-    btn_stop_rx: "Stop",
-    hero_listen_any: "Listen Address · Any Source",
-    hero_listen_waiting: "Listen Address · Waiting for Source",
-    hero_receiving_from: "Receiving from",
-    label_source_addr: "Source Address",
-    source_waiting_any: "Waiting (Any Source)",
-    source_addr_hover: "Click to copy source address and use as target",
-    route_adaptive_jb: "Adaptive Jitter Buffer",
-    stat_buffer_level: "Buffer Level",
-    stat_clock_comp: "Clock Drift",
-    stat_loss_repaired: "Lost / Fixed",
-    chart_jitter_buffer: "Jitter Buffer",
-    chart_rx_idle_hint: "Buffer curve will appear when receiving",
-    label_listen_port: "Listen Port",
-    label_output_device: "Output Device",
-    label_target_buffer: "Target Buffer",
-    label_output_gain: "Output Gain",
-    chk_advertise_mdns: "Advertise node on LAN (Auto-Discovery)",
-
-    btn_start_duplex: "Start Call",
-    btn_stop_duplex: "End Call",
-    conn_local_role: "Local Role",
-    role_host_short: "Host PC",
-    role_headset_short: "Headset",
-    role_symmetric_short: "Dual Share",
-    conn_codec: "Codec",
-    label_bus_direction: "Bus Flow",
-    bus_off: "Off",
-    media_mode_send: "Send",
-    media_mode_recv: "Listen",
-    media_mode_bi: "Both",
-    mic_mode_send: "Send Mic",
-    mic_mode_recv: "To VMic",
-    mic_mode_bi: "Both",
-    c2_listen_title: "Player Listen",
-    c2_listen_subtitle: "Media Bus · Play peer system audio to headphones",
-    c2_media_bi_title: "Player Bidirectional",
-    c2_media_bi_subtitle: "Media Bus · Send local loopback & listen to peer",
-    c2_media_off_title: "Player Bus (Off)",
-    c2_media_off_subtitle: "Only Microphone Bus active",
-    c2_host_rx_title: "Virtual Mic Bridge",
-    c2_host_rx_subtitle: "Mic Bus · Inject peer voice into Virtual Mic (echo-free)",
-    c2_mic_bi_title: "Mic Bidirectional",
-    c2_mic_bi_subtitle: "Mic Bus · Send physical mic & receive into Virtual Mic",
-    c2_mic_off_title: "Mic Bus (Off)",
-    c2_mic_off_subtitle: "Only Player Bus active",
-    c2_host_rx_device_label: "Virtual Mic Sink",
-    c2_host_rx_auto_vmic: "Auto · Virtual Mic (Echo-Free)",
+    c2_host_tx_default_loopback: "Default System Audio",
+    c2_host_rx_auto_vmic: "Auto · Virtual Mic",
     c2_vmic_guard_option: "Echo-Free Guard (Driver Needed)",
-    c2_vmic_missing_warn: "No virtual mic detected · Echo-Free Guard active (muted from speakers)",
-    c2_vmic_audiorelay_hint: "Tip: AudioRelay is running in background; quit AudioRelay if Virtual Mic contends",
+    c2_vmic_missing_warn: "No virtual mic · Echo-Free Guard active",
+    c2_vmic_audiorelay_hint: "AudioRelay running; quit it if Virtual Mic contends",
     c2_vmic_ready_prefix: "Select mic in apps: ",
     btn_install_macos_vmic: "Install Virtual Mic",
     btn_install_win_vbcable: "Install VB-CABLE",
     btn_installing_vmic: "Installing...",
-    c2_jb_chart_title: "Jitter Buffer · Last 20s",
-    label_channels: "Channels",
-    c2_mic_title: "Mic Transmit",
-    c2_mic_subtitle: "Mic Bus · Stream physical mic to peer Virtual Mic",
-    c2_host_tx_title: "System Audio Send",
-    c2_host_tx_subtitle: "Media Bus · Stream local loopback to peer headphones",
-    c2_host_tx_device_label: "Loopback Source",
-    c2_host_tx_default_loopback: "Default Speaker (Loopback)",
-    c2_gate_marker_prefix: "▼ Gate",
-    stat_level: "Level",
-    stat_gated_frames: "Gated Frames (Saved)",
-    c2_voice_chart_title: "Voice Envelope · Last 20s",
-    label_microphone: "Physical Mic",
-    label_noise_gate_threshold: "Noise Gate",
-    label_mic_mute: "Mute Mic",
+    macos_perm_required: "Audio Permission Needed",
+    btn_grant_perm: "Grant Audio Permission",
+    hover_grant_perm: "Open macOS System Settings for Screen & System Audio Recording",
 
+    peer_media_recv_title: "Peer System Audio",
+    peer_media_recv_desc: "Streams peer's game, video, and desktop audio to your headphones",
+    peer_media_send_title: "Peer Headphones / Speaker",
+    peer_media_send_desc: "Streams this machine's system audio to play on the peer",
+    peer_media_bi_title: "Peer Loopback ⇄ Speaker",
+    peer_media_bi_desc: "Both machines share and listen to each other's system audio",
+    peer_media_off_title: "Audio Channel Off",
+    peer_media_off_desc: "No desktop audio streamed; click the center pill to enable",
+
+    peer_mic_send_title: "Peer Virtual Microphone",
+    peer_mic_send_desc: "Pick Virtual Mic in peer's Zoom, Discord, or games to speak from here",
+    peer_mic_recv_title: "Peer Physical Microphone",
+    peer_mic_recv_desc: "Routes peer's headset mic into this machine's Virtual Mic (echo-free)",
+    peer_mic_bi_title: "Peer Mic ⇄ Virtual Mic",
+    peer_mic_bi_desc: "Both machines bridge physical mics into each other's Virtual Mic",
+    peer_mic_off_title: "Mic Channel Off",
+    peer_mic_off_desc: "No microphone voice streamed; click the center pill to enable",
+
+    label_quality_latency: "Quality & Latency",
+    profile_ultra_low: "Ultra-Low",
+    profile_balanced: "Balanced",
+    profile_stable: "Stable",
+    profile_lossless: "Lossless PCM",
+    btn_drawer_open: "Waveforms & Advanced",
+    btn_drawer_close: "Hide Advanced",
+
+    drawer_telemetry_title: "Live Audio & Network Telemetry",
+    drawer_advanced_title: "Advanced Network & Audio",
+    stat_buffer_level: "Buffer Level",
+    stat_clock_comp: "Clock Drift",
+    stat_loss_repaired: "Lost / Fixed",
+    stat_gated_frames: "Gated Frames",
+    c2_jb_chart_title: "Jitter Buffer · Last 20s",
+    c2_voice_chart_title: "Audio Envelope · Last 20s",
+    chart_rx_idle_hint: "Buffer curve appears while receiving audio",
+    chart_tx_idle_hint: "Voice/audio envelope appears while streaming",
+
+    label_target_addr: "Target Peer Address",
+    combo_scan_lan: "↻ Rescan LAN Devices",
+    combo_no_lan_peers: "No other LAN peers found yet (enter IP manually)",
+    combo_local_loopback: "Localhost Loopback",
+    combo_local_lan: "This Machine (LAN)",
+    label_media_port: "Audio UDP Port",
+    label_mic_port: "Mic UDP Port",
+    label_custom_buffer: "Custom Buffer",
+    buffer_auto_profile: "Auto (Profile)",
+    label_channels: "Audio Channels",
+    channel_stereo: "Stereo",
+    channel_mono: "Mono",
+    label_opus_bitrate: "Opus Bitrate",
+    label_test_tone: "440Hz Test Tone",
+    label_status_log: "Latest Status",
+
+    page_hw_title: "Audio Devices",
+    page_hw_subtitle:
+        "Inspect local capture and playback hardware, default routing, and LAN discovery",
     hw_input_title: "Input Devices",
-    hw_input_subtitle: "Local microphone and loopback capture hardware",
+    hw_input_subtitle: "Local microphone and virtual capture hardware",
     hw_output_title: "Output Devices",
-    hw_output_subtitle: "Local speaker and headphone playback hardware",
+    hw_output_subtitle: "Local speaker, headphone, and virtual mic sinks",
     badge_default_in: "Default",
     badge_default_out: "Default",
+    chk_advertise_mdns: "Advertise node on LAN (Auto-Discovery)",
 };
 
 #[cfg(test)]
@@ -902,9 +763,9 @@ mod tests {
     fn test_texts_completeness() {
         let en = Language::En.texts();
         let zh = Language::Zh.texts();
-        assert!(!en.tx_card_title.is_empty());
-        assert!(!zh.tx_card_title.is_empty());
-        assert_ne!(en.tab_dual_console, zh.tab_dual_console);
+        assert!(!en.page_link_title.is_empty());
+        assert!(!zh.page_link_title.is_empty());
+        assert_ne!(en.tab_audio_link, zh.tab_audio_link);
         assert_ne!(
             Language::En.status_ready(),
             Language::Zh.status_ready()

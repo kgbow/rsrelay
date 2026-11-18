@@ -442,59 +442,169 @@ fn map_font_file_readonly(path: &str) -> Option<&'static [u8]> {
     }
 }
 
-fn load_cjk_font_static_slice() -> Option<(&'static str, &'static [u8])> {
-    static CJK_FONT_CACHE: std::sync::OnceLock<Option<(&'static str, &'static [u8])>> =
-        std::sync::OnceLock::new();
-
-    *CJK_FONT_CACHE.get_or_init(|| {
-        let candidate_paths: &[&'static str] = &[
-            // macOS system CJK fonts
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "/System/Library/Fonts/STHeiti Medium.ttc",
-            "/System/Library/Fonts/STHeiti Light.ttc",
-            "/System/Library/Fonts/PingFang.ttc",
-            // Windows 10/11 system CJK fonts
-            r"C:\Windows\Fonts\msyh.ttc",
-            r"C:\Windows\Fonts\msyh.ttf",
-            r"C:\Windows\Fonts\simhei.ttf",
-            r"C:\Windows\Fonts\simsun.ttc",
-            // Linux CJK fallback fonts
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        ];
-
-        for &path in candidate_paths {
-            #[cfg(unix)]
-            if let Some(mapped) = map_font_file_readonly(path) {
-                return Some((path, mapped));
-            }
-
-            if let Ok(bytes) = std::fs::read(path) {
-                let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-                return Some((path, leaked));
-            }
-        }
-        None
-    })
+struct CalibratedCjkFont {
+    path: &'static str,
+    bytes: &'static [u8],
+    prop_y_offset_factor: f32,
+    mono_y_offset_factor: f32,
 }
 
-/// Load native OS CJK fallback fonts so Chinese UI text and localized device names render crisply.
+fn measure_cjk_font_calibration(bytes: &'static [u8]) -> Option<(f32, f32)> {
+    let probe_size = 20.0_f32;
+
+    // 1. Measure as primary Proportional font on mixed CJK + Latin caps/digits
+    let prop_ctx = egui::Context::default();
+    let mut prop_defs = egui::FontDefinitions::default();
+    prop_defs
+        .font_data
+        .insert("probe_cjk".to_owned(), egui::FontData::from_static(bytes));
+    prop_defs
+        .families
+        .get_mut(&FontFamily::Proportional)?
+        .insert(0, "probe_cjk".to_owned());
+    prop_ctx.set_fonts(prop_defs);
+
+    let mut prop_diff_opt: Option<f32> = None;
+    let _ = prop_ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let p = ui.painter();
+            let g_cjk = p.layout_no_wrap(
+                "系统默认扬声器".to_string(),
+                FontId::new(probe_size, FontFamily::Proportional),
+                Color32::WHITE,
+            );
+            let g_lat = p.layout_no_wrap(
+                "UDP09".to_string(),
+                FontId::new(probe_size, FontFamily::Proportional),
+                Color32::WHITE,
+            );
+            if g_cjk.mesh_bounds.is_finite()
+                && g_cjk.mesh_bounds.height() > 4.0
+                && g_lat.mesh_bounds.is_finite()
+                && g_lat.mesh_bounds.height() > 4.0
+            {
+                let avg_ink_cy = (g_cjk.mesh_bounds.center().y + g_lat.mesh_bounds.center().y) * 0.5;
+                prop_diff_opt = Some(avg_ink_cy - g_cjk.rect.center().y);
+            }
+        });
+    });
+    let prop_diff = prop_diff_opt?;
+    let prop_factor = (-prop_diff / probe_size).clamp(-0.35, 0.35);
+
+    // 2. Measure as fallback behind Hack in Monospace
+    let mono_ctx = egui::Context::default();
+    let mut mono_defs = egui::FontDefinitions::default();
+    mono_defs
+        .font_data
+        .insert("probe_cjk".to_owned(), egui::FontData::from_static(bytes));
+    mono_defs
+        .families
+        .get_mut(&FontFamily::Monospace)?
+        .push("probe_cjk".to_owned());
+    mono_ctx.set_fonts(mono_defs);
+
+    let mut mono_diff = 0.0_f32;
+    let _ = mono_ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let g_m = ui.painter().layout_no_wrap(
+                "音频".to_string(),
+                FontId::new(probe_size, FontFamily::Monospace),
+                Color32::WHITE,
+            );
+            if g_m.mesh_bounds.is_finite() && g_m.mesh_bounds.height() > 4.0 {
+                mono_diff = g_m.mesh_bounds.center().y - g_m.rect.center().y;
+            }
+        });
+    });
+    let mono_factor = (-mono_diff / probe_size).clamp(-0.35, 0.35);
+
+    Some((prop_factor, mono_factor))
+}
+
+fn load_calibrated_cjk_font() -> Option<&'static CalibratedCjkFont> {
+    static CJK_FONT_CACHE: std::sync::OnceLock<Option<CalibratedCjkFont>> =
+        std::sync::OnceLock::new();
+
+    CJK_FONT_CACHE
+        .get_or_init(|| {
+            let candidate_paths: &[&'static str] = &[
+                // macOS system CJK fonts (Hiragino Sans GB W3 has crisp, matched Latin + CJK outlines)
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                "/System/Library/Fonts/STHeiti Medium.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                // Windows 10/11 system UI CJK fonts
+                r"C:\Windows\Fonts\msyh.ttc",
+                r"C:\Windows\Fonts\msyh.ttf",
+                r"C:\Windows\Fonts\simhei.ttf",
+                r"C:\Windows\Fonts\simsun.ttc",
+                // Linux CJK fallback fonts
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            ];
+
+            for &path in candidate_paths {
+                #[cfg(unix)]
+                if let Some(mapped) = map_font_file_readonly(path) {
+                    if let Some((prop_f, mono_f)) = measure_cjk_font_calibration(mapped) {
+                        return Some(CalibratedCjkFont {
+                            path,
+                            bytes: mapped,
+                            prop_y_offset_factor: prop_f,
+                            mono_y_offset_factor: mono_f,
+                        });
+                    }
+                }
+
+                if let Ok(vec_bytes) = std::fs::read(path) {
+                    let leaked: &'static [u8] = Box::leak(vec_bytes.into_boxed_slice());
+                    if let Some((prop_f, mono_f)) = measure_cjk_font_calibration(leaked) {
+                        return Some(CalibratedCjkFont {
+                            path,
+                            bytes: leaked,
+                            prop_y_offset_factor: prop_f,
+                            mono_y_offset_factor: mono_f,
+                        });
+                    }
+                }
+            }
+            None
+        })
+        .as_ref()
+}
+
+/// Load and auto-calibrate native OS CJK + UI fonts so both Chinese and mixed Latin+CJK text
+/// share an identical baseline and sit optically dead-center inside single-line controls.
 pub fn configure_cjk_fallback_fonts(ctx: &egui::Context) {
-    if let Some((path, bytes)) = load_cjk_font_static_slice() {
+    if let Some(cal) = load_calibrated_cjk_font() {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
-            "system_cjk".to_owned(),
-            egui::FontData::from_static(bytes),
+            "system_cjk_prop".to_owned(),
+            egui::FontData::from_static(cal.bytes).tweak(egui::FontTweak {
+                y_offset_factor: cal.prop_y_offset_factor,
+                ..Default::default()
+            }),
+        );
+        fonts.font_data.insert(
+            "system_cjk_mono".to_owned(),
+            egui::FontData::from_static(cal.bytes).tweak(egui::FontTweak {
+                y_offset_factor: cal.mono_y_offset_factor,
+                ..Default::default()
+            }),
         );
         if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional) {
-            prop.push("system_cjk".to_owned());
+            prop.insert(0, "system_cjk_prop".to_owned());
         }
         if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
-            mono.push("system_cjk".to_owned());
+            mono.push("system_cjk_mono".to_owned());
         }
         ctx.set_fonts(fonts);
-        tracing::debug!("Mapped native CJK fallback font zero-copy from '{path}'");
+        tracing::debug!(
+            "Configured calibrated UI font '{}' (prop_y_factor={:+.3}, mono_y_factor={:+.3})",
+            cal.path,
+            cal.prop_y_offset_factor,
+            cal.mono_y_offset_factor
+        );
     }
 }
 
@@ -715,6 +825,43 @@ mod tests {
                 f.has_glyph(&FontId::monospace(14.0), '音'),
                 "Monospace font must have CJK glyph '音'"
             );
+        });
+    }
+
+    #[test]
+    fn test_calibrated_font_vertical_centering() {
+        let ctx = egui::Context::default();
+        apply_studio_theme(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let p = ui.painter();
+                for &sz in &[11.5_f32, 12.5, 13.0, 15.0] {
+                    for &s in &[
+                        "系统默认扬声器",
+                        "UDP 低延迟实时传输中",
+                        "无损 PCM",
+                        "收起波形与高级参数",
+                        "中文",
+                        "EN",
+                    ] {
+                        let g = p.layout_no_wrap(
+                            s.to_string(),
+                            FontId::new(sz, FontFamily::Proportional),
+                            Color32::WHITE,
+                        );
+                        let diff = (g.mesh_bounds.center().y - g.rect.center().y).abs();
+                        println!(
+                            "[sz={sz}] '{s}': rect_cy={:.2}, ink_cy={:.2}, |diff|={diff:.2}",
+                            g.rect.center().y,
+                            g.mesh_bounds.center().y
+                        );
+                        assert!(
+                            diff <= 1.1,
+                            "Expected '{s}' at {sz}pt to be vertically centered within 1.1pt, got diff={diff:.2}"
+                        );
+                    }
+                }
+            });
         });
     }
 }
