@@ -11,6 +11,10 @@ pub const JB_CAPACITY: usize = 64;
 /// Maximum consecutive missing packets before transitioning back to initial `Buffering` state.
 const MAX_CONSECUTIVE_MISSES: usize = 40;
 
+/// Maximum consecutive late arrivals while the jitter buffer is completely empty (`occupied_count == 0`)
+/// before re-anchoring `expected_seq` (recovers cleanly if sender paused without advancing `seq`).
+const MAX_EMPTY_CONSECUTIVE_LATE: usize = 8;
+
 #[derive(Clone, Copy)]
 struct PacketSlot {
     header: PacketHeader,
@@ -73,6 +77,7 @@ pub struct JitterBuffer {
     occupied_count: usize,
     target_prefetch: usize,
     consecutive_misses: usize,
+    consecutive_late: usize,
     epoch: Instant,
     last_transit_us: Option<i64>,
     stats: JitterStats,
@@ -90,6 +95,7 @@ impl JitterBuffer {
             occupied_count: 0,
             target_prefetch,
             consecutive_misses: 0,
+            consecutive_late: 0,
             epoch: Instant::now(),
             last_transit_us: None,
             stats: JitterStats::default(),
@@ -126,6 +132,7 @@ impl JitterBuffer {
         self.buffering = true;
         self.occupied_count = 0;
         self.consecutive_misses = 0;
+        self.consecutive_late = 0;
         self.last_transit_us = None;
         self.stats.buffer_resets += 1;
     }
@@ -162,11 +169,27 @@ impl JitterBuffer {
             if self.buffering && (-diff as usize) <= self.target_prefetch {
                 // Packet arrived slightly out-of-order before playout began; rewind expected_seq
                 self.expected_seq = header.seq;
+                self.consecutive_late = 0;
                 diff = 0;
+            } else if self.occupied_count == 0 && (-diff as usize) < JB_CAPACITY {
+                self.consecutive_late += 1;
+                if self.consecutive_late >= MAX_EMPTY_CONSECUTIVE_LATE {
+                    // Sender clock/callback paused briefly without advancing `seq`, leaving
+                    // `expected_seq` permanently ahead of live packets; re-anchor immediately.
+                    self.reset();
+                    self.expected_seq = header.seq;
+                    self.initialized = true;
+                    diff = 0;
+                } else {
+                    self.stats.packets_late_or_dup += 1;
+                    return;
+                }
             } else {
                 self.stats.packets_late_or_dup += 1;
                 return;
             }
+        } else {
+            self.consecutive_late = 0;
         }
 
         // Severe sequence jump exceeding window capacity: resynchronize
@@ -335,6 +358,38 @@ mod tests {
         match jb.pop(&mut out_buf) {
             PopOutcome::Ready { header, .. } => assert_eq!(header.seq, 51),
             other => panic!("expected seq 51 second, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reanchor_when_expected_seq_outruns_sender_pause() {
+        let mut jb = JitterBuffer::new(2);
+        let mut out_buf = [0u8; MAX_UDP_PAYLOAD];
+
+        jb.push(dummy_header(10, false), &[1]);
+        jb.push(dummy_header(11, false), &[2]);
+        let _ = jb.pop(&mut out_buf); // 10
+        let _ = jb.pop(&mut out_buf); // 11
+        // Simulate 25 pop ticks while sender paused without advancing seq -> expected_seq = 37
+        for _ in 0..25 {
+            assert_eq!(jb.pop(&mut out_buf), PopOutcome::MissingNoFec);
+        }
+
+        // Sender resumes at seq = 12 (`diff < 0` while occupied_count == 0):
+        // within MAX_EMPTY_CONSECUTIVE_LATE + target_prefetch packets, JitterBuffer must re-anchor!
+        for s in 12..(12 + (MAX_EMPTY_CONSECUTIVE_LATE as u16) + 2) {
+            jb.push(dummy_header(s, false), &[s as u8]);
+        }
+
+        assert!(
+            !jb.is_buffering(),
+            "JitterBuffer should have re-anchored and completed prefetch"
+        );
+        match jb.pop(&mut out_buf) {
+            PopOutcome::Ready { header, .. } => {
+                assert_eq!(header.seq, 12 + (MAX_EMPTY_CONSECUTIVE_LATE as u16) - 1);
+            }
+            other => panic!("expected Ready after re-anchor, got {other:?}"),
         }
     }
 }

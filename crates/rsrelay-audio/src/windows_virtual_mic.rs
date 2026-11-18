@@ -495,9 +495,14 @@ mod imp {
                                     last_kernel_queued = None;
                                     let max_user_samples = 48_000 * src_ch * 35 / 1000;
                                     if consumer.slots() > max_user_samples {
-                                        let drop_n = (FRAMES_PER_TICK * src_ch).min(consumer.slots());
-                                        if let Ok(chunk) = consumer.read_chunk(drop_n) {
-                                            chunk.commit_all();
+                                        let drop_n = ((FRAMES_PER_TICK * src_ch)
+                                            .min(consumer.slots())
+                                            / src_ch)
+                                            * src_ch;
+                                        if drop_n > 0 {
+                                            if let Ok(chunk) = consumer.read_chunk(drop_n) {
+                                                chunk.commit_all();
+                                            }
                                         }
                                     }
                                 } else if queued < LOW_KERNEL_QUEUED_BYTES
@@ -511,9 +516,13 @@ mod imp {
                                 // ringbuffer from ever accumulating > 35ms of stale samples
                                 let max_idle_samples = 48_000 * src_ch * 35 / 1000;
                                 if consumer.slots() > max_idle_samples {
-                                    let excess = consumer.slots() - (48_000 * src_ch * 20 / 1000);
-                                    if let Ok(chunk) = consumer.read_chunk(excess) {
-                                        chunk.commit_all();
+                                    let raw_excess =
+                                        consumer.slots() - (48_000 * src_ch * 20 / 1000);
+                                    let excess = (raw_excess / src_ch) * src_ch;
+                                    if excess > 0 {
+                                        if let Ok(chunk) = consumer.read_chunk(excess) {
+                                            chunk.commit_all();
+                                        }
                                     }
                                 }
                             }

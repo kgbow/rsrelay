@@ -10,7 +10,7 @@ use rtrb::Consumer;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use rsrelay_audio::promote_worker_thread_priority;
-use rsrelay_dsp::{AdaptiveResampler, AudioEncoder, NoiseGate};
+use rsrelay_dsp::{opus_packet_can_carry_fec, AdaptiveResampler, AudioEncoder, NoiseGate};
 use rsrelay_proto::{
     ChannelLayout, CodecType, FormatFlags, FrameDuration, PacketHeader, HEADER_LEN,
     MAX_PACKET_SIZE, MAX_UDP_PAYLOAD, STANDARD_SAMPLE_RATE,
@@ -64,9 +64,10 @@ impl AudioSenderWorker {
         mut consumer: Consumer<f32>,
     ) -> Result<Self, anyhow::Error> {
         let socket = build_low_latency_udp_sender(config.target_addr)?;
-        let mut encoder = AudioEncoder::new(
+        let mut encoder = AudioEncoder::new_for_frame(
             config.codec,
             config.channels,
+            config.frame_duration,
             config.opus_bitrate_bps,
             config.enable_fec,
         )?;
@@ -236,7 +237,9 @@ impl AudioSenderWorker {
                                 config.channels,
                                 config.frame_duration,
                             );
-                            flags.has_fec = config.enable_fec && config.codec == CodecType::Opus;
+                            flags.has_fec = config.enable_fec
+                                && config.codec == CodecType::Opus
+                                && opus_packet_can_carry_fec(&payload_buf[..payload_len]);
                             if is_first_packet {
                                 flags.is_reset = true;
                                 is_first_packet = false;

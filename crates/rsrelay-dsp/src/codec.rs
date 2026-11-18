@@ -1,6 +1,16 @@
 use opus::{Application, Bitrate, Channels, Decoder as OpusDecoder, Encoder as OpusEncoder};
-use rsrelay_proto::{ChannelLayout, CodecType, MAX_UDP_PAYLOAD, STANDARD_SAMPLE_RATE};
+use rsrelay_proto::{
+    ChannelLayout, CodecType, FrameDuration, MAX_UDP_PAYLOAD, STANDARD_SAMPLE_RATE,
+};
 use thiserror::Error;
+
+/// Check RFC 6716 §3.1 TOC byte to determine whether an Opus packet uses SILK or Hybrid mode
+/// (`config 0..=15`, bit 7 == 0) and is therefore capable of carrying LBRR In-Band FEC data.
+/// CELT-only packets (`config 16..=31`, bit 7 == 1, such as all 2.5ms/5ms frames) never contain LBRR.
+#[inline]
+pub const fn opus_packet_can_carry_fec(payload: &[u8]) -> bool {
+    !payload.is_empty() && (payload[0] & 0x80) == 0
+}
 
 #[derive(Debug, Error)]
 pub enum CodecError {
@@ -26,12 +36,33 @@ impl AudioEncoder {
         bitrate_bps: u32,
         enable_fec: bool,
     ) -> Result<Self, CodecError> {
+        Self::new_for_frame(codec, channels, FrameDuration::Ms5, bitrate_bps, enable_fec)
+    }
+
+    pub fn new_for_frame(
+        codec: CodecType,
+        channels: ChannelLayout,
+        frame_duration: FrameDuration,
+        bitrate_bps: u32,
+        enable_fec: bool,
+    ) -> Result<Self, CodecError> {
         let opus = if codec == CodecType::Opus {
             let opus_ch = match channels {
                 ChannelLayout::Mono => Channels::Mono,
                 ChannelLayout::Stereo => Channels::Stereo,
             };
-            let mut enc = OpusEncoder::new(STANDARD_SAMPLE_RATE, opus_ch, Application::LowDelay)?;
+            // Sub-10ms frames (2.5ms / 5ms) are CELT-only; use Restricted LowDelay (2.5ms lookahead).
+            // For >= 10ms frames with FEC enabled, use Voip/Audio so SILK/Hybrid LBRR FEC can operate.
+            let app = if enable_fec && matches!(frame_duration, FrameDuration::Ms10 | FrameDuration::Ms20) {
+                if bitrate_bps <= 64_000 {
+                    Application::Voip
+                } else {
+                    Application::Audio
+                }
+            } else {
+                Application::LowDelay
+            };
+            let mut enc = OpusEncoder::new(STANDARD_SAMPLE_RATE, opus_ch, app)?;
             enc.set_bitrate(Bitrate::Bits(bitrate_bps as i32))?;
             enc.set_inband_fec(enable_fec)?;
             if enable_fec {
@@ -197,8 +228,10 @@ impl AudioDecoder {
             CodecType::Opus => {
                 let dec = self.opus.as_mut().expect("opus decoder initialized");
                 let samples_per_ch = match next_packet_payload {
-                    Some(next_pkt) => dec.decode_float(next_pkt, out_interleaved, true)?,
-                    None => dec.decode_float(&[], out_interleaved, false)?,
+                    Some(next_pkt) if opus_packet_can_carry_fec(next_pkt) => {
+                        dec.decode_float(next_pkt, out_interleaved, true)?
+                    }
+                    _ => dec.decode_float(&[], out_interleaved, false)?,
                 };
                 Ok(samples_per_ch * ch)
             }

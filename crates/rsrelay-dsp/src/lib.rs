@@ -7,7 +7,7 @@ pub mod gate;
 pub mod jitter;
 pub mod resampler;
 
-pub use codec::{AudioDecoder, AudioEncoder, CodecError};
+pub use codec::{opus_packet_can_carry_fec, AudioDecoder, AudioEncoder, CodecError};
 pub use drift::ClockDriftController;
 pub use gate::{soft_limit, NoiseGate};
 pub use jitter::{JitterBuffer, JitterStats, PopOutcome, JB_CAPACITY};

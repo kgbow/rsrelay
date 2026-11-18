@@ -65,16 +65,17 @@ impl AudioReceiverWorker {
         let socket = build_low_latency_udp_receiver(config.bind_addr)?;
 
         let mut current_codec = CodecType::Opus;
-        let current_channels = config.output_channels;
+        let out_channels = config.output_channels;
+        let mut wire_channels = out_channels;
         let mut current_frame_dur = FrameDuration::Ms5;
-        let ch = current_channels.channels();
-        let frames_per_pkt = current_frame_dur.samples_per_channel();
+        let out_ch = out_channels.channels().max(1);
+        let mut frames_per_pkt = current_frame_dur.samples_per_channel();
 
-        let mut decoder = AudioDecoder::new(current_codec, current_channels)?;
+        let mut decoder = AudioDecoder::new(current_codec, wire_channels)?;
         let mut resampler = AdaptiveResampler::new(
             STANDARD_SAMPLE_RATE,
             config.output_sample_rate,
-            ch,
+            out_ch,
             frames_per_pkt,
             1.01,
         )?;
@@ -97,18 +98,32 @@ impl AudioReceiverWorker {
 
                 let mut jitter = JitterBuffer::new(prefetch_packets);
 
-                let target_rtrb_frames = ((config.target_buffer_ms as usize)
-                    * (config.output_sample_rate as usize))
-                    / 1000;
-                let mut drift_ctrl = ClockDriftController::new(target_rtrb_frames.max(480));
-                let mut current_rel_ratio = 1.0f64;
+                // Stage 1 PI loop: locks packet pop rate (`next_deadline`) strictly to Sender clock
+                // using ONLY `JitterBuffer` occupancy so `rtrb` can never squeeze `JitterBuffer` to 0.
+                let jb_target_frames_48k = ((config.target_buffer_ms as usize
+                    * STANDARD_SAMPLE_RATE as usize)
+                    / 1000)
+                    .max(frames_per_pkt * 2);
+                let mut jb_ctrl = ClockDriftController::new(jb_target_frames_48k);
+                let mut current_jb_ratio = 1.0f64;
+
+                // Stage 2 PI loop: locks ASRC output sample rate strictly to Receiver DAC hardware clock
+                // using `rtrb` occupancy with feed-forward decoupling (`r_asrc = jb_ratio * dac_ratio`).
+                let rtrb_target_ms = (config.target_buffer_ms as usize).clamp(14, 24);
+                let rtrb_target_frames =
+                    ((rtrb_target_ms * config.output_sample_rate as usize) / 1000).max(480);
+                let max_rtrb_frames =
+                    (rtrb_target_frames * 4).max((config.output_sample_rate as usize) / 8);
+                let mut rtrb_ctrl = ClockDriftController::new(rtrb_target_frames);
+                let mut was_buffering = true;
 
                 promote_worker_thread_priority(config.output_sample_rate, frames_per_pkt as u32);
 
                 let mut udp_buf = [0u8; MAX_PACKET_SIZE];
                 let mut pkt_payload = [0u8; MAX_UDP_PAYLOAD];
-                let mut decoded_pcm = vec![0.0f32; frames_per_pkt * ch];
-                let mut resampled_pcm = Vec::with_capacity(frames_per_pkt * ch * 2);
+                let mut wire_decoded_pcm = vec![0.0f32; frames_per_pkt * wire_channels.channels()];
+                let mut decoded_pcm = vec![0.0f32; frames_per_pkt * out_ch];
+                let mut resampled_pcm = Vec::with_capacity(frames_per_pkt * out_ch * 2);
 
                 let base_step_us = current_frame_dur.duration_us();
                 let mut next_deadline = Instant::now() + Duration::from_micros(base_step_us);
@@ -131,37 +146,63 @@ impl AudioReceiverWorker {
                                         }
                                     }
 
-                                    // Reconfigure pipeline on the fly if sender changed codec or frame size
+                                    // Reconfigure pipeline on the fly if sender changed codec, frame size, or channels
                                     if hdr.flags.codec != current_codec
                                         || hdr.flags.frame_duration != current_frame_dur
+                                        || hdr.flags.channels != wire_channels
                                     {
+                                        let dur_changed =
+                                            hdr.flags.frame_duration != current_frame_dur;
                                         current_codec = hdr.flags.codec;
                                         current_frame_dur = hdr.flags.frame_duration;
+                                        wire_channels = hdr.flags.channels;
+                                        frames_per_pkt = current_frame_dur.samples_per_channel();
+
                                         let new_prefetch = ((config.target_buffer_ms as u64 * 1000)
                                             / current_frame_dur.duration_us())
                                         .max(2)
                                             as usize;
                                         jitter.set_target_prefetch(new_prefetch);
 
+                                        let new_jb_target = ((config.target_buffer_ms as usize
+                                            * STANDARD_SAMPLE_RATE as usize)
+                                            / 1000)
+                                            .max(frames_per_pkt * 2);
+                                        jb_ctrl = ClockDriftController::new(new_jb_target);
+                                        current_jb_ratio = 1.0;
+
                                         if let Ok(new_dec) =
-                                            AudioDecoder::new(current_codec, current_channels)
+                                            AudioDecoder::new(current_codec, wire_channels)
                                         {
                                             decoder = new_dec;
                                         }
-                                        let new_frames = current_frame_dur.samples_per_channel();
-                                        decoded_pcm.resize(new_frames * ch, 0.0);
-                                        if let Ok(new_res) = AdaptiveResampler::new(
-                                            STANDARD_SAMPLE_RATE,
-                                            config.output_sample_rate,
-                                            ch,
-                                            new_frames,
-                                            1.01,
-                                        ) {
-                                            resampler = new_res;
+                                        wire_decoded_pcm
+                                            .resize(frames_per_pkt * wire_channels.channels(), 0.0);
+                                        decoded_pcm.resize(frames_per_pkt * out_ch, 0.0);
+
+                                        if dur_changed {
+                                            if let Ok(new_res) = AdaptiveResampler::new(
+                                                STANDARD_SAMPLE_RATE,
+                                                config.output_sample_rate,
+                                                out_ch,
+                                                frames_per_pkt,
+                                                1.01,
+                                            ) {
+                                                resampler = new_res;
+                                            }
                                         }
                                     }
 
+                                    let prev_buffering = jitter.is_buffering();
                                     jitter.push(hdr, payload);
+                                    if prev_buffering && !jitter.is_buffering() {
+                                        // Phase-align pop timer half a frame after prefetch completion
+                                        // for maximum jitter margin on both sides of packet arrivals.
+                                        let half_step_ns =
+                                            (current_frame_dur.duration_us() * 1000) / 2;
+                                        next_deadline =
+                                            Instant::now() + Duration::from_nanos(half_step_ns);
+                                    }
                                 }
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -169,8 +210,8 @@ impl AudioReceiverWorker {
                         }
                     }
 
-                    // 2. When clock-drift-modulated frame deadline arrives, pop from JitterBuffer,
-                    //    decode, and resample into the playback ring buffer.
+                    // 2. When Sender-locked frame deadline arrives, pop from JitterBuffer,
+                    //    decode, and ASRC-resample to Receiver DAC clock into playback ring buffer.
                     let now = Instant::now();
                     if now >= next_deadline {
                         if current_src.is_some()
@@ -186,7 +227,7 @@ impl AudioReceiverWorker {
 
                         let dynamic_step_ns = ((current_frame_dur.duration_us() as f64)
                             * 1000.0
-                            * current_rel_ratio)
+                            * current_jb_ratio)
                             as u64;
                         let step_duration = Duration::from_nanos(dynamic_step_ns.max(500_000));
                         next_deadline += step_duration;
@@ -195,63 +236,169 @@ impl AudioReceiverWorker {
                             next_deadline = now + step_duration;
                         }
 
+                        let jb_frames_before_pop = jitter.occupied_count() * frames_per_pkt;
                         let outcome = jitter.pop(&mut pkt_payload);
+                        let wire_ch = wire_channels.channels().max(1);
                         let has_frame = match outcome {
-                            PopOutcome::Ready { payload_len, .. } => decoder
-                                .decode(&pkt_payload[..payload_len], &mut decoded_pcm)
-                                .is_ok(),
+                            PopOutcome::Ready { payload_len, .. } => {
+                                if wire_ch == out_ch {
+                                    decoder
+                                        .decode(&pkt_payload[..payload_len], &mut decoded_pcm)
+                                        .is_ok()
+                                } else if decoder
+                                    .decode(&pkt_payload[..payload_len], &mut wire_decoded_pcm)
+                                    .is_ok()
+                                {
+                                    convert_interleaved_channels(
+                                        &wire_decoded_pcm,
+                                        wire_ch,
+                                        &mut decoded_pcm,
+                                        out_ch,
+                                    );
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
                             PopOutcome::SilenceHeartbeat { .. } => {
                                 decoded_pcm.fill(0.0);
                                 true
                             }
-                            PopOutcome::MissingWithFec { fec_payload_len } => decoder
-                                .conceal_loss(
-                                    Some(&pkt_payload[..fec_payload_len]),
-                                    &mut decoded_pcm,
-                                )
-                                .is_ok(),
-                            PopOutcome::MissingNoFec => {
-                                decoder.conceal_loss(None, &mut decoded_pcm).is_ok()
+                            PopOutcome::MissingWithFec { fec_payload_len } => {
+                                if wire_ch == out_ch {
+                                    decoder
+                                        .conceal_loss(
+                                            Some(&pkt_payload[..fec_payload_len]),
+                                            &mut decoded_pcm,
+                                        )
+                                        .is_ok()
+                                } else if decoder
+                                    .conceal_loss(
+                                        Some(&pkt_payload[..fec_payload_len]),
+                                        &mut wire_decoded_pcm,
+                                    )
+                                    .is_ok()
+                                {
+                                    convert_interleaved_channels(
+                                        &wire_decoded_pcm,
+                                        wire_ch,
+                                        &mut decoded_pcm,
+                                        out_ch,
+                                    );
+                                    true
+                                } else {
+                                    false
+                                }
                             }
-                            PopOutcome::Buffering => false,
+                            PopOutcome::MissingNoFec => {
+                                if wire_ch == out_ch {
+                                    decoder.conceal_loss(None, &mut decoded_pcm).is_ok()
+                                } else if decoder.conceal_loss(None, &mut wire_decoded_pcm).is_ok()
+                                {
+                                    convert_interleaved_channels(
+                                        &wire_decoded_pcm,
+                                        wire_ch,
+                                        &mut decoded_pcm,
+                                        out_ch,
+                                    );
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            PopOutcome::Buffering => {
+                                if !was_buffering {
+                                    was_buffering = true;
+                                    jb_ctrl.reset();
+                                    rtrb_ctrl.reset();
+                                    current_jb_ratio = 1.0;
+                                }
+                                false
+                            }
                         };
 
                         if has_frame {
+                            let priming = if was_buffering {
+                                was_buffering = false;
+                                jb_ctrl.reset();
+                                rtrb_ctrl.reset();
+                                true
+                            } else {
+                                false
+                            };
+
+                            // Stage 1: JitterBuffer watermark -> packet pop interval ratio
+                            let jb_ratio = jb_ctrl.update(jb_frames_before_pop);
+                            current_jb_ratio = jb_ratio;
+
                             let rtrb_queued_samples = config
                                 .ringbuffer_capacity_samples
                                 .saturating_sub(producer.slots());
-                            let rtrb_queued_frames = rtrb_queued_samples / ch.max(1);
-                            let jb_frames_48k =
-                                jitter.occupied_count() * current_frame_dur.samples_per_channel();
-                            let jb_queued_frames = (jb_frames_48k
+                            let rtrb_queued_frames = rtrb_queued_samples / out_ch;
+                            let expected_out_frames = (frames_per_pkt
                                 * (config.output_sample_rate as usize))
                                 / (STANDARD_SAMPLE_RATE as usize);
-                            let total_buffered_frames = rtrb_queued_frames + jb_queued_frames;
 
-                            let rel_ratio = drift_ctrl.update(total_buffered_frames);
-                            current_rel_ratio = rel_ratio;
+                            // Stage 2: rtrb hardware watermark -> DAC ratio, decoupled from jb_ratio
+                            let measured_rtrb_frames = if priming {
+                                rtrb_target_frames
+                            } else {
+                                rtrb_queued_frames + (expected_out_frames / 2)
+                            };
+                            let dac_ratio = rtrb_ctrl.update(measured_rtrb_frames);
+                            let r_asrc = (jb_ratio * dac_ratio).clamp(0.995, 1.005);
 
-                            if resampler
-                                .process_interleaved(&decoded_pcm, rel_ratio, &mut resampled_pcm)
-                                .is_ok()
+                            if let Ok(out_frames) =
+                                resampler.process_interleaved(&decoded_pcm, r_asrc, &mut resampled_pcm)
                             {
-                                let avail = producer.slots();
-                                let to_write = resampled_pcm.len().min(avail);
-                                if to_write > 0 {
-                                    if let Ok(mut chunk) = producer.write_chunk(to_write) {
-                                        let (first, second) = chunk.as_mut_slices();
-                                        first.copy_from_slice(&resampled_pcm[..first.len()]);
-                                        if !second.is_empty() {
-                                            second.copy_from_slice(
-                                                &resampled_pcm[first.len()..to_write],
-                                            );
+                                if priming && rtrb_queued_frames + out_frames < rtrb_target_frames {
+                                    // Pre-prime rtrb with silence cushion so the very first OS
+                                    // audio callback has contiguous frames without startup underrun.
+                                    let pad_frames =
+                                        rtrb_target_frames - (rtrb_queued_frames + out_frames);
+                                    let max_pad_frames = producer
+                                        .slots()
+                                        .saturating_sub(resampled_pcm.len())
+                                        / out_ch;
+                                    let pad_samples = pad_frames.min(max_pad_frames) * out_ch;
+                                    if pad_samples > 0 {
+                                        if let Ok(mut chunk) = producer.write_chunk(pad_samples) {
+                                            let (s1, s2) = chunk.as_mut_slices();
+                                            s1.fill(0.0);
+                                            s2.fill(0.0);
+                                            chunk.commit_all();
                                         }
-                                        chunk.commit_all();
+                                    }
+                                }
+
+                                if rtrb_queued_frames > max_rtrb_frames {
+                                    // Host audio callback stalled (>125ms): skip pushing to cap stale
+                                    // latency and avoid saturating the 500ms ring buffer.
+                                    rtrb_ctrl.reset();
+                                } else {
+                                    // Always write whole multi-channel frames only; never truncate
+                                    // mid-packet or split stereo [L, R] sample pairs.
+                                    let avail_samples = (producer.slots() / out_ch) * out_ch;
+                                    if avail_samples >= resampled_pcm.len()
+                                        && !resampled_pcm.is_empty()
+                                    {
+                                        if let Ok(mut chunk) =
+                                            producer.write_chunk(resampled_pcm.len())
+                                        {
+                                            let (first, second) = chunk.as_mut_slices();
+                                            first.copy_from_slice(&resampled_pcm[..first.len()]);
+                                            if !second.is_empty() {
+                                                second.copy_from_slice(
+                                                    &resampled_pcm[first.len()..],
+                                                );
+                                            }
+                                            chunk.commit_all();
+                                        }
                                     }
                                 }
                             }
 
-                            // Update atomic telemetry
+                            // Update atomic telemetry: report real JitterBuffer cushion (ms) & net ASRC ratio
                             let jb_stats = jitter.stats();
                             metrics_clone
                                 .packets_received
@@ -269,14 +416,14 @@ impl AudioReceiverWorker {
                                 .jitter_us
                                 .store(jb_stats.jitter_estimate_us as u64, Ordering::Relaxed);
 
-                            let level_ms = (drift_ctrl.smoothed_frames() as f32 * 1000.0)
-                                / (config.output_sample_rate as f32);
+                            let level_ms = (jb_ctrl.smoothed_frames() as f32 * 1000.0)
+                                / (STANDARD_SAMPLE_RATE as f32);
                             metrics_clone
                                 .buffer_level_ms_bits
                                 .store(level_ms.to_bits(), Ordering::Relaxed);
                             metrics_clone
                                 .resample_ratio_bits
-                                .store(rel_ratio.to_bits(), Ordering::Relaxed);
+                                .store(r_asrc.to_bits(), Ordering::Relaxed);
                         }
                     } else {
                         let sleep_dur =
@@ -320,6 +467,27 @@ impl Drop for AudioReceiverWorker {
         self.stop_flag.store(true, Ordering::Relaxed);
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+#[inline]
+fn convert_interleaved_channels(
+    src: &[f32],
+    src_ch: usize,
+    dst: &mut [f32],
+    dst_ch: usize,
+) {
+    let frames = (src.len() / src_ch.max(1)).min(dst.len() / dst_ch.max(1));
+    for f in 0..frames {
+        let s_base = f * src_ch;
+        let d_base = f * dst_ch;
+        if dst_ch == 1 && src_ch >= 2 {
+            dst[d_base] = (src[s_base] + src[s_base + 1]) * 0.5;
+        } else {
+            for c in 0..dst_ch {
+                dst[d_base + c] = src[s_base + c.min(src_ch - 1)];
+            }
         }
     }
 }
@@ -387,5 +555,100 @@ mod tests {
         }
 
         assert_eq!(recorded, Some(tx_local_addr));
+    }
+
+    #[test]
+    fn test_decoupled_asrc_preserves_jitter_cushion_when_rtrb_preloaded() {
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let bind_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let ring_cap = 48_000 * 2 / 2;
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(ring_cap);
+
+        // Preload ~25ms (1200 stereo frames = 2400 samples) into rtrb BEFORE streaming starts,
+        // simulating the exact condition where rtrb exceeds target_buffer_ms (20ms).
+        // Previously, this squeezed JitterBuffer down to 0 packets and caused massive false losses.
+        if let Ok(mut chunk) = producer.write_chunk(2400) {
+            let (s1, s2) = chunk.as_mut_slices();
+            s1.fill(0.0);
+            s2.fill(0.0);
+            chunk.commit_all();
+        }
+
+        let cfg = ReceiverConfig {
+            bind_addr,
+            output_sample_rate: 48_000,
+            output_channels: ChannelLayout::Stereo,
+            target_buffer_ms: 20,
+            ringbuffer_capacity_samples: ring_cap,
+        };
+        let worker = AudioReceiverWorker::spawn(cfg, producer).expect("spawn receiver");
+
+        let tx_sock = UdpSocket::bind("127.0.0.1:0").expect("bind tx");
+        let mut enc = rsrelay_dsp::AudioEncoder::new_for_frame(
+            CodecType::Opus,
+            ChannelLayout::Stereo,
+            FrameDuration::Ms5,
+            128_000,
+            true,
+        )
+        .expect("opus encoder");
+
+        let frame_pcm = vec![0.15f32; 240 * 2];
+        let mut payload = [0u8; MAX_UDP_PAYLOAD];
+        let mut datagram = [0u8; MAX_PACKET_SIZE];
+
+        // Stream 60 packets (300ms) at 5ms intervals while draining rtrb slightly slower (-500 ppm)
+        let start = Instant::now();
+        for seq in 0..60u16 {
+            let plen = enc.encode(&frame_pcm, &mut payload).expect("encode");
+            let flags = FormatFlags::new(CodecType::Opus, ChannelLayout::Stereo, FrameDuration::Ms5);
+            let hdr = PacketHeader {
+                seq,
+                timestamp: (seq as u32) * 240,
+                flags,
+                payload_len: plen as u16,
+            };
+            hdr.encode((&mut datagram[..HEADER_LEN]).try_into().unwrap());
+            datagram[HEADER_LEN..HEADER_LEN + plen].copy_from_slice(&payload[..plen]);
+            tx_sock
+                .send_to(&datagram[..HEADER_LEN + plen], bind_addr)
+                .expect("send packet");
+
+            // Simulate slightly slow DAC callback draining ~478 stereo samples (~239 frames) per 5ms
+            if seq >= 4 {
+                let to_drain = (consumer.slots().min(478) / 2) * 2;
+                if to_drain > 0 {
+                    if let Ok(c) = consumer.read_chunk(to_drain) {
+                        c.commit_all();
+                    }
+                }
+            }
+
+            let next_t = Duration::from_micros(((seq as u64) + 1) * 5_000);
+            let elapsed = start.elapsed();
+            if next_t > elapsed {
+                thread::sleep(next_t - elapsed);
+            }
+        }
+
+        let snap = worker.snapshot();
+        assert!(
+            snap.packets_received >= 55,
+            "expected >= 55 packets received, got {}",
+            snap.packets_received
+        );
+        assert_eq!(
+            snap.packets_lost, 0,
+            "JitterBuffer must keep its cushion and incur 0 false packet losses (got {})",
+            snap.packets_lost
+        );
+        assert!(
+            snap.buffer_level_ms >= 12.0,
+            "JitterBuffer cushion should stay healthy near 20ms, got {:.1} ms",
+            snap.buffer_level_ms
+        );
     }
 }
