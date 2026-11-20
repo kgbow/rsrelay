@@ -11,7 +11,8 @@ pub mod windows_virtual_mic;
 pub use capture::{start_capture_stream, CaptureStreamHandle};
 pub use device::{
     is_virtual_mic_input_device_name, is_virtual_mic_output_sink_name, list_audio_devices,
-    select_default_virtual_mic_output_device, AudioDeviceInfo, AudioError, CaptureSource,
+    select_default_virtual_mic_output_device, select_virtual_mic_output_from_devices,
+    AudioDeviceInfo, AudioError, CaptureSource,
 };
 pub use macos_sck::interleave_planar_to_ringbuffer;
 pub use macos_virtual_mic::{
@@ -66,22 +67,58 @@ pub fn request_system_loopback_permission() -> bool {
 #[link(name = "winmm")]
 extern "system" {
     fn timeBeginPeriod(uPeriod: u32) -> u32;
+    fn timeEndPeriod(uPeriod: u32) -> u32;
+}
+
+/// RAII guard returned by [`promote_worker_thread_priority`] that restores both
+/// OS real-time thread priority (e.g. Windows MMCSS `AvRevertMmThreadCharacteristics`)
+/// and Windows `winmm` 1ms timer resolution (`timeEndPeriod(1)`) when the worker thread exits.
+pub struct WorkerPriorityGuard {
+    #[cfg(target_os = "windows")]
+    timer_period_active: bool,
+    rt_handle: Option<audio_thread_priority::RtPriorityHandle>,
+}
+
+impl Drop for WorkerPriorityGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.rt_handle.take() {
+            let _ = audio_thread_priority::demote_current_thread_from_real_time(handle);
+        }
+        #[cfg(target_os = "windows")]
+        if self.timer_period_active {
+            unsafe {
+                let _ = timeEndPeriod(1);
+            }
+        }
+    }
 }
 
 /// Promote the calling worker thread (encoder/packetizer or decoder/resampler) to OS real-time priority.
 ///
-/// Uses Windows MMCSS (`"Pro Audio"`) + `timeBeginPeriod(1)` 1ms kernel timer resolution,
-/// or macOS Mach `THREAD_TIME_CONSTRAINT_POLICY`.
-pub fn promote_worker_thread_priority(sample_rate: u32, buffer_frames: u32) {
+/// Uses Windows MMCSS (`AvSetMmThreadCharacteristics`) + `timeBeginPeriod(1)` 1ms kernel timer resolution,
+/// or macOS Mach `THREAD_TIME_CONSTRAINT_POLICY`. Keep the returned [`WorkerPriorityGuard`] alive on the
+/// worker thread stack so OS handles and timer resolution are cleanly released on thread exit.
+#[must_use = "keep WorkerPriorityGuard alive for the duration of the real-time worker loop"]
+pub fn promote_worker_thread_priority(sample_rate: u32, buffer_frames: u32) -> WorkerPriorityGuard {
     #[cfg(target_os = "windows")]
-    unsafe {
+    let timer_period_active = unsafe {
         // Ensure 1ms scheduler timer resolution on Windows 10/11 for 5ms UDP packet pacing
-        let _ = timeBeginPeriod(1);
-    }
+        timeBeginPeriod(1) == 0
+    };
 
-    if let Err(err) =
-        audio_thread_priority::promote_current_thread_to_real_time(buffer_frames, sample_rate)
-    {
-        tracing::debug!("Could not promote worker thread to real-time priority: {err:?}");
+    let rt_handle =
+        match audio_thread_priority::promote_current_thread_to_real_time(buffer_frames, sample_rate)
+        {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::debug!("Could not promote worker thread to real-time priority: {err:?}");
+                None
+            }
+        };
+
+    WorkerPriorityGuard {
+        #[cfg(target_os = "windows")]
+        timer_period_active,
+        rt_handle,
     }
 }

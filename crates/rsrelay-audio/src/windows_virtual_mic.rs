@@ -447,7 +447,8 @@ mod imp {
                 .name("rsrelay-virtual-mic-out".to_string())
                 .spawn(move || {
                     let dev_handle = dev_handle;
-                    crate::promote_worker_thread_priority(48_000, FRAMES_PER_TICK as u32);
+                    let _prio_guard =
+                        crate::promote_worker_thread_priority(48_000, FRAMES_PER_TICK as u32);
                     let hi_res_timer = HighResWaitableTimer::new();
 
                     // Set compact initial kernel ringbuffer capacity once at startup

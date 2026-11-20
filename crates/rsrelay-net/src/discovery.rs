@@ -131,6 +131,31 @@ pub struct DiscoveredPeer {
     pub version: String,
 }
 
+/// Lightweight cloneable handle for running LAN discovery scans on a background thread
+/// while reusing an existing `mdns-sd` [`ServiceDaemon`] instead of spawning a new daemon
+/// thread and multicast socket set on every scan.
+#[derive(Clone)]
+pub struct DiscoveryScanner {
+    daemon: Option<ServiceDaemon>,
+    beacon_port: u16,
+}
+
+impl DiscoveryScanner {
+    /// Create a UDP-beacon-only scanner without spawning an `mdns-sd` background daemon.
+    pub fn udp_only() -> Self {
+        Self {
+            daemon: None,
+            beacon_port: DEFAULT_DISCOVERY_UDP_PORT,
+        }
+    }
+
+    /// Browse the LAN for active `rsrelay` nodes during `scan_duration` using both
+    /// UDP unicast/broadcast discovery probes and (when available) the shared mDNS daemon.
+    pub fn scan(&self, scan_duration: Duration) -> Result<Vec<DiscoveredPeer>, DiscoveryError> {
+        scan_lan_peers(self.daemon.as_ref(), self.beacon_port, scan_duration)
+    }
+}
+
 /// Manages mDNS service advertisement + UDP LAN discovery beacon (`_rsrelay._udp.local.` & UDP `:49151`).
 pub struct DiscoveryService {
     daemon: Option<ServiceDaemon>,
@@ -249,163 +274,220 @@ impl DiscoveryService {
         Ok(())
     }
 
-    /// Browse the LAN for active `rsrelay` nodes during `scan_duration` using both
-    /// UDP unicast/broadcast discovery probes and mDNS (`_rsrelay._udp.local.`).
-    pub fn scan(&self, scan_duration: Duration) -> Result<Vec<DiscoveredPeer>, DiscoveryError> {
-        let mdns_rx = self
-            .daemon
-            .as_ref()
-            .and_then(|d| d.browse(MDNS_SERVICE_TYPE).ok());
-
-        let local_ips = detect_all_local_ipv4s();
-        let udp_probe_sock = bind_ephemeral_discovery_socket().ok();
-
-        if let Some(ref sock) = udp_probe_sock {
-            send_lan_discovery_probes(sock, &local_ips, self.beacon_port);
+    /// Obtain a lightweight cloneable [`DiscoveryScanner`] sharing this service's mDNS daemon.
+    pub fn scanner(&self) -> DiscoveryScanner {
+        DiscoveryScanner {
+            daemon: self.daemon.clone(),
+            beacon_port: self.beacon_port,
         }
-
-        let start = Instant::now();
-        let deadline = start + scan_duration;
-        let mut second_probe_sent = false;
-        let mut peers: HashMap<String, DiscoveredPeer> = HashMap::new();
-        let mut recv_buf = [0u8; 2048];
-
-        while Instant::now() < deadline {
-            if !second_probe_sent && start.elapsed() >= (scan_duration / 2).max(Duration::from_millis(120)) {
-                second_probe_sent = true;
-                if let Some(ref sock) = udp_probe_sock {
-                    send_lan_discovery_probes(sock, &local_ips, self.beacon_port);
-                }
-            }
-
-            // 1. Drain UDP discovery beacon responses
-            if let Some(ref sock) = udp_probe_sock {
-                loop {
-                    match sock.recv_from(&mut recv_buf) {
-                        Ok((len, src_addr)) => {
-                            if let Some(ann) = parse_beacon_response(&recv_buf[..len]) {
-                                let mut addrs = Vec::new();
-                                let src_ip = src_addr.ip();
-                                if !src_ip.is_loopback() && !src_ip.is_unspecified() {
-                                    addrs.push(src_ip);
-                                }
-                                if let Some(lan_ip) = ann.lan_ip {
-                                    if !addrs.contains(&lan_ip) {
-                                        addrs.push(lan_ip);
-                                    }
-                                }
-                                if addrs.is_empty() && !src_ip.is_unspecified() {
-                                    addrs.push(src_ip);
-                                }
-                                sort_peer_addresses(&mut addrs, &local_ips);
-
-                                let clean_host = ann
-                                    .hostname
-                                    .trim_end_matches(".local.")
-                                    .trim_end_matches(".local")
-                                    .to_string();
-                                let key = addrs
-                                    .first()
-                                    .map(|ip| format!("{ip}:{}", ann.udp_port))
-                                    .unwrap_or_else(|| ann.instance_name.clone());
-
-                                peers.insert(
-                                    key,
-                                    DiscoveredPeer {
-                                        instance_name: ann.instance_name,
-                                        hostname: clean_host,
-                                        addresses: addrs,
-                                        udp_port: ann.udp_port,
-                                        os: ann.os,
-                                        version: ann.version,
-                                    },
-                                );
-                            }
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
-                    }
-                }
-            }
-
-            // 2. Poll mDNS browse channel
-            if let Some(ref rx) = mdns_rx {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                match rx.recv_timeout(remaining.min(Duration::from_millis(25))) {
-                    Ok(ServiceEvent::ServiceResolved(info)) => {
-                        let fullname = info.get_fullname().to_string();
-                        let mut addresses: Vec<IpAddr> =
-                            info.get_addresses().iter().copied().collect();
-                        if let Some(lan_ip_str) = info.get_property_val_str("lan_ip") {
-                            if let Ok(ip) = lan_ip_str.parse::<IpAddr>() {
-                                if !addresses.contains(&ip) {
-                                    addresses.push(ip);
-                                }
-                            }
-                        }
-                        sort_peer_addresses(&mut addresses, &local_ips);
-
-                        let os = info
-                            .get_property_val_str("os")
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let version = info
-                            .get_property_val_str("version")
-                            .unwrap_or("1")
-                            .to_string();
-                        let clean_host = info
-                            .get_property_val_str("hostname")
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| {
-                                info.get_hostname()
-                                    .trim_end_matches(".local.")
-                                    .trim_end_matches(".local")
-                                    .to_string()
-                            });
-                        let udp_port = info.get_port();
-                        let key = addresses
-                            .first()
-                            .map(|ip| format!("{ip}:{udp_port}"))
-                            .unwrap_or_else(|| fullname.clone());
-
-                        peers.entry(key).or_insert(DiscoveredPeer {
-                            instance_name: fullname,
-                            hostname: clean_host,
-                            addresses,
-                            udp_port,
-                            os,
-                            version,
-                        });
-                    }
-                    Ok(_) => {}
-                    Err(_) => {}
-                }
-            } else {
-                thread::sleep(Duration::from_millis(15));
-            }
-        }
-
-        if let Some(ref daemon) = self.daemon {
-            let _ = daemon.stop_browse(MDNS_SERVICE_TYPE);
-        }
-
-        let mut list: Vec<DiscoveredPeer> = peers.into_values().collect();
-        list.sort_by(|a, b| a.hostname.cmp(&b.hostname));
-        Ok(list)
     }
-}
 
-impl Drop for DiscoveryService {
-    fn drop(&mut self) {
+    /// Whether this service is currently advertising an active mDNS record or UDP beacon.
+    pub fn is_advertising(&self) -> bool {
+        self.beacon_thread.is_some() || self.fullname.is_some()
+    }
+
+    /// Stop mDNS service advertisement and UDP beacon responder while keeping the underlying
+    /// `ServiceDaemon` alive for future reuse without re-spawning threads or sockets.
+    pub fn unadvertise(&mut self) {
+        self.advertised_port.store(0, Ordering::Relaxed);
         self.beacon_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.beacon_thread.take() {
             let _ = handle.join();
         }
         if let Some(ref daemon) = self.daemon {
             if let Some(fullname) = self.fullname.take() {
-                let _ = daemon.unregister(&fullname);
+                unregister_mdns_service(daemon, &fullname);
             }
-            let _ = daemon.shutdown();
+        }
+    }
+
+    /// Browse the LAN for active `rsrelay` nodes during `scan_duration` using both
+    /// UDP unicast/broadcast discovery probes and mDNS (`_rsrelay._udp.local.`).
+    pub fn scan(&self, scan_duration: Duration) -> Result<Vec<DiscoveredPeer>, DiscoveryError> {
+        scan_lan_peers(self.daemon.as_ref(), self.beacon_port, scan_duration)
+    }
+}
+
+fn scan_lan_peers(
+    daemon: Option<&ServiceDaemon>,
+    beacon_port: u16,
+    scan_duration: Duration,
+) -> Result<Vec<DiscoveredPeer>, DiscoveryError> {
+    let mdns_rx = daemon.and_then(|d| d.browse(MDNS_SERVICE_TYPE).ok());
+
+    let local_ips = detect_all_local_ipv4s();
+    let udp_probe_sock = bind_ephemeral_discovery_socket().ok();
+
+    if let Some(ref sock) = udp_probe_sock {
+        send_lan_discovery_probes(sock, &local_ips, beacon_port);
+    }
+
+    let start = Instant::now();
+    let deadline = start + scan_duration;
+    let mut second_probe_sent = false;
+    let mut peers: HashMap<String, DiscoveredPeer> = HashMap::new();
+    let mut recv_buf = [0u8; 2048];
+
+    while Instant::now() < deadline {
+        if !second_probe_sent
+            && start.elapsed() >= (scan_duration / 2).max(Duration::from_millis(120))
+        {
+            second_probe_sent = true;
+            if let Some(ref sock) = udp_probe_sock {
+                send_lan_discovery_probes(sock, &local_ips, beacon_port);
+            }
+        }
+
+        // 1. Drain UDP discovery beacon responses
+        if let Some(ref sock) = udp_probe_sock {
+            loop {
+                match sock.recv_from(&mut recv_buf) {
+                    Ok((len, src_addr)) => {
+                        if let Some(ann) = parse_beacon_response(&recv_buf[..len]) {
+                            let mut addrs = Vec::new();
+                            let src_ip = src_addr.ip();
+                            if !src_ip.is_loopback() && !src_ip.is_unspecified() {
+                                addrs.push(src_ip);
+                            }
+                            if let Some(lan_ip) = ann.lan_ip {
+                                if !addrs.contains(&lan_ip) {
+                                    addrs.push(lan_ip);
+                                }
+                            }
+                            if addrs.is_empty() && !src_ip.is_unspecified() {
+                                addrs.push(src_ip);
+                            }
+                            sort_peer_addresses(&mut addrs, &local_ips);
+
+                            let clean_host = ann
+                                .hostname
+                                .trim_end_matches(".local.")
+                                .trim_end_matches(".local")
+                                .to_string();
+                            let key = addrs
+                                .first()
+                                .map(|ip| format!("{ip}:{}", ann.udp_port))
+                                .unwrap_or_else(|| ann.instance_name.clone());
+
+                            peers.insert(
+                                key,
+                                DiscoveredPeer {
+                                    instance_name: ann.instance_name,
+                                    hostname: clean_host,
+                                    addresses: addrs,
+                                    udp_port: ann.udp_port,
+                                    os: ann.os,
+                                    version: ann.version,
+                                },
+                            );
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // 2. Poll mDNS browse channel
+        if let Some(ref rx) = mdns_rx {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining.min(Duration::from_millis(25))) {
+                Ok(ServiceEvent::ServiceResolved(info)) => {
+                    let fullname = info.get_fullname().to_string();
+                    let mut addresses: Vec<IpAddr> =
+                        info.get_addresses().iter().copied().collect();
+                    if let Some(lan_ip_str) = info.get_property_val_str("lan_ip") {
+                        if let Ok(ip) = lan_ip_str.parse::<IpAddr>() {
+                            if !addresses.contains(&ip) {
+                                addresses.push(ip);
+                            }
+                        }
+                    }
+                    sort_peer_addresses(&mut addresses, &local_ips);
+
+                    let os = info
+                        .get_property_val_str("os")
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let version = info
+                        .get_property_val_str("version")
+                        .unwrap_or("1")
+                        .to_string();
+                    let clean_host = info
+                        .get_property_val_str("hostname")
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            info.get_hostname()
+                                .trim_end_matches(".local.")
+                                .trim_end_matches(".local")
+                                .to_string()
+                        });
+                    let udp_port = info.get_port();
+                    let key = addresses
+                        .first()
+                        .map(|ip| format!("{ip}:{udp_port}"))
+                        .unwrap_or_else(|| fullname.clone());
+
+                    peers.entry(key).or_insert(DiscoveredPeer {
+                        instance_name: fullname,
+                        hostname: clean_host,
+                        addresses,
+                        udp_port,
+                        os,
+                        version,
+                    });
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        } else {
+            thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    if let Some(d) = daemon {
+        for _ in 0..3 {
+            match d.stop_browse(MDNS_SERVICE_TYPE) {
+                Err(mdns_sd::Error::Again) => thread::sleep(Duration::from_millis(5)),
+                _ => break,
+            }
+        }
+    }
+
+    let mut list: Vec<DiscoveredPeer> = peers.into_values().collect();
+    list.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    Ok(list)
+}
+
+fn unregister_mdns_service(daemon: &ServiceDaemon, fullname: &str) {
+    for _ in 0..4 {
+        match daemon.unregister(fullname) {
+            Ok(_) => break,
+            Err(mdns_sd::Error::Again) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+}
+
+fn shutdown_mdns_daemon(daemon: &ServiceDaemon) {
+    for _ in 0..6 {
+        match daemon.shutdown() {
+            Ok(status_rx) => {
+                let _ = status_rx.recv_timeout(Duration::from_millis(150));
+                break;
+            }
+            Err(mdns_sd::Error::Again) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+}
+
+impl Drop for DiscoveryService {
+    fn drop(&mut self) {
+        self.unadvertise();
+        if let Some(ref daemon) = self.daemon {
+            shutdown_mdns_daemon(daemon);
         }
     }
 }
@@ -580,11 +662,10 @@ mod tests {
             .advertise("rsrelay-test-node", 49153)
             .expect("advertise node");
 
-        let scanner =
-            DiscoveryService::with_beacon_port(test_beacon_port).expect("create scanner");
+        let scanner = advertiser.scanner();
         let peers = scanner
             .scan(Duration::from_millis(350))
-            .expect("scan peers");
+            .expect("scan peers via shared scanner");
 
         assert!(
             !peers.is_empty(),
@@ -593,6 +674,9 @@ mod tests {
         let found = peers.iter().find(|p| p.udp_port == 49153).expect("find port 49153");
         assert!(!found.addresses.is_empty());
         assert!(!found.hostname.is_empty());
+
+        advertiser.unadvertise();
+        assert!(!advertiser.is_advertising());
     }
 
     #[test]

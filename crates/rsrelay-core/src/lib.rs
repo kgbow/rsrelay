@@ -15,12 +15,14 @@ pub use rsrelay_audio::{
     is_audiorelay_backend_running, is_macos_rsrelay_driver_installed, is_null_virtual_mic_filter,
     is_virtual_mic_driver_available, is_virtual_mic_input_device_name,
     is_virtual_mic_output_sink_name, launch_windows_vbcable_install, list_audio_devices,
-    request_system_loopback_permission, select_default_virtual_mic_output_device, AudioDeviceInfo,
-    CaptureSource, MACOS_RSRELAY_VMIC_INPUT_NAME, MACOS_RSRELAY_VMIC_SINK_NAME,
-    NULL_VIRTUAL_MIC_DEVICE_NAME, VIRTUAL_MIC_OUTPUT_DEVICE_NAME,
+    request_system_loopback_permission, select_default_virtual_mic_output_device,
+    select_virtual_mic_output_from_devices, AudioDeviceInfo, CaptureSource,
+    MACOS_RSRELAY_VMIC_INPUT_NAME, MACOS_RSRELAY_VMIC_SINK_NAME, NULL_VIRTUAL_MIC_DEVICE_NAME,
+    VIRTUAL_MIC_OUTPUT_DEVICE_NAME,
 };
 pub use rsrelay_net::{
-    detect_all_local_ipv4s, detect_local_lan_ip, DiscoveredPeer, DiscoveryService,
+    detect_all_local_ipv4s, detect_local_lan_ip, DiscoveredPeer, DiscoveryScanner,
+    DiscoveryService,
 };
 pub use rsrelay_proto::{
     ChannelLayout, CodecType, DuplexRole, FrameDuration, DEFAULT_AUDIO_UDP_PORT,

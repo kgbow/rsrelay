@@ -442,6 +442,104 @@ fn map_font_file_readonly(path: &str) -> Option<&'static [u8]> {
     }
 }
 
+#[cfg(windows)]
+fn map_font_file_readonly(path: &str) -> Option<&'static [u8]> {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    type HANDLE = *mut c_void;
+    type BOOL = i32;
+    type DWORD = u32;
+
+    const GENERIC_READ: DWORD = 0x8000_0000;
+    const FILE_SHARE_READ: DWORD = 0x0000_0001;
+    const FILE_SHARE_WRITE: DWORD = 0x0000_0002;
+    const FILE_SHARE_DELETE: DWORD = 0x0000_0004;
+    const OPEN_EXISTING: DWORD = 3;
+    const FILE_ATTRIBUTE_NORMAL: DWORD = 0x0000_0080;
+    const PAGE_READONLY: DWORD = 0x02;
+    const FILE_MAP_READ: DWORD = 0x0004;
+    const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: DWORD,
+            dwShareMode: DWORD,
+            lpSecurityAttributes: *const c_void,
+            dwCreationDisposition: DWORD,
+            dwFlagsAndAttributes: DWORD,
+            hTemplateFile: HANDLE,
+        ) -> HANDLE;
+        fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *mut i64) -> BOOL;
+        fn CreateFileMappingW(
+            hFile: HANDLE,
+            lpFileMappingAttributes: *const c_void,
+            flProtect: DWORD,
+            dwMaximumSizeHigh: DWORD,
+            dwMaximumSizeLow: DWORD,
+            lpName: *const u16,
+        ) -> HANDLE;
+        fn MapViewOfFile(
+            hFileMappingObject: HANDLE,
+            dwDesiredAccess: DWORD,
+            dwFileOffsetHigh: DWORD,
+            dwFileOffsetLow: DWORD,
+            dwNumberOfBytesToMap: usize,
+        ) -> *const c_void;
+        fn CloseHandle(hObject: HANDLE) -> BOOL;
+    }
+
+    let wide_path: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let file_handle = CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        );
+        if file_handle.is_null() || file_handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+
+        let mut size_i64: i64 = 0;
+        if GetFileSizeEx(file_handle, &mut size_i64) == 0 || size_i64 <= 0 {
+            CloseHandle(file_handle);
+            return None;
+        }
+        let Ok(len) = usize::try_from(size_i64) else {
+            CloseHandle(file_handle);
+            return None;
+        };
+
+        let mapping_handle =
+            CreateFileMappingW(file_handle, null(), PAGE_READONLY, 0, 0, null());
+        CloseHandle(file_handle);
+        if mapping_handle.is_null() {
+            return None;
+        }
+
+        let view_ptr = MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, len);
+        // Closing the section handle leaves the mapped view valid for the lifetime of the process
+        // (backed by the OS standby file page cache, consuming ~0 bytes of private heap/commit).
+        CloseHandle(mapping_handle);
+        if view_ptr.is_null() {
+            return None;
+        }
+
+        Some(std::slice::from_raw_parts(view_ptr.cast::<u8>(), len))
+    }
+}
+
 struct CalibratedCjkFont {
     path: &'static str,
     bytes: &'static [u8],
@@ -452,20 +550,26 @@ struct CalibratedCjkFont {
 fn measure_cjk_font_calibration(bytes: &'static [u8]) -> Option<(f32, f32)> {
     let probe_size = 20.0_f32;
 
-    // 1. Measure as primary Proportional font on mixed CJK + Latin caps/digits
-    let prop_ctx = egui::Context::default();
-    let mut prop_defs = egui::FontDefinitions::default();
-    prop_defs
+    // Measure both Proportional (primary CJK + Latin) and Monospace (CJK fallback behind Hack)
+    // in a single temporary `egui::Context` pass to halve startup probe allocations.
+    let probe_ctx = egui::Context::default();
+    let mut probe_defs = egui::FontDefinitions::default();
+    probe_defs
         .font_data
         .insert("probe_cjk".to_owned(), egui::FontData::from_static(bytes));
-    prop_defs
+    probe_defs
         .families
         .get_mut(&FontFamily::Proportional)?
         .insert(0, "probe_cjk".to_owned());
-    prop_ctx.set_fonts(prop_defs);
+    probe_defs
+        .families
+        .get_mut(&FontFamily::Monospace)?
+        .push("probe_cjk".to_owned());
+    probe_ctx.set_fonts(probe_defs);
 
     let mut prop_diff_opt: Option<f32> = None;
-    let _ = prop_ctx.run(egui::RawInput::default(), |ctx| {
+    let mut mono_diff = 0.0_f32;
+    let _ = probe_ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let p = ui.painter();
             let g_cjk = p.layout_no_wrap(
@@ -486,27 +590,8 @@ fn measure_cjk_font_calibration(bytes: &'static [u8]) -> Option<(f32, f32)> {
                 let avg_ink_cy = (g_cjk.mesh_bounds.center().y + g_lat.mesh_bounds.center().y) * 0.5;
                 prop_diff_opt = Some(avg_ink_cy - g_cjk.rect.center().y);
             }
-        });
-    });
-    let prop_diff = prop_diff_opt?;
-    let prop_factor = (-prop_diff / probe_size).clamp(-0.35, 0.35);
 
-    // 2. Measure as fallback behind Hack in Monospace
-    let mono_ctx = egui::Context::default();
-    let mut mono_defs = egui::FontDefinitions::default();
-    mono_defs
-        .font_data
-        .insert("probe_cjk".to_owned(), egui::FontData::from_static(bytes));
-    mono_defs
-        .families
-        .get_mut(&FontFamily::Monospace)?
-        .push("probe_cjk".to_owned());
-    mono_ctx.set_fonts(mono_defs);
-
-    let mut mono_diff = 0.0_f32;
-    let _ = mono_ctx.run(egui::RawInput::default(), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let g_m = ui.painter().layout_no_wrap(
+            let g_m = p.layout_no_wrap(
                 "音频".to_string(),
                 FontId::new(probe_size, FontFamily::Monospace),
                 Color32::WHITE,
@@ -516,6 +601,9 @@ fn measure_cjk_font_calibration(bytes: &'static [u8]) -> Option<(f32, f32)> {
             }
         });
     });
+
+    let prop_diff = prop_diff_opt?;
+    let prop_factor = (-prop_diff / probe_size).clamp(-0.35, 0.35);
     let mono_factor = (-mono_diff / probe_size).clamp(-0.35, 0.35);
 
     Some((prop_factor, mono_factor))
@@ -544,7 +632,7 @@ fn load_calibrated_cjk_font() -> Option<&'static CalibratedCjkFont> {
             ];
 
             for &path in candidate_paths {
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 if let Some(mapped) = map_font_file_readonly(path) {
                     if let Some((prop_f, mono_f)) = measure_cjk_font_calibration(mapped) {
                         return Some(CalibratedCjkFont {
@@ -556,6 +644,7 @@ fn load_calibrated_cjk_font() -> Option<&'static CalibratedCjkFont> {
                     }
                 }
 
+                #[cfg(not(any(unix, windows)))]
                 if let Ok(vec_bytes) = std::fs::read(path) {
                     let leaked: &'static [u8] = Box::leak(vec_bytes.into_boxed_slice());
                     if let Some((prop_f, mono_f)) = measure_cjk_font_calibration(leaked) {
@@ -578,25 +667,41 @@ fn load_calibrated_cjk_font() -> Option<&'static CalibratedCjkFont> {
 pub fn configure_cjk_fallback_fonts(ctx: &egui::Context) {
     if let Some(cal) = load_calibrated_cjk_font() {
         let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "system_cjk_prop".to_owned(),
-            egui::FontData::from_static(cal.bytes).tweak(egui::FontTweak {
-                y_offset_factor: cal.prop_y_offset_factor,
-                ..Default::default()
-            }),
-        );
-        fonts.font_data.insert(
-            "system_cjk_mono".to_owned(),
-            egui::FontData::from_static(cal.bytes).tweak(egui::FontTweak {
-                y_offset_factor: cal.mono_y_offset_factor,
-                ..Default::default()
-            }),
-        );
-        if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional) {
-            prop.insert(0, "system_cjk_prop".to_owned());
-        }
-        if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
-            mono.push("system_cjk_mono".to_owned());
+        if (cal.prop_y_offset_factor - cal.mono_y_offset_factor).abs() < 0.01 {
+            fonts.font_data.insert(
+                "system_cjk".to_owned(),
+                egui::FontData::from_static(cal.bytes).tweak(egui::FontTweak {
+                    y_offset_factor: cal.prop_y_offset_factor,
+                    ..Default::default()
+                }),
+            );
+            if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional) {
+                prop.insert(0, "system_cjk".to_owned());
+            }
+            if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
+                mono.push("system_cjk".to_owned());
+            }
+        } else {
+            fonts.font_data.insert(
+                "system_cjk_prop".to_owned(),
+                egui::FontData::from_static(cal.bytes).tweak(egui::FontTweak {
+                    y_offset_factor: cal.prop_y_offset_factor,
+                    ..Default::default()
+                }),
+            );
+            fonts.font_data.insert(
+                "system_cjk_mono".to_owned(),
+                egui::FontData::from_static(cal.bytes).tweak(egui::FontTweak {
+                    y_offset_factor: cal.mono_y_offset_factor,
+                    ..Default::default()
+                }),
+            );
+            if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional) {
+                prop.insert(0, "system_cjk_prop".to_owned());
+            }
+            if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
+                mono.push("system_cjk_mono".to_owned());
+            }
         }
         ctx.set_fonts(fonts);
         tracing::debug!(

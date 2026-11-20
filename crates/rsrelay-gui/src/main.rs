@@ -18,13 +18,13 @@ use eframe::egui::{
 };
 use rsrelay_core::{
     detect_all_local_ipv4s, detect_local_lan_ip, has_system_loopback_permission,
-    install_macos_virtual_mic_driver, is_audiorelay_backend_running,
-    is_macos_rsrelay_driver_installed, is_virtual_mic_input_device_name,
-    is_virtual_mic_output_sink_name, launch_windows_vbcable_install, list_audio_devices,
-    preset_bus_modes_for_role, request_system_loopback_permission,
-    select_default_virtual_mic_output_device, AudioDeviceInfo, ChannelLayout, DiscoveredPeer,
-    DiscoveryService, DuplexRole, DuplexSession, DuplexSessionConfig, LatencyProfile, MediaBusMode,
-    MicBusMode, DEFAULT_AUDIO_UDP_PORT, DEFAULT_UPLINK_UDP_PORT, MACOS_RSRELAY_VMIC_INPUT_NAME,
+    install_macos_virtual_mic_driver, is_macos_rsrelay_driver_installed,
+    is_virtual_mic_input_device_name, is_virtual_mic_output_sink_name,
+    launch_windows_vbcable_install, list_audio_devices, preset_bus_modes_for_role,
+    request_system_loopback_permission, select_virtual_mic_output_from_devices, AudioDeviceInfo,
+    ChannelLayout, DiscoveredPeer, DiscoveryScanner, DiscoveryService, DuplexRole, DuplexSession,
+    DuplexSessionConfig, LatencyProfile, MediaBusMode, MicBusMode, DEFAULT_AUDIO_UDP_PORT,
+    DEFAULT_UPLINK_UDP_PORT, MACOS_RSRELAY_VMIC_INPUT_NAME,
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
@@ -549,7 +549,7 @@ pub struct RsRelayGuiApp {
     pub sck_permission_granted: bool,
 
     pub devices: Vec<AudioDeviceInfo>,
-    pending_devices: Arc<Mutex<Option<(Vec<AudioDeviceInfo>, bool)>>>,
+    pending_devices: Arc<Mutex<Option<(Vec<AudioDeviceInfo>, Option<IpAddr>, bool)>>>,
     polling_devices: Arc<AtomicBool>,
     pub discovered_peers: Arc<Mutex<Vec<DiscoveredPeer>>>,
     pub scanning_lan: Arc<AtomicBool>,
@@ -639,7 +639,7 @@ impl RsRelayGuiApp {
 
         let initial_role = DuplexRole::Headset;
         let (init_media_mode, init_mic_mode) = preset_bus_modes_for_role(initial_role);
-        let audiorelay_conflict_cached = is_audiorelay_backend_running();
+        let audiorelay_conflict_cached = false;
 
         let mut app = Self {
             lang,
@@ -799,6 +799,12 @@ impl RsRelayGuiApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(1220.0, 760.0)));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        if self.tray.is_some() {
+            self.refresh_audio_devices(false);
+            if !self.demo_mode && self.active_duplex.is_none() {
+                self.trigger_lan_scan_internal(false);
+            }
+        }
         ctx.request_repaint();
         #[cfg(target_os = "windows")]
         win32_tray::wake_main_window();
@@ -827,10 +833,16 @@ impl RsRelayGuiApp {
         let polling = Arc::clone(&self.polling_devices);
         thread::spawn(move || {
             let new_devices = list_audio_devices().unwrap_or_default();
+            let lan_ip = detect_local_lan_ip();
             if let Ok(mut guard) = pending.lock() {
-                *guard = Some((new_devices, manual));
+                *guard = Some((new_devices, lan_ip, manual));
             }
             polling.store(false, Ordering::Relaxed);
+            if let Ok(guard) = global_egui_wakeup_ctx().lock() {
+                if let Some(ref ctx) = *guard {
+                    ctx.request_repaint();
+                }
+            }
         });
     }
 
@@ -860,7 +872,7 @@ impl RsRelayGuiApp {
             .lock()
             .ok()
             .and_then(|mut guard| guard.take());
-        let Some((new_devices, manual)) = maybe_update else {
+        let Some((new_devices, new_lan_ip, manual)) = maybe_update else {
             return;
         };
 
@@ -877,14 +889,17 @@ impl RsRelayGuiApp {
             .map(|d| d.name.clone());
 
         self.devices = new_devices;
-        self.local_lan_ip = detect_local_lan_ip();
+        if !self.demo_mode {
+            self.local_lan_ip = new_lan_ip;
+        }
         self.sck_permission_granted = has_system_loopback_permission();
-        self.audiorelay_conflict_cached = is_audiorelay_backend_running();
 
         if let Some(ref dpx) = self.active_duplex {
             let st = dpx.status();
-            // Auto-bind real Virtual Mic driver if one just became available
-            if !st.virtual_mic_ready && select_default_virtual_mic_output_device().is_some() {
+            // Auto-bind real Virtual Mic driver if one just became available (pure slice check)
+            if !st.virtual_mic_ready
+                && select_virtual_mic_output_from_devices(&self.devices).is_some()
+            {
                 self.restart_active_session();
                 return;
             }
@@ -923,14 +938,20 @@ impl RsRelayGuiApp {
     fn sync_lan_advertiser(&mut self) {
         let port = self.duplex_downlink_port;
         if self.advertise_mdns {
-            if let Some(ref svc) = self.lan_advertiser {
-                svc.set_advertised_port(port);
+            if let Some(ref mut svc) = self.lan_advertiser {
+                if svc.is_advertising() {
+                    svc.set_advertised_port(port);
+                } else {
+                    let _ = svc.advertise("rsrelay-desktop", port);
+                }
             } else if let Ok(mut svc) = DiscoveryService::new() {
                 let _ = svc.advertise("rsrelay-desktop", port);
                 self.lan_advertiser = Some(svc);
             }
-        } else {
-            self.lan_advertiser = None;
+        } else if let Some(ref mut svc) = self.lan_advertiser {
+            // Unregister mDNS & stop UDP responder while keeping the underlying ServiceDaemon
+            // alive for zero-churn reuse on future scans or re-advertisement.
+            svc.unadvertise();
         }
     }
 
@@ -939,14 +960,21 @@ impl RsRelayGuiApp {
     }
 
     fn trigger_lan_scan_internal(&mut self, manual: bool) {
-        if self.scanning_lan.load(Ordering::Relaxed) {
+        if self.scanning_lan.swap(true, Ordering::Relaxed) {
             return;
         }
         self.last_lan_scan = Instant::now();
-        self.scanning_lan.store(true, Ordering::Relaxed);
         if manual {
             self.last_status_msg = self.lang.status_scanning_lan();
         }
+        if self.lan_advertiser.is_none() {
+            self.lan_advertiser = DiscoveryService::new().ok();
+        }
+        let scanner = self
+            .lan_advertiser
+            .as_ref()
+            .map(|svc| svc.scanner())
+            .unwrap_or_else(DiscoveryScanner::udp_only);
         let peers_arc = Arc::clone(&self.discovered_peers);
         let scanning_flag = Arc::clone(&self.scanning_lan);
 
@@ -955,26 +983,29 @@ impl RsRelayGuiApp {
                 .into_iter()
                 .map(IpAddr::V4)
                 .collect();
-            if let Ok(svc) = DiscoveryService::new() {
-                if let Ok(found) = svc.scan(Duration::from_millis(900)) {
-                    let remote_peers: Vec<DiscoveredPeer> = found
-                        .into_iter()
-                        .filter_map(|mut p| {
-                            p.addresses
-                                .retain(|ip| !ip.is_loopback() && !local_ips.contains(ip));
-                            if p.addresses.is_empty() {
-                                None
-                            } else {
-                                Some(p)
-                            }
-                        })
-                        .collect();
-                    if let Ok(mut guard) = peers_arc.lock() {
-                        *guard = remote_peers;
-                    }
+            if let Ok(found) = scanner.scan(Duration::from_millis(900)) {
+                let remote_peers: Vec<DiscoveredPeer> = found
+                    .into_iter()
+                    .filter_map(|mut p| {
+                        p.addresses
+                            .retain(|ip| !ip.is_loopback() && !local_ips.contains(ip));
+                        if p.addresses.is_empty() {
+                            None
+                        } else {
+                            Some(p)
+                        }
+                    })
+                    .collect();
+                if let Ok(mut guard) = peers_arc.lock() {
+                    *guard = remote_peers;
                 }
             }
             scanning_flag.store(false, Ordering::Relaxed);
+            if let Ok(guard) = global_egui_wakeup_ctx().lock() {
+                if let Some(ref ctx) = *guard {
+                    ctx.request_repaint();
+                }
+            }
         });
     }
 
@@ -1162,7 +1193,12 @@ impl RsRelayGuiApp {
         } else {
             self.volume
         };
-        cfg.advertise_mdns = self.advertise_mdns && self.lan_advertiser.is_none();
+        cfg.advertise_mdns = self.advertise_mdns
+            && !self
+                .lan_advertiser
+                .as_ref()
+                .map(|s| s.is_advertising())
+                .unwrap_or(false);
         cfg.synthetic_source_override = self.use_test_tone;
         cfg.target_buffer_ms_override = if self.custom_buffer_enabled {
             Some(self.target_buffer_ms)
@@ -2877,7 +2913,11 @@ impl RsRelayGuiApp {
                 let mic_mode = self.duplex_mic_mode;
                 let mic_enabled = mic_mode != MicBusMode::Off;
                 let mic_live = link_running && mic_enabled;
-                let auto_vmic = select_default_virtual_mic_output_device();
+                let auto_vmic = if mic_mode == MicBusMode::ReceiveVirtualMic {
+                    select_virtual_mic_output_from_devices(&self.devices)
+                } else {
+                    None
+                };
 
                 // 2A. Left Local Mic / Virtual Mic Port Box
                 {
@@ -3581,7 +3621,7 @@ impl RsRelayGuiApp {
             }
             if (cfg!(target_os = "macos") && !is_macos_rsrelay_driver_installed())
                 || (cfg!(target_os = "windows")
-                    && select_default_virtual_mic_output_device().is_none())
+                    && select_virtual_mic_output_from_devices(&self.devices).is_none())
             {
                 let installing = self.installing_vmic_driver.load(Ordering::Relaxed);
                 let drv_btn = if installing {
@@ -3853,11 +3893,18 @@ impl RsRelayGuiApp {
             return;
         }
 
-        if self.last_device_poll.elapsed() >= Duration::from_millis(2500) {
+        let window_visible = self.tray_window_state == TrayWindowState::Visible;
+        if (window_visible || self.active_duplex.is_some())
+            && self.last_device_poll.elapsed() >= Duration::from_millis(3000)
+        {
             self.last_device_poll = Instant::now();
             self.refresh_audio_devices(false);
         }
-        if !self.demo_mode && self.last_lan_scan.elapsed() >= Duration::from_secs(4) {
+        if window_visible
+            && !self.demo_mode
+            && self.active_duplex.is_none()
+            && self.last_lan_scan.elapsed() >= Duration::from_secs(8)
+        {
             self.trigger_lan_scan_internal(false);
         }
         self.apply_pending_device_updates();
@@ -3902,10 +3949,7 @@ impl RsRelayGuiApp {
             }
         }
 
-        if self.active_duplex.is_some()
-            || self.demo_mode
-            || self.scanning_lan.load(Ordering::Relaxed)
-        {
+        if self.active_duplex.is_some() || self.demo_mode {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
@@ -4291,6 +4335,15 @@ mod tests {
             });
         }
         assert_eq!(app.tray_window_state, TrayWindowState::HiddenInTray);
+
+        // Verify background device polling and LAN scanning stay idle while hidden in tray
+        app.last_device_poll = Instant::now() - Duration::from_secs(30);
+        app.last_lan_scan = Instant::now() - Duration::from_secs(30);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.render_ui(ctx);
+        });
+        assert!(!app.polling_devices.load(Ordering::Relaxed));
+        assert!(!app.scanning_lan.load(Ordering::Relaxed));
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.restore_from_tray(ctx);

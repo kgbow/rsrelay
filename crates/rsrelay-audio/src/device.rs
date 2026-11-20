@@ -147,16 +147,17 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, AudioError> {
     Ok(infos)
 }
 
-/// Automatically select the preferred virtual microphone output sink across Windows and macOS.
+/// Select the preferred virtual microphone output sink from an already-enumerated slice of devices.
+///
+/// Performs pure in-memory matching with zero OS audio host queries or kernel handle opens,
+/// making it safe to call inside 60 FPS GUI render loops.
 ///
 /// Priority order:
 /// 1. `rsrelay Virtual Mic Sink` (dedicated macOS CoreAudio HAL split bridge — hardware-clocked, zero speaker hijack)
 /// 2. `CABLE Input` / `VB-Audio` (hardware-clocked WASAPI/CoreAudio virtual cable — zero `audiorelay-backend` contention)
 /// 3. `Virtual Mic (Virtual Mic for AudioRelay)` (high-resolution Windows kernel bridge)
 /// 4. `BlackHole` / `Soundflower` / `VoiceMeeter Input` / `Virtual Audio`
-pub fn select_default_virtual_mic_output_device() -> Option<String> {
-    let devices = list_audio_devices().ok()?;
-
+pub fn select_virtual_mic_output_from_devices(devices: &[AudioDeviceInfo]) -> Option<String> {
     // 1. Dedicated rsrelay HAL sink or hardware-clocked VB-CABLE first
     for keyword in ["rsrelay virtual mic sink", "cable input", "vb-audio"] {
         if let Some(dev) = devices
@@ -167,9 +168,12 @@ pub fn select_default_virtual_mic_output_device() -> Option<String> {
         }
     }
 
-    // 2. Native Windows Virtual Mic kernel bridge
-    if is_virtual_mic_driver_available() {
-        return Some(VIRTUAL_MIC_OUTPUT_DEVICE_NAME.to_string());
+    // 2. Native Windows Virtual Mic kernel bridge (appended by `list_audio_devices` when active)
+    if let Some(dev) = devices
+        .iter()
+        .find(|d| d.is_output && d.name == VIRTUAL_MIC_OUTPUT_DEVICE_NAME)
+    {
+        return Some(dev.name.clone());
     }
 
     // 3. Other virtual loopback cables (BlackHole, Soundflower, VoiceMeeter, Virtual Audio Driver)
@@ -189,4 +193,60 @@ pub fn select_default_virtual_mic_output_device() -> Option<String> {
     }
 
     None
+}
+
+/// Automatically select the preferred virtual microphone output sink across Windows and macOS.
+///
+/// Enumerates host audio devices once and delegates to [`select_virtual_mic_output_from_devices`].
+pub fn select_default_virtual_mic_output_device() -> Option<String> {
+    let devices = list_audio_devices().ok()?;
+    select_virtual_mic_output_from_devices(&devices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_select_virtual_mic_output_from_devices_priority() {
+        let devices = vec![
+            AudioDeviceInfo {
+                name: "Speakers (Realtek Audio)".to_string(),
+                is_input: false,
+                is_output: true,
+                is_default_input: false,
+                is_default_output: true,
+                default_sample_rate: Some(48_000),
+                default_channels: Some(2),
+            },
+            AudioDeviceInfo {
+                name: VIRTUAL_MIC_OUTPUT_DEVICE_NAME.to_string(),
+                is_input: false,
+                is_output: true,
+                is_default_input: false,
+                is_default_output: false,
+                default_sample_rate: Some(48_000),
+                default_channels: Some(2),
+            },
+            AudioDeviceInfo {
+                name: "CABLE Input (VB-Audio Virtual Cable)".to_string(),
+                is_input: false,
+                is_output: true,
+                is_default_input: false,
+                is_default_output: false,
+                default_sample_rate: Some(48_000),
+                default_channels: Some(2),
+            },
+        ];
+
+        assert_eq!(
+            select_virtual_mic_output_from_devices(&devices).as_deref(),
+            Some("CABLE Input (VB-Audio Virtual Cable)")
+        );
+        assert_eq!(
+            select_virtual_mic_output_from_devices(&devices[..2]).as_deref(),
+            Some(VIRTUAL_MIC_OUTPUT_DEVICE_NAME)
+        );
+        assert_eq!(select_virtual_mic_output_from_devices(&devices[..1]), None);
+    }
 }

@@ -117,7 +117,8 @@ impl AudioReceiverWorker {
                 let mut rtrb_ctrl = ClockDriftController::new(rtrb_target_frames);
                 let mut was_buffering = true;
 
-                promote_worker_thread_priority(config.output_sample_rate, frames_per_pkt as u32);
+                let _prio_guard =
+                    promote_worker_thread_priority(config.output_sample_rate, frames_per_pkt as u32);
 
                 let mut udp_buf = [0u8; MAX_PACKET_SIZE];
                 let mut pkt_payload = [0u8; MAX_UDP_PAYLOAD];

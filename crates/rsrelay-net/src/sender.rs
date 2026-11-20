@@ -107,7 +107,8 @@ impl AudioSenderWorker {
         let join_handle = thread::Builder::new()
             .name("rsrelay-tx-worker".to_string())
             .spawn(move || {
-                promote_worker_thread_priority(STANDARD_SAMPLE_RATE, target_frames_48k as u32);
+                let _prio_guard =
+                    promote_worker_thread_priority(STANDARD_SAMPLE_RATE, target_frames_48k as u32);
 
                 let mut last_gate_bits = init_gate_bits;
                 let mut noise_gate =
