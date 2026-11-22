@@ -609,6 +609,8 @@ pub struct RsRelayGuiApp {
     pub tray_window_state: TrayWindowState,
     pending_restore_focus: bool,
     pub quit_requested: bool,
+    last_tray_title: String,
+    last_tray_title_update: Instant,
     tray: Option<SystemTrayHandles>,
 }
 
@@ -699,6 +701,8 @@ impl RsRelayGuiApp {
             tray_window_state: TrayWindowState::Visible,
             pending_restore_focus: false,
             quit_requested: false,
+            last_tray_title: String::new(),
+            last_tray_title_update: Instant::now() - Duration::from_secs(5),
             tray,
         };
 
@@ -714,6 +718,7 @@ impl RsRelayGuiApp {
         let hidden = self.tray_window_state != TrayWindowState::Visible;
         if let Some(ref tray) = self.tray {
             tray.set_language(lang, hidden);
+            self.last_tray_title = lang.texts().tray_title.to_string();
         }
         self.last_status_msg = lang.status_language_switched();
     }
@@ -810,19 +815,31 @@ impl RsRelayGuiApp {
         win32_tray::wake_main_window();
     }
 
-    fn sync_tray_status_title(&self) {
+    fn sync_tray_status_title(&mut self) {
         let Some(ref tray) = self.tray else {
             return;
         };
-        let status_line = if let Some(ref dpx) = self.active_duplex {
+        if let Some(ref dpx) = self.active_duplex {
+            if self.last_tray_title_update.elapsed() < Duration::from_millis(1000) {
+                return;
+            }
+            self.last_tray_title_update = Instant::now();
             let st = dpx.status();
             let tx_pkts = st.primary_tx().map(|t| t.net.packets_sent).unwrap_or(0);
             let rx_buf = st.primary_rx().map(|r| r.net.buffer_level_ms).unwrap_or(0.0);
-            format!("● LIVE — TX: {tx_pkts} | Buf: {rx_buf:.1} ms")
+            let status_line = format!("● LIVE — TX: {tx_pkts} | Buf: {rx_buf:.1} ms");
+            if status_line != self.last_tray_title {
+                tray.title_item.set_text(&status_line);
+                self.last_tray_title = status_line;
+            }
         } else {
-            self.lang.texts().tray_title.to_string()
-        };
-        tray.title_item.set_text(status_line);
+            let idle_title = self.lang.texts().tray_title;
+            if self.last_tray_title != idle_title {
+                tray.title_item.set_text(idle_title);
+                self.last_tray_title.clear();
+                self.last_tray_title.push_str(idle_title);
+            }
+        }
     }
 
     pub fn refresh_audio_devices(&mut self, manual: bool) {

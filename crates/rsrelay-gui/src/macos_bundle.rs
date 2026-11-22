@@ -61,9 +61,11 @@ pub fn install_macos_app_bundle() -> anyhow::Result<PathBuf> {
     fs::create_dir_all(&macos_dir)?;
     fs::create_dir_all(&resources_dir)?;
 
-    // 1. Copy executable binary into Contents/MacOS/rsrelay-gui
+    // 1. Copy executable binary into Contents/MacOS/rsrelay-gui (unlink first so macOS arm64
+    //    allocates a fresh inode without invalidating code-signing pages of any running instance)
     let dest_bin = macos_dir.join("rsrelay-gui");
     if current_exe != dest_bin {
+        let _ = fs::remove_file(&dest_bin);
         fs::copy(&current_exe, &dest_bin)?;
     }
     #[cfg(unix)]

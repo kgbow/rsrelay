@@ -3,7 +3,9 @@ use std::sync::{
     Arc,
 };
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
+#[cfg(not(target_os = "macos"))]
+use cpal::traits::HostTrait;
 use cpal::SampleFormat;
 use rtrb::Consumer;
 
@@ -111,21 +113,7 @@ pub fn start_playback_stream(
     }
 
     let host = cpal::default_host();
-    let device = if let Some(filter) = device_name_filter {
-        let filter_lower = filter.to_lowercase();
-        host.output_devices()?
-            .find(|d| {
-                d.name()
-                    .map(|n| n.to_lowercase().contains(&filter_lower))
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| AudioError::DeviceNotFound(filter.to_string()))?
-    } else {
-        host.default_output_device()
-            .ok_or_else(|| AudioError::DeviceNotFound("default output device".to_string()))?
-    };
-
-    let device_name = device.name().unwrap_or_else(|_| "Default Output".to_string());
+    let (device, device_name) = resolve_output_device(&host, device_name_filter)?;
     let supported_cfg = device.default_output_config()?;
     let sample_format = supported_cfg.sample_format();
     let config: cpal::StreamConfig = supported_cfg.into();
@@ -205,6 +193,45 @@ pub fn start_playback_stream(
         peak_bits,
         underrun_count,
     })
+}
+
+fn resolve_output_device(
+    host: &cpal::Host,
+    device_name_filter: Option<&str>,
+) -> Result<(cpal::Device, String), AudioError> {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::device::macos_coreaudio::{
+            default_cpal_device_with_name, find_cpal_device_by_name,
+        };
+        if let Some(filter) = device_name_filter {
+            let filter_lower = filter.to_lowercase();
+            find_cpal_device_by_name(host, false, |n| n.to_lowercase().contains(&filter_lower))
+                .ok_or_else(|| AudioError::DeviceNotFound(filter.to_string()))
+        } else {
+            default_cpal_device_with_name(host, false)
+                .ok_or_else(|| AudioError::DeviceNotFound("default output device".to_string()))
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let device = if let Some(filter) = device_name_filter {
+            let filter_lower = filter.to_lowercase();
+            host.output_devices()?
+                .find(|d| {
+                    d.name()
+                        .map(|n| n.to_lowercase().contains(&filter_lower))
+                        .unwrap_or(false)
+                })
+                .ok_or_else(|| AudioError::DeviceNotFound(filter.to_string()))?
+        } else {
+            host.default_output_device()
+                .ok_or_else(|| AudioError::DeviceNotFound("default output device".to_string()))?
+        };
+        let device_name = device.name().unwrap_or_else(|_| "Default Output".to_string());
+        Ok((device, device_name))
+    }
 }
 
 #[inline]

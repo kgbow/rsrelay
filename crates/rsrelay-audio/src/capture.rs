@@ -5,7 +5,9 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
+#[cfg(not(target_os = "macos"))]
+use cpal::traits::HostTrait;
 use cpal::SampleFormat;
 use rtrb::Producer;
 
@@ -164,13 +166,9 @@ pub fn start_capture_stream(
     let host = cpal::default_host();
 
     // Select device based on source and platform
-    let (device, supported_cfg, is_windows_loopback) = select_capture_device(
-        &host,
-        source,
-        device_name_filter,
-    )?;
+    let (device, device_name, supported_cfg, is_windows_loopback) =
+        select_capture_device(&host, source, device_name_filter)?;
 
-    let device_name = device.name().unwrap_or_else(|_| "Default Device".to_string());
     let sample_format = supported_cfg.sample_format();
     let config: cpal::StreamConfig = supported_cfg.into();
     let hw_sample_rate = config.sample_rate.0;
@@ -236,7 +234,7 @@ fn select_capture_device(
     host: &cpal::Host,
     source: CaptureSource,
     name_filter: Option<&str>,
-) -> Result<(cpal::Device, cpal::SupportedStreamConfig, bool), AudioError> {
+) -> Result<(cpal::Device, String, cpal::SupportedStreamConfig, bool), AudioError> {
     match source {
         CaptureSource::SystemLoopback => {
             #[cfg(target_os = "windows")]
@@ -256,14 +254,50 @@ fn select_capture_device(
                         AudioError::DeviceNotFound("default Windows output device".to_string())
                     })?
                 };
+                let dev_name = device
+                    .name()
+                    .unwrap_or_else(|_| "Default Windows Output".to_string());
                 let cfg = device.default_output_config()?;
-                return Ok((device, cfg, true));
+                return Ok((device, dev_name, cfg, true));
             }
 
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "macos")]
             {
-                // On macOS / Unix: look for a loopback device (e.g., BlackHole, Loopback, Soundflower)
-                // or match the user's filter, falling back to default input device
+                use crate::device::macos_coreaudio::{
+                    default_cpal_device_with_name, find_cpal_device_by_name,
+                };
+
+                if let Some(filter) = name_filter {
+                    let filter_lower = filter.to_lowercase();
+                    if let Some((dev, name)) = find_cpal_device_by_name(host, true, |n| {
+                        n.to_lowercase().contains(&filter_lower)
+                    }) {
+                        let cfg = dev.default_input_config()?;
+                        return Ok((dev, name, cfg, false));
+                    }
+                }
+
+                for keyword in ["blackhole", "loopback", "soundflower", "monitor"] {
+                    if let Some((dev, name)) = find_cpal_device_by_name(host, true, |n| {
+                        let lower = n.to_lowercase();
+                        lower.contains(keyword) && !lower.contains("rsrelay virtual mic")
+                    }) {
+                        let cfg = dev.default_input_config()?;
+                        return Ok((dev, name, cfg, false));
+                    }
+                }
+
+                let (dev, name) = default_cpal_device_with_name(host, true).ok_or_else(|| {
+                    AudioError::DeviceNotFound(
+                        "macOS loopback or default input device".to_string(),
+                    )
+                })?;
+                let cfg = dev.default_input_config()?;
+                return Ok((dev, name, cfg, false));
+            }
+
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
                 if let Some(filter) = name_filter {
                     let filter_lower = filter.to_lowercase();
                     if let Some(dev) = host.input_devices()?.find(|d| {
@@ -271,8 +305,9 @@ fn select_capture_device(
                             .map(|n| n.to_lowercase().contains(&filter_lower))
                             .unwrap_or(false)
                     }) {
+                        let name = dev.name().unwrap_or_else(|_| "Default Device".to_string());
                         let cfg = dev.default_input_config()?;
-                        return Ok((dev, cfg, false));
+                        return Ok((dev, name, cfg, false));
                     }
                 }
 
@@ -285,63 +320,104 @@ fn select_capture_device(
                             })
                             .unwrap_or(false)
                     }) {
+                        let name = dev.name().unwrap_or_else(|_| "Default Device".to_string());
                         let cfg = dev.default_input_config()?;
-                        return Ok((dev, cfg, false));
+                        return Ok((dev, name, cfg, false));
                     }
                 }
 
                 let dev = host.default_input_device().ok_or_else(|| {
-                    AudioError::DeviceNotFound(
-                        "macOS loopback or default input device".to_string(),
-                    )
+                    AudioError::DeviceNotFound("loopback or default input device".to_string())
                 })?;
+                let name = dev.name().unwrap_or_else(|_| "Default Device".to_string());
                 let cfg = dev.default_input_config()?;
-                Ok((dev, cfg, false))
+                Ok((dev, name, cfg, false))
             }
         }
         CaptureSource::Microphone => {
-            let dev = if let Some(filter) = name_filter {
-                let filter_lower = filter.to_lowercase();
-                host.input_devices()?
-                    .find(|d| {
-                        d.name()
-                            .map(|n| n.to_lowercase().contains(&filter_lower))
-                            .unwrap_or(false)
+            #[cfg(target_os = "macos")]
+            {
+                use crate::device::macos_coreaudio::{
+                    default_cpal_device_with_name, find_cpal_device_by_name,
+                };
+
+                let (dev, dev_name) = if let Some(filter) = name_filter {
+                    let filter_lower = filter.to_lowercase();
+                    find_cpal_device_by_name(host, true, |n| {
+                        n.to_lowercase().contains(&filter_lower)
                     })
                     .ok_or_else(|| AudioError::DeviceNotFound(filter.to_string()))?
-            } else {
-                // When auto-selecting a physical microphone, avoid virtual microphone loopback
-                // endpoints (`Virtual Mic`, `CABLE Output`, `rsrelay Virtual Mic`, `BlackHole`)
-                // if the user previously set a virtual mic as OS Default Input, preventing loops.
-                let default_dev = host.default_input_device();
-                let default_is_virtual = default_dev
-                    .as_ref()
-                    .and_then(|d| d.name().ok())
-                    .map(|n| crate::device::is_virtual_mic_input_device_name(&n))
-                    .unwrap_or(false);
-
-                if !default_is_virtual {
-                    if let Some(d) = default_dev {
-                        d
-                    } else {
-                        return Err(AudioError::DeviceNotFound(
-                            "default microphone input".to_string(),
-                        ));
-                    }
-                } else if let Some(phys) = host.input_devices()?.find(|d| {
-                    d.name()
-                        .map(|n| !crate::device::is_virtual_mic_input_device_name(&n))
-                        .unwrap_or(false)
-                }) {
-                    phys
                 } else {
-                    default_dev.ok_or_else(|| {
-                        AudioError::DeviceNotFound("default microphone input".to_string())
-                    })?
-                }
-            };
-            let cfg = dev.default_input_config()?;
-            Ok((dev, cfg, false))
+                    let default_opt = default_cpal_device_with_name(host, true);
+                    let default_is_virtual = default_opt
+                        .as_ref()
+                        .map(|(_, n)| crate::device::is_virtual_mic_input_device_name(n))
+                        .unwrap_or(false);
+
+                    if !default_is_virtual {
+                        default_opt.ok_or_else(|| {
+                            AudioError::DeviceNotFound("default microphone input".to_string())
+                        })?
+                    } else if let Some(phys) = find_cpal_device_by_name(host, true, |n| {
+                        !crate::device::is_virtual_mic_input_device_name(n)
+                    }) {
+                        phys
+                    } else {
+                        default_opt.ok_or_else(|| {
+                            AudioError::DeviceNotFound("default microphone input".to_string())
+                        })?
+                    }
+                };
+                let cfg = dev.default_input_config()?;
+                return Ok((dev, dev_name, cfg, false));
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let dev = if let Some(filter) = name_filter {
+                    let filter_lower = filter.to_lowercase();
+                    host.input_devices()?
+                        .find(|d| {
+                            d.name()
+                                .map(|n| n.to_lowercase().contains(&filter_lower))
+                                .unwrap_or(false)
+                        })
+                        .ok_or_else(|| AudioError::DeviceNotFound(filter.to_string()))?
+                } else {
+                    // When auto-selecting a physical microphone, avoid virtual microphone loopback
+                    // endpoints (`Virtual Mic`, `CABLE Output`, `rsrelay Virtual Mic`, `BlackHole`)
+                    // if the user previously set a virtual mic as OS Default Input, preventing loops.
+                    let default_dev = host.default_input_device();
+                    let default_is_virtual = default_dev
+                        .as_ref()
+                        .and_then(|d| d.name().ok())
+                        .map(|n| crate::device::is_virtual_mic_input_device_name(&n))
+                        .unwrap_or(false);
+
+                    if !default_is_virtual {
+                        if let Some(d) = default_dev {
+                            d
+                        } else {
+                            return Err(AudioError::DeviceNotFound(
+                                "default microphone input".to_string(),
+                            ));
+                        }
+                    } else if let Some(phys) = host.input_devices()?.find(|d| {
+                        d.name()
+                            .map(|n| !crate::device::is_virtual_mic_input_device_name(&n))
+                            .unwrap_or(false)
+                    }) {
+                        phys
+                    } else {
+                        default_dev.ok_or_else(|| {
+                            AudioError::DeviceNotFound("default microphone input".to_string())
+                        })?
+                    }
+                };
+                let dev_name = dev.name().unwrap_or_else(|_| "Default Device".to_string());
+                let cfg = dev.default_input_config()?;
+                Ok((dev, dev_name, cfg, false))
+            }
         }
         CaptureSource::SyntheticTone => unreachable!("handled above"),
     }
