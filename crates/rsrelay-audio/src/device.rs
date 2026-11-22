@@ -21,6 +21,8 @@ pub enum AudioError {
     PlayStream(#[from] cpal::PlayStreamError),
     #[error("unsupported sample format: {0:?}")]
     UnsupportedSampleFormat(cpal::SampleFormat),
+    #[error("WASAPI audio error ({device}): {detail}")]
+    Wasapi { device: String, detail: String },
 }
 
 /// Audio capture source mode.

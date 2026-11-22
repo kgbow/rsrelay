@@ -2244,15 +2244,22 @@ impl RsRelayGuiApp {
                             FontId::new(11.5, FontFamily::Proportional),
                             palette::STATUS_DANGER(),
                         );
-                        let (err_rect, _) = right_ui
-                            .allocate_exact_size(Vec2::new(err_g.size().x, 30.0), Sense::hover());
+                        let max_err_w = (right_ui.available_width() - 16.0).clamp(80.0, 340.0);
+                        let (err_rect, err_resp) = right_ui.allocate_exact_size(
+                            Vec2::new(err_g.size().x.min(max_err_w), 30.0),
+                            Sense::click(),
+                        );
+                        let cp = right_ui.painter().with_clip_rect(err_rect);
                         crate::widgets::paint_galley_vcenter(
-                            right_ui.painter(),
+                            &cp,
                             err_rect.min.x,
                             bar_cy,
                             err_g,
                             palette::STATUS_DANGER(),
                         );
+                        if err_resp.on_hover_text(&self.last_status_msg).clicked() {
+                            right_ui.ctx().copy_text(self.last_status_msg.clone());
+                        }
                     }
                 }
             });
@@ -3568,9 +3575,9 @@ impl RsRelayGuiApp {
                         palette::TEXT_SECONDARY(),
                     );
                     let max_w = ui.available_width().max(60.0);
-                    let (lbl_r, _) = ui.allocate_exact_size(
+                    let (lbl_r, lbl_resp) = ui.allocate_exact_size(
                         Vec2::new(g.size().x.min(max_w), 22.0),
-                        Sense::hover(),
+                        Sense::click(),
                     );
                     let cp = ui.painter().with_clip_rect(lbl_r);
                     crate::widgets::paint_galley_vcenter(
@@ -3580,6 +3587,9 @@ impl RsRelayGuiApp {
                         g,
                         palette::TEXT_SECONDARY(),
                     );
+                    if lbl_resp.on_hover_text(&self.last_status_msg).clicked() {
+                        ui.ctx().copy_text(self.last_status_msg.clone());
+                    }
                 });
             });
         });

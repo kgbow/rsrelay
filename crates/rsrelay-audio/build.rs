@@ -1,8 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/sck_bridge.m");
 
-    #[cfg(target_os = "macos")]
-    {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
             .file("src/sck_bridge.m")
             .flag("-fobjc-arc")

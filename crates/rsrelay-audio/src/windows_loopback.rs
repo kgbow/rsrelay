@@ -39,6 +39,14 @@ impl SilentKeepaliveStream {
                 err_fn,
                 None,
             )?,
+            SampleFormat::I32 => output_device.build_output_stream(
+                &config,
+                move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
+                    data.fill(0);
+                },
+                err_fn,
+                None,
+            )?,
             SampleFormat::U16 => output_device.build_output_stream(
                 &config,
                 move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {

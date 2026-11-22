@@ -1,6 +1,6 @@
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -21,6 +21,8 @@ pub struct CaptureStreamHandle {
     _cpal_stream: Option<cpal::Stream>,
     #[cfg(target_os = "macos")]
     _sck_stream: Option<crate::macos_sck::MacosSckStream>,
+    #[cfg(target_os = "windows")]
+    _wasapi_stream: Option<crate::windows_wasapi::WasapiCaptureStream>,
     _keepalive: Option<SilentKeepaliveStream>,
     stop_flag: Arc<AtomicBool>,
     tone_thread: Option<JoinHandle<()>>,
@@ -53,7 +55,7 @@ pub fn start_capture_stream(
     source: CaptureSource,
     device_name_filter: Option<&str>,
     target_channels: u16,
-    mut producer: Producer<f32>,
+    #[allow(unused_mut)] mut producer: Producer<f32>,
 ) -> Result<CaptureStreamHandle, AudioError> {
     let peak_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -113,6 +115,8 @@ pub fn start_capture_stream(
             _cpal_stream: None,
             #[cfg(target_os = "macos")]
             _sck_stream: None,
+            #[cfg(target_os = "windows")]
+            _wasapi_stream: None,
             _keepalive: None,
             stop_flag,
             tone_thread: Some(handle),
@@ -165,9 +169,42 @@ pub fn start_capture_stream(
 
     let host = cpal::default_host();
 
-    // Select device based on source and platform
+    // Select device based on source and platform.
+    // On Windows, if `default_output_config` / `default_input_config` rejects an unusual native
+    // mix format (e.g. 24-bit packed PCM), fall back straight to native WASAPI `GetMixFormat()`.
     let (device, device_name, supported_cfg, is_windows_loopback) =
-        select_capture_device(&host, source, device_name_filter)?;
+        match select_capture_device(&host, source, device_name_filter) {
+            Ok(v) => v,
+            Err(err) => {
+                #[cfg(target_os = "windows")]
+                if matches!(err, AudioError::DefaultConfig(_)) {
+                    tracing::warn!(
+                        "cpal default capture config failed ({err}); falling back to native WASAPI GetMixFormat()"
+                    );
+                    let wasapi = crate::windows_wasapi::WasapiCaptureStream::start(
+                        source,
+                        device_name_filter,
+                        target_channels,
+                        producer,
+                        Arc::clone(&peak_bits),
+                    )?;
+                    let dev_name = wasapi.device_name.clone();
+                    let rate = wasapi.sample_rate;
+                    return Ok(CaptureStreamHandle {
+                        _cpal_stream: None,
+                        _wasapi_stream: Some(wasapi),
+                        _keepalive: None,
+                        stop_flag,
+                        tone_thread: None,
+                        device_name: dev_name,
+                        sample_rate: rate,
+                        channels: target_channels,
+                        peak_bits,
+                    });
+                }
+                return Err(err);
+            }
+        };
 
     let sample_format = supported_cfg.sample_format();
     let config: cpal::StreamConfig = supported_cfg.into();
@@ -181,37 +218,87 @@ pub fn start_capture_stream(
         None
     };
 
-    let peak_clone = Arc::clone(&peak_bits);
-    let err_fn = |err| {
-        tracing::error!("Audio capture stream callback error: {err}");
-    };
+    // Keep `producer` recoverable across format fallbacks; once a stream succeeds, the audio
+    // callback takes ownership on its first invocation and never touches the mutex again.
+    let producer_slot = Arc::new(Mutex::new(Some(producer)));
 
-    let stream = match sample_format {
-        SampleFormat::F32 => device.build_input_stream(
+    #[allow(unused_mut)]
+    let mut build_res = try_build_cpal_input_stream(
+        &device,
+        &config,
+        sample_format,
+        hw_channels,
+        target_channels,
+        &producer_slot,
+        &peak_bits,
+    );
+
+    // On non-Windows hosts, retry with `I16` if the default sample format is rejected.
+    // On Windows we prefer falling straight back to native WASAPI `GetMixFormat()` below so we
+    // keep the endpoint's exact native float/PCM format, channel mask, and silent keepalive.
+    #[cfg(not(target_os = "windows"))]
+    if matches!(
+        build_res,
+        Err(AudioError::BuildStream(
+            cpal::BuildStreamError::StreamConfigNotSupported
+        )) | Err(AudioError::UnsupportedSampleFormat(_))
+    ) && sample_format != SampleFormat::I16
+    {
+        if let Ok(fallback_stream) = try_build_cpal_input_stream(
+            &device,
             &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                push_converted_samples(data, hw_channels, target_channels, &mut producer, &peak_clone);
-            },
-            err_fn,
-            None,
-        )?,
-        SampleFormat::I16 => device.build_input_stream(
-            &config,
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                push_converted_i16(data, hw_channels, target_channels, &mut producer, &peak_clone);
-            },
-            err_fn,
-            None,
-        )?,
-        SampleFormat::U16 => device.build_input_stream(
-            &config,
-            move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                push_converted_u16(data, hw_channels, target_channels, &mut producer, &peak_clone);
-            },
-            err_fn,
-            None,
-        )?,
-        other => return Err(AudioError::UnsupportedSampleFormat(other)),
+            SampleFormat::I16,
+            hw_channels,
+            target_channels,
+            &producer_slot,
+            &peak_bits,
+        ) {
+            tracing::info!(
+                "cpal capture on '{device_name}' succeeded using I16 fallback (default was {sample_format:?})"
+            );
+            build_res = Ok(fallback_stream);
+        }
+    }
+
+    let stream = match build_res {
+        Ok(s) => s,
+        Err(err) => {
+            #[cfg(target_os = "windows")]
+            if matches!(
+                err,
+                AudioError::BuildStream(_) | AudioError::UnsupportedSampleFormat(_)
+            ) {
+                drop(keepalive);
+                if let Some(recovered_producer) =
+                    producer_slot.lock().ok().and_then(|mut g| g.take())
+                {
+                    tracing::warn!(
+                        "cpal capture rejected '{device_name}' ({hw_sample_rate}Hz, {hw_channels}ch, {sample_format:?}: {err}); falling back to native WASAPI GetMixFormat()"
+                    );
+                    let wasapi = crate::windows_wasapi::WasapiCaptureStream::start(
+                        source,
+                        device_name_filter,
+                        target_channels,
+                        recovered_producer,
+                        Arc::clone(&peak_bits),
+                    )?;
+                    let dev_name = wasapi.device_name.clone();
+                    let rate = wasapi.sample_rate;
+                    return Ok(CaptureStreamHandle {
+                        _cpal_stream: None,
+                        _wasapi_stream: Some(wasapi),
+                        _keepalive: None,
+                        stop_flag,
+                        tone_thread: None,
+                        device_name: dev_name,
+                        sample_rate: rate,
+                        channels: target_channels,
+                        peak_bits,
+                    });
+                }
+            }
+            return Err(err);
+        }
     };
 
     stream.play()?;
@@ -220,6 +307,8 @@ pub fn start_capture_stream(
         _cpal_stream: Some(stream),
         #[cfg(target_os = "macos")]
         _sck_stream: None,
+        #[cfg(target_os = "windows")]
+        _wasapi_stream: None,
         _keepalive: keepalive,
         stop_flag,
         tone_thread: None,
@@ -228,6 +317,91 @@ pub fn start_capture_stream(
         channels: target_channels,
         peak_bits,
     })
+}
+
+fn try_build_cpal_input_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    sample_format: SampleFormat,
+    hw_channels: u16,
+    target_channels: u16,
+    producer_slot: &Arc<Mutex<Option<Producer<f32>>>>,
+    peak_bits: &Arc<AtomicU32>,
+) -> Result<cpal::Stream, AudioError> {
+    let slot = Arc::clone(producer_slot);
+    let peak_clone = Arc::clone(peak_bits);
+    let err_fn = |err| {
+        tracing::error!("Audio capture stream callback error: {err}");
+    };
+
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            let mut local_prod: Option<Producer<f32>> = None;
+            device.build_input_stream(
+                config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    if local_prod.is_none() {
+                        local_prod = slot.lock().ok().and_then(|mut g| g.take());
+                    }
+                    if let Some(ref mut prod) = local_prod {
+                        push_converted_samples(data, hw_channels, target_channels, prod, &peak_clone);
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::I16 => {
+            let mut local_prod: Option<Producer<f32>> = None;
+            device.build_input_stream(
+                config,
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    if local_prod.is_none() {
+                        local_prod = slot.lock().ok().and_then(|mut g| g.take());
+                    }
+                    if let Some(ref mut prod) = local_prod {
+                        push_converted_i16(data, hw_channels, target_channels, prod, &peak_clone);
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::I32 => {
+            let mut local_prod: Option<Producer<f32>> = None;
+            device.build_input_stream(
+                config,
+                move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                    if local_prod.is_none() {
+                        local_prod = slot.lock().ok().and_then(|mut g| g.take());
+                    }
+                    if let Some(ref mut prod) = local_prod {
+                        push_converted_i32(data, hw_channels, target_channels, prod, &peak_clone);
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::U16 => {
+            let mut local_prod: Option<Producer<f32>> = None;
+            device.build_input_stream(
+                config,
+                move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                    if local_prod.is_none() {
+                        local_prod = slot.lock().ok().and_then(|mut g| g.take());
+                    }
+                    if let Some(ref mut prod) = local_prod {
+                        push_converted_u16(data, hw_channels, target_channels, prod, &peak_clone);
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        other => return Err(AudioError::UnsupportedSampleFormat(other)),
+    };
+    Ok(stream)
 }
 
 fn select_capture_device(
@@ -502,6 +676,53 @@ fn push_converted_i16(
                     ((data[base] as f32) + (data[base + 1] as f32)) / 65536.0
                 } else {
                     (data[base + c.min(hw_ch - 1)] as f32) / 32768.0
+                };
+                let abs = sample.abs();
+                if abs > max_abs {
+                    max_abs = abs;
+                }
+                if out_idx < first.len() {
+                    first[out_idx] = sample;
+                } else {
+                    second[out_idx - first.len()] = sample;
+                }
+                out_idx += 1;
+            }
+        }
+        chunk.commit_all();
+        peak_bits.store(max_abs.to_bits(), Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn push_converted_i32(
+    data: &[i32],
+    hw_channels: u16,
+    target_channels: u16,
+    producer: &mut Producer<f32>,
+    peak_bits: &AtomicU32,
+) {
+    let hw_ch = (hw_channels as usize).max(1);
+    let tgt_ch = (target_channels as usize).max(1);
+    let frames = data.len() / hw_ch;
+    let frames_to_write = frames.min(producer.slots() / tgt_ch);
+    let samples_to_write = frames_to_write * tgt_ch;
+
+    if samples_to_write == 0 {
+        return;
+    }
+
+    let mut max_abs = 0.0f32;
+    if let Ok(mut chunk) = producer.write_chunk(samples_to_write) {
+        let (first, second) = chunk.as_mut_slices();
+        let mut out_idx = 0;
+        for f in 0..frames_to_write {
+            let base = f * hw_ch;
+            for c in 0..tgt_ch {
+                let sample = if tgt_ch == 1 && hw_ch >= 2 {
+                    ((data[base] as f64) + (data[base + 1] as f64)) as f32 / 4_294_967_296.0
+                } else {
+                    (data[base + c.min(hw_ch - 1)] as f32) / 2_147_483_648.0
                 };
                 let abs = sample.abs();
                 if abs > max_abs {

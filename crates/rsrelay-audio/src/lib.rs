@@ -7,6 +7,8 @@ pub mod macos_virtual_mic;
 pub mod playback;
 pub mod windows_loopback;
 pub mod windows_virtual_mic;
+#[cfg(target_os = "windows")]
+pub mod windows_wasapi;
 
 pub use capture::{start_capture_stream, CaptureStreamHandle};
 pub use device::{
