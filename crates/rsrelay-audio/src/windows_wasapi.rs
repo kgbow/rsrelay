@@ -1,15 +1,24 @@
-//! Native Windows WASAPI `GetMixFormat()` capture (Loopback & Microphone) and playback streams.
+//! Native Windows WASAPI device enumeration, `GetMixFormat()` capture (Loopback & Microphone),
+//! and shared-mode playback streams.
 //!
-//! Why this exists alongside `cpal 0.15`:
-//! In `cpal 0.15`, `wasapi::device::config_to_waveformatextensible` discards the endpoint's real
-//! `dwChannelMask` from `IAudioClient::GetMixFormat()` and substitutes `KSAUDIO_SPEAKER_DIRECTOUT (0)`.
-//! On Windows 10/11 endpoints with Spatial Sound (Windows Sonic / Dolby Atmos / DTS:X), 5.1/7.1
-//! virtual surround headsets, APO enhancers, Bluetooth profiles, or Loopback capture, WASAPI's
-//! `IAudioClient::IsFormatSupported` rejects `dwChannelMask = 0` with `S_FALSE`, causing `cpal` to
-//! fail with `BuildStreamError::StreamConfigNotSupported`.
-//!
-//! This module initializes `IAudioClient` in shared mode with the **exact, unmodified `WAVEFORMATEX`**
-//! returned by `GetMixFormat()`, which Windows WASAPI guarantees to accept on every active endpoint.
+//! ### Why native WASAPI is used directly on Windows instead of `cpal 0.15`:
+//! 1. **Zero `audiodg.exe` RPC/Handle Churn during Device Enumeration**:
+//!    `cpal 0.15`'s `Host::input_devices()` / `output_devices()` activates `IAudioClient` and invokes
+//!    ~60 `IsFormatSupported()` RPCs per endpoint on every refresh, triggering handle leaks inside
+//!    `audiodg.exe` with certain vendor APOs (e.g. AMD HD Audio) and filtering out Spatial Sound /
+//!    24-bit endpoints when `dwChannelMask = 0` returns `S_FALSE`.
+//!    [`list_audio_devices_native`] reads `DEVPKEY_Device_FriendlyName` and `PKEY_AudioEngine_DeviceFormat`
+//!    straight from the MMDevice Property Store in-process with **zero `audiodg.exe` RPCs**.
+//! 2. **Exact `GetMixFormat()` Stream Initialization**:
+//!    `cpal 0.15` discards `dwChannelMask` from `GetMixFormat()` and substitutes `KSAUDIO_SPEAKER_DIRECTOUT (0)`,
+//!    which fails on Spatial Sound (Windows Sonic / Dolby Atmos), 5.1/7.1 virtual surround, and 24-bit
+//!    packed PCM endpoints, and masks `HRESULT` errors (such as `0x800705AA` `ERROR_NO_SYSTEM_RESOURCES`)
+//!    as `StreamConfigNotSupported`. This module initializes `IAudioClient` directly with the unmodified
+//!    `WAVEFORMATEX*` from `GetMixFormat()`.
+//! 3. **Continuous Zero-Copy Loopback Silent Keepalive**:
+//!    Maintains a 100ms silent shared-mode render buffer topped up via `AUDCLNT_BUFFERFLAGS_SILENT`
+//!    whenever padding drops below 50%, preventing WASAPI from pausing the Loopback capture clock
+//!    during desktop silence without spawning an extra thread.
 
 #![cfg(target_os = "windows")]
 
@@ -24,34 +33,70 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 
 use rtrb::{Consumer, Producer};
-use windows::core::GUID;
+use windows::core::{GUID, HRESULT, PWSTR};
 use windows::Win32::Devices::Properties;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, RPC_E_CHANGED_MODE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, RPC_E_CHANGED_MODE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::Media::{
     Audio::{
         self, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
-        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
-        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-        AUDCLNT_S_BUFFER_EMPTY, DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
-        WAVE_FORMAT_PCM,
+        IMMDeviceEnumerator, MMDeviceEnumerator, PKEY_AudioEngine_DeviceFormat,
+        PKEY_AudioEngine_OEMFormat, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_S_BUFFER_EMPTY,
+        DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVE_FORMAT_PCM,
     },
-    KernelStreaming::{
-        KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE,
-    },
+    KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE},
     Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, StructuredStorage,
-    CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+    COINIT_MULTITHREADED, STGM_READ,
 };
 use windows::Win32::System::Threading::{
     CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
 };
-use windows::Win32::System::Variant::VT_LPWSTR;
+use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
+use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, PROPERTYKEY};
 
-use crate::device::{is_virtual_mic_input_device_name, AudioError, CaptureSource};
+use crate::device::{is_virtual_mic_input_device_name, AudioDeviceInfo, AudioError, CaptureSource};
+use crate::windows_virtual_mic::{is_virtual_mic_driver_available, VIRTUAL_MIC_OUTPUT_DEVICE_NAME};
 
-/// RAII guard for COM initialization on a dedicated worker thread.
+const HRESULT_ELEMENT_NOT_FOUND: HRESULT = HRESULT(0x80070490u32 as i32);
+const HRESULT_NO_SYSTEM_RESOURCES: HRESULT = HRESULT(0x800705AAu32 as i32);
+const HRESULT_RPC_SERVER_UNAVAILABLE: HRESULT = HRESULT(0x800706BAu32 as i32);
+const AUDCLNT_E_SERVICE_NOT_RUNNING: HRESULT = HRESULT(0x8889000Fu32 as i32);
+
+enum WasapiInitError {
+    DeviceNotFound(String),
+    Wasapi { device: String, detail: String },
+}
+
+impl From<WasapiInitError> for AudioError {
+    fn from(err: WasapiInitError) -> Self {
+        match err {
+            WasapiInitError::DeviceNotFound(d) => AudioError::DeviceNotFound(d),
+            WasapiInitError::Wasapi { device, detail } => AudioError::Wasapi { device, detail },
+        }
+    }
+}
+
+fn format_wasapi_err(context: &str, err: &windows::core::Error) -> String {
+    let code = err.code();
+    if code == HRESULT_NO_SYSTEM_RESOURCES {
+        format!(
+            "{context}: {err} (audiodg.exe handle limit reached — run `Restart-Service Audiosrv -Force` then `Start-Service Audiosrv` as Administrator)"
+        )
+    } else if code == AUDCLNT_E_SERVICE_NOT_RUNNING || code == HRESULT_RPC_SERVER_UNAVAILABLE {
+        format!(
+            "{context}: {err} (Windows Audio service `Audiosrv` is not running — run `Start-Service Audiosrv` as Administrator)"
+        )
+    } else {
+        format!("{context}: {err}")
+    }
+}
+
+/// RAII guard for COM initialization on the calling thread.
 struct ComGuard {
     should_uninit: bool,
 }
@@ -78,6 +123,19 @@ impl Drop for ComGuard {
         if self.should_uninit {
             unsafe {
                 CoUninitialize();
+            }
+        }
+    }
+}
+
+/// RAII guard for a `CoTaskMemAlloc`-allocated `PWSTR` (e.g. `IMMDevice::GetId`).
+struct CoTaskPwstr(PWSTR);
+
+impl Drop for CoTaskPwstr {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CoTaskMemFree(Some(self.0 .0.cast()));
             }
         }
     }
@@ -214,56 +272,219 @@ unsafe fn parse_mix_format(ptr: *const WAVEFORMATEX) -> Result<ParsedMixFormat, 
     })
 }
 
-unsafe fn read_device_friendly_name(device: &IMMDevice) -> String {
-    let Ok(store) = device.OpenPropertyStore(STGM_READ) else {
-        return "Windows Audio Device".to_string();
-    };
-    let Ok(mut prop) =
-        store.GetValue(&Properties::DEVPKEY_Device_FriendlyName as *const _ as *const _)
-    else {
-        return "Windows Audio Device".to_string();
-    };
+unsafe fn read_device_id(device: &IMMDevice) -> Option<String> {
+    let raw = device.GetId().ok()?;
+    if raw.is_null() {
+        return None;
+    }
+    let guard = CoTaskPwstr(raw);
+    let mut len = 0usize;
+    while *guard.0 .0.add(len) != 0 {
+        len += 1;
+    }
+    let slice_u16 = slice::from_raw_parts(guard.0 .0, len);
+    Some(OsString::from_wide(slice_u16).to_string_lossy().into_owned())
+}
 
+unsafe fn read_friendly_name_from_store(store: &IPropertyStore, fallback: &str) -> String {
+    let Ok(prop) = store.GetValue(&Properties::DEVPKEY_Device_FriendlyName as *const _ as *const _)
+    else {
+        return fallback.to_string();
+    };
     let raw = &prop.as_raw().Anonymous.Anonymous;
-    let name = if raw.vt == VT_LPWSTR.0 {
-        let ptr_u16 = *(&raw.Anonymous as *const _ as *const *const u16);
-        if ptr_u16.is_null() {
-            "Windows Audio Device".to_string()
-        } else {
+    if raw.vt == VT_LPWSTR.0 {
+        let ptr_u16 = raw.Anonymous.pwszVal;
+        if !ptr_u16.is_null() {
             let mut len = 0usize;
             while *ptr_u16.add(len) != 0 {
                 len += 1;
             }
             let slice_u16 = slice::from_raw_parts(ptr_u16, len);
-            OsString::from_wide(slice_u16)
+            return OsString::from_wide(slice_u16)
                 .to_string_lossy()
-                .into_owned()
+                .into_owned();
         }
-    } else {
-        "Windows Audio Device".to_string()
-    };
+    }
+    fallback.to_string()
+}
 
-    let _ = StructuredStorage::PropVariantClear(&mut prop);
-    name
+unsafe fn read_device_friendly_name(device: &IMMDevice) -> String {
+    let Ok(store) = device.OpenPropertyStore(STGM_READ) else {
+        return "Windows Audio Device".to_string();
+    };
+    read_friendly_name_from_store(&store, "Windows Audio Device")
+}
+
+unsafe fn extract_rate_channels_from_prop(
+    store: &IPropertyStore,
+    key: &PROPERTYKEY,
+) -> Option<(u32, u16)> {
+    let prop = store.GetValue(key).ok()?;
+    let raw = &prop.as_raw().Anonymous.Anonymous;
+    if raw.vt != VT_BLOB.0 {
+        return None;
+    }
+    let blob = raw.Anonymous.blob;
+    if blob.pBlobData.is_null() || (blob.cbSize as usize) < std::mem::size_of::<WAVEFORMATEX>() {
+        return None;
+    }
+    let wf = ptr::read_unaligned(blob.pBlobData as *const WAVEFORMATEX);
+    if wf.nSamplesPerSec > 0 && wf.nChannels > 0 {
+        Some((wf.nSamplesPerSec, wf.nChannels))
+    } else {
+        None
+    }
+}
+
+/// Read friendly name, nominal sample rate, and channel count purely from the MMDevice Property Store
+/// (`PKEY_AudioEngine_DeviceFormat` / `PKEY_AudioEngine_OEMFormat`) without activating `IAudioClient`
+/// or making RPC calls to `audiodg.exe`. Only falls back to `GetMixFormat()` if both property keys
+/// are absent on a custom kernel-streaming filter.
+unsafe fn read_device_info_zero_churn(
+    device: &IMMDevice,
+    fallback_name: &str,
+) -> (String, Option<u32>, Option<u16>) {
+    if let Ok(store) = device.OpenPropertyStore(STGM_READ) {
+        let name = read_friendly_name_from_store(&store, fallback_name);
+        if let Some((rate, ch)) =
+            extract_rate_channels_from_prop(&store, &PKEY_AudioEngine_DeviceFormat)
+                .or_else(|| extract_rate_channels_from_prop(&store, &PKEY_AudioEngine_OEMFormat))
+        {
+            return (name, Some(rate), Some(ch));
+        }
+
+        // Rare fallback for bare KS virtual endpoints without PropertyStore format blobs
+        if let Ok(client) = device.Activate::<IAudioClient>(CLSCTX_ALL, None) {
+            if let Ok(mix_ptr) = client.GetMixFormat() {
+                let mix = MixFormatPtr(mix_ptr);
+                let wf = &*mix.0;
+                if wf.nSamplesPerSec > 0 && wf.nChannels > 0 {
+                    return (name, Some(wf.nSamplesPerSec), Some(wf.nChannels));
+                }
+            }
+        }
+        return (name, None, None);
+    }
+
+    (fallback_name.to_string(), None, None)
+}
+
+/// Enumerate all active Windows input and output audio endpoints with zero `IsFormatSupported`
+/// probing and zero `audiodg.exe` handle churn.
+pub fn list_audio_devices_native() -> Result<Vec<AudioDeviceInfo>, AudioError> {
+    let _com = ComGuard::init_mta().map_err(|detail| AudioError::Wasapi {
+        device: "MMDeviceEnumerator".to_string(),
+        detail,
+    })?;
+
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| {
+                AudioError::Wasapi {
+                    device: "MMDeviceEnumerator".to_string(),
+                    detail: format!("CoCreateInstance failed: {e}"),
+                }
+            })?;
+
+        let default_in_id = enumerator
+            .GetDefaultAudioEndpoint(Audio::eCapture, Audio::eConsole)
+            .ok()
+            .and_then(|d| read_device_id(&d));
+        let default_out_id = enumerator
+            .GetDefaultAudioEndpoint(Audio::eRender, Audio::eConsole)
+            .ok()
+            .and_then(|d| read_device_id(&d));
+
+        let mut infos = Vec::new();
+
+        if let Ok(col_in) = enumerator.EnumAudioEndpoints(Audio::eCapture, DEVICE_STATE_ACTIVE) {
+            let count = col_in.GetCount().unwrap_or(0);
+            for idx in 0..count {
+                if let Ok(dev) = col_in.Item(idx) {
+                    let dev_id = read_device_id(&dev);
+                    let (name, rate, ch) = read_device_info_zero_churn(&dev, "Unknown Input");
+                    infos.push(AudioDeviceInfo {
+                        is_default_input: dev_id.is_some() && dev_id == default_in_id,
+                        is_default_output: false,
+                        name,
+                        is_input: true,
+                        is_output: false,
+                        default_sample_rate: rate,
+                        default_channels: ch,
+                    });
+                }
+            }
+        }
+
+        if let Ok(col_out) = enumerator.EnumAudioEndpoints(Audio::eRender, DEVICE_STATE_ACTIVE) {
+            let count = col_out.GetCount().unwrap_or(0);
+            for idx in 0..count {
+                if let Ok(dev) = col_out.Item(idx) {
+                    let dev_id = read_device_id(&dev);
+                    let (name, rate, ch) = read_device_info_zero_churn(&dev, "Unknown Output");
+                    infos.push(AudioDeviceInfo {
+                        is_default_input: false,
+                        is_default_output: dev_id.is_some() && dev_id == default_out_id,
+                        name,
+                        is_input: false,
+                        is_output: true,
+                        default_sample_rate: rate,
+                        default_channels: ch,
+                    });
+                }
+            }
+        }
+
+        // When the Windows Virtual Mic kernel driver (`\\.\AudioRelayVirtualMicDeviceLink`) is active,
+        // expose it as an output destination so RX streams and Duplex Mic RX can write directly
+        // into the virtual microphone capture endpoint without playing out to speakers.
+        if is_virtual_mic_driver_available()
+            && !infos.iter().any(|d| {
+                d.is_output
+                    && d.name.to_ascii_lowercase().contains("virtual mic")
+                    && !d.name.to_ascii_lowercase().contains("rsrelay virtual mic")
+            })
+        {
+            infos.push(AudioDeviceInfo {
+                name: VIRTUAL_MIC_OUTPUT_DEVICE_NAME.to_string(),
+                is_input: false,
+                is_output: true,
+                is_default_input: false,
+                is_default_output: false,
+                default_sample_rate: Some(48_000),
+                default_channels: Some(2),
+            });
+        }
+
+        Ok(infos)
+    }
 }
 
 unsafe fn select_imm_device(
     data_flow: Audio::EDataFlow,
     name_filter: Option<&str>,
     avoid_virtual_mic_inputs: bool,
-) -> Result<(IMMDevice, String), String> {
-    let enumerator: IMMDeviceEnumerator =
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .map_err(|e| format!("CoCreateInstance(MMDeviceEnumerator) failed: {e}"))?;
+) -> Result<(IMMDevice, String), WasapiInitError> {
+    let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        .map_err(|e| WasapiInitError::Wasapi {
+        device: "MMDeviceEnumerator".to_string(),
+        detail: format!("CoCreateInstance(MMDeviceEnumerator) failed: {e}"),
+    })?;
 
     if let Some(filter) = name_filter {
         let filter_lower = filter.to_lowercase();
         let collection = enumerator
             .EnumAudioEndpoints(data_flow, DEVICE_STATE_ACTIVE)
-            .map_err(|e| format!("EnumAudioEndpoints failed: {e}"))?;
+            .map_err(|e| WasapiInitError::Wasapi {
+                device: filter.to_string(),
+                detail: format!("EnumAudioEndpoints failed: {e}"),
+            })?;
         let count = collection
             .GetCount()
-            .map_err(|e| format!("IMMDeviceCollection::GetCount failed: {e}"))?;
+            .map_err(|e| WasapiInitError::Wasapi {
+                device: filter.to_string(),
+                detail: format!("IMMDeviceCollection::GetCount failed: {e}"),
+            })?;
         for idx in 0..count {
             if let Ok(dev) = collection.Item(idx) {
                 let name = read_device_friendly_name(&dev);
@@ -272,12 +493,27 @@ unsafe fn select_imm_device(
                 }
             }
         }
-        return Err(format!("no active Windows endpoint matching '{filter}'"));
+        return Err(WasapiInitError::DeviceNotFound(filter.to_string()));
     }
+
+    let fallback_label = if data_flow == Audio::eRender {
+        "default Windows output device"
+    } else {
+        "default microphone input"
+    };
 
     let default_dev = enumerator
         .GetDefaultAudioEndpoint(data_flow, Audio::eConsole)
-        .map_err(|e| format!("GetDefaultAudioEndpoint failed: {e}"))?;
+        .map_err(|e| {
+            if e.code() == HRESULT_ELEMENT_NOT_FOUND {
+                WasapiInitError::DeviceNotFound(fallback_label.to_string())
+            } else {
+                WasapiInitError::Wasapi {
+                    device: fallback_label.to_string(),
+                    detail: format_wasapi_err("GetDefaultAudioEndpoint failed", &e),
+                }
+            }
+        })?;
     let default_name = read_device_friendly_name(&default_dev);
 
     if avoid_virtual_mic_inputs && is_virtual_mic_input_device_name(&default_name) {
@@ -400,12 +636,32 @@ fn bytes_per_sample(fmt: NativeSampleFormat) -> usize {
     }
 }
 
-struct NativeKeepaliveGuard {
+struct NativeKeepaliveStream {
     client: IAudioClient,
-    _render: IAudioRenderClient,
+    render: IAudioRenderClient,
+    buffer_frames: u32,
 }
 
-impl Drop for NativeKeepaliveGuard {
+impl NativeKeepaliveStream {
+    /// Top up the 100ms shared-mode render FIFO with `AUDCLNT_BUFFERFLAGS_SILENT` whenever
+    /// less than half of the buffer remains queued, keeping the WASAPI render clock continuously
+    /// running during desktop silence with zero memory writes and zero extra threads.
+    #[inline]
+    unsafe fn top_up_silence(&self) {
+        if let Ok(padding) = self.client.GetCurrentPadding() {
+            if padding < self.buffer_frames / 2 {
+                let avail = self.buffer_frames - padding;
+                if let Ok(_buf) = self.render.GetBuffer(avail) {
+                    let _ = self
+                        .render
+                        .ReleaseBuffer(avail, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for NativeKeepaliveStream {
     fn drop(&mut self) {
         unsafe {
             let _ = self.client.Stop();
@@ -418,21 +674,22 @@ impl Drop for NativeKeepaliveGuard {
 unsafe fn start_native_silent_keepalive(
     device: &IMMDevice,
     mix_fmt_ptr: *const WAVEFORMATEX,
-) -> Option<NativeKeepaliveGuard> {
+) -> Option<NativeKeepaliveStream> {
     let client: IAudioClient = device.Activate(CLSCTX_ALL, None).ok()?;
+    // 100 ms shared-mode buffer (1,000,000 * 100ns); topped up inline in `run_capture_loop`
     client
-        .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 200_000, 0, mix_fmt_ptr, None)
+        .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1_000_000, 0, mix_fmt_ptr, None)
         .ok()?;
-    let frames = client.GetBufferSize().ok()?;
+    let buffer_frames = client.GetBufferSize().ok()?.max(1);
     let render: IAudioRenderClient = client.GetService().ok()?;
-    if let Ok(buf) = render.GetBuffer(frames) {
-        let _ = render.ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
-        let _ = buf;
+    if let Ok(_buf) = render.GetBuffer(buffer_frames) {
+        let _ = render.ReleaseBuffer(buffer_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
     }
     client.Start().ok()?;
-    Some(NativeKeepaliveGuard {
+    Some(NativeKeepaliveStream {
         client,
-        _render: render,
+        render,
+        buffer_frames,
     })
 }
 
@@ -468,7 +725,7 @@ impl WasapiCaptureStream {
 
         let stop_flag_cl = Arc::clone(&stop_flag);
         let stop_event_cl = Arc::clone(&stop_event);
-        let (init_tx, init_rx) = mpsc::sync_channel::<Result<(String, u32), String>>(1);
+        let (init_tx, init_rx) = mpsc::sync_channel::<Result<(String, u32), WasapiInitError>>(1);
 
         let worker = thread::Builder::new()
             .name(if is_loopback {
@@ -479,27 +736,25 @@ impl WasapiCaptureStream {
             .spawn(move || {
                 let _com = match ComGuard::init_mta() {
                     Ok(g) => g,
-                    Err(e) => {
-                        let _ = init_tx.send(Err(e));
+                    Err(detail) => {
+                        let _ = init_tx.send(Err(WasapiInitError::Wasapi {
+                            device: "COM".to_string(),
+                            detail,
+                        }));
                         return;
                     }
                 };
 
-                let init_res = unsafe {
-                    init_capture_pipeline(
-                        is_loopback,
-                        filter_owned.as_deref(),
-                    )
-                };
+                let init_res = unsafe { init_capture_pipeline(is_loopback, filter_owned.as_deref()) };
 
-                let (
+                let CapturePipeline {
                     device_name,
                     parsed_fmt,
                     audio_client,
                     capture_client,
                     audio_event,
-                    _keepalive,
-                ) = match init_res {
+                    keepalive,
+                } = match init_res {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = init_tx.send(Err(e));
@@ -511,7 +766,10 @@ impl WasapiCaptureStream {
                     crate::promote_worker_thread_priority(parsed_fmt.sample_rate, 240);
 
                 if let Err(e) = unsafe { audio_client.Start() } {
-                    let _ = init_tx.send(Err(format!("IAudioClient::Start failed: {e}")));
+                    let _ = init_tx.send(Err(WasapiInitError::Wasapi {
+                        device: device_name,
+                        detail: format_wasapi_err("IAudioClient::Start failed", &e),
+                    }));
                     return;
                 }
 
@@ -522,6 +780,7 @@ impl WasapiCaptureStream {
                     &stop_flag_cl,
                     &stop_event_cl,
                     audio_event.as_ref(),
+                    keepalive.as_ref(),
                     &capture_client,
                     parsed_fmt,
                     target_channels,
@@ -546,14 +805,9 @@ impl WasapiCaptureStream {
                 device_name,
                 sample_rate,
             }),
-            Ok(Err(detail)) => {
+            Ok(Err(err)) => {
                 let _ = worker.join();
-                Err(AudioError::Wasapi {
-                    device: device_name_filter
-                        .unwrap_or("Default Windows Device")
-                        .to_string(),
-                    detail,
-                })
+                Err(err.into())
             }
             Err(_) => {
                 let _ = worker.join();
@@ -578,20 +832,19 @@ impl Drop for WasapiCaptureStream {
     }
 }
 
+struct CapturePipeline {
+    device_name: String,
+    parsed_fmt: ParsedMixFormat,
+    audio_client: IAudioClient,
+    capture_client: IAudioCaptureClient,
+    audio_event: Option<EventHandle>,
+    keepalive: Option<NativeKeepaliveStream>,
+}
+
 unsafe fn init_capture_pipeline(
     is_loopback: bool,
     filter: Option<&str>,
-) -> Result<
-    (
-        String,
-        ParsedMixFormat,
-        IAudioClient,
-        IAudioCaptureClient,
-        Option<EventHandle>,
-        Option<NativeKeepaliveGuard>,
-    ),
-    String,
-> {
+) -> Result<CapturePipeline, WasapiInitError> {
     let data_flow = if is_loopback {
         Audio::eRender
     } else {
@@ -599,29 +852,29 @@ unsafe fn init_capture_pipeline(
     };
     let (device, device_name) = select_imm_device(data_flow, filter, !is_loopback)?;
 
-    // Attempt 1: Event-driven shared mode with exact GetMixFormat()
     let base_flag = if is_loopback {
         AUDCLNT_STREAMFLAGS_LOOPBACK
     } else {
         0
     };
 
-    let client1: IAudioClient = device
-        .Activate(CLSCTX_ALL, None)
-        .map_err(|e| format!("IMMDevice::Activate(IAudioClient) failed on '{device_name}': {e}"))?;
-    let mix_fmt = MixFormatPtr(
-        client1
-            .GetMixFormat()
-            .map_err(|e| format!("IAudioClient::GetMixFormat failed on '{device_name}': {e}"))?,
-    );
-    let parsed_fmt = parse_mix_format(mix_fmt.0)?;
+    let client1: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| {
+        WasapiInitError::Wasapi {
+            device: device_name.clone(),
+            detail: format_wasapi_err("IMMDevice::Activate(IAudioClient) failed", &e),
+        }
+    })?;
+    let mix_fmt = MixFormatPtr(client1.GetMixFormat().map_err(|e| WasapiInitError::Wasapi {
+        device: device_name.clone(),
+        detail: format_wasapi_err("IAudioClient::GetMixFormat failed", &e),
+    })?);
+    let parsed_fmt = parse_mix_format(mix_fmt.0).map_err(|detail| WasapiInitError::Wasapi {
+        device: device_name.clone(),
+        detail,
+    })?;
 
-    let keepalive = if is_loopback {
-        start_native_silent_keepalive(&device, mix_fmt.0)
-    } else {
-        None
-    };
-
+    // Initialize the primary capture stream BEFORE opening the optional silent keepalive render
+    // stream so the primary stream always has first claim on audio engine resources.
     let init_event_res = client1.Initialize(
         AUDCLNT_SHAREMODE_SHARED,
         base_flag | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -632,20 +885,25 @@ unsafe fn init_capture_pipeline(
     );
 
     let (audio_client, audio_event) = if init_event_res.is_ok() {
-        let ev = EventHandle::new_auto_reset()?;
+        let ev = EventHandle::new_auto_reset().map_err(|detail| WasapiInitError::Wasapi {
+            device: device_name.clone(),
+            detail,
+        })?;
         if client1.SetEventHandle(ev.raw()).is_ok() {
             (client1, Some(ev))
         } else {
-            // Fall back to polling mode with a fresh IAudioClient
-            let client2: IAudioClient = device
-                .Activate(CLSCTX_ALL, None)
-                .map_err(|e| format!("Activate fallback failed: {e}"))?;
+            drop(client1);
+            let client2: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| {
+                WasapiInitError::Wasapi {
+                    device: device_name.clone(),
+                    detail: format_wasapi_err("Activate polling fallback failed", &e),
+                }
+            })?;
             client2
                 .Initialize(AUDCLNT_SHAREMODE_SHARED, base_flag, 200_000, 0, mix_fmt.0, None)
-                .map_err(|e| {
-                    format!(
-                        "IAudioClient::Initialize polling fallback failed on '{device_name}': {e}"
-                    )
+                .map_err(|e| WasapiInitError::Wasapi {
+                    device: device_name.clone(),
+                    detail: format_wasapi_err("IAudioClient::Initialize polling fallback failed", &e),
                 })?;
             (client2, None)
         }
@@ -653,32 +911,49 @@ unsafe fn init_capture_pipeline(
         // Older drivers or certain loopback endpoints reject EVENTCALLBACK + LOOPBACK;
         // retry cleanly in polling mode with a fresh IAudioClient and the exact GetMixFormat().
         drop(client1);
-        let client2: IAudioClient = device
-            .Activate(CLSCTX_ALL, None)
-            .map_err(|e| format!("Activate fallback failed on '{device_name}': {e}"))?;
+        let client2: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| {
+            WasapiInitError::Wasapi {
+                device: device_name.clone(),
+                detail: format_wasapi_err("Activate fallback failed", &e),
+            }
+        })?;
         client2
             .Initialize(AUDCLNT_SHAREMODE_SHARED, base_flag, 200_000, 0, mix_fmt.0, None)
             .map_err(|e| {
-                format!(
-                    "IAudioClient::Initialize failed on '{device_name}' ({}Hz, {}ch, {:?}): {e}",
+                let ctx = format!(
+                    "IAudioClient::Initialize failed ({}Hz, {}ch, {:?})",
                     parsed_fmt.sample_rate, parsed_fmt.channels, parsed_fmt.sample_format
-                )
+                );
+                WasapiInitError::Wasapi {
+                    device: device_name.clone(),
+                    detail: format_wasapi_err(&ctx, &e),
+                }
             })?;
         (client2, None)
     };
 
-    let capture_client: IAudioCaptureClient = audio_client
-        .GetService()
-        .map_err(|e| format!("GetService(IAudioCaptureClient) failed on '{device_name}': {e}"))?;
+    let capture_client: IAudioCaptureClient =
+        audio_client
+            .GetService()
+            .map_err(|e| WasapiInitError::Wasapi {
+                device: device_name.clone(),
+                detail: format_wasapi_err("GetService(IAudioCaptureClient) failed", &e),
+            })?;
 
-    Ok((
+    let keepalive = if is_loopback {
+        start_native_silent_keepalive(&device, mix_fmt.0)
+    } else {
+        None
+    };
+
+    Ok(CapturePipeline {
         device_name,
         parsed_fmt,
         audio_client,
         capture_client,
         audio_event,
         keepalive,
-    ))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -687,6 +962,7 @@ fn run_capture_loop(
     stop_flag: &AtomicBool,
     stop_event: &EventHandle,
     audio_event: Option<&EventHandle>,
+    keepalive: Option<&NativeKeepaliveStream>,
     capture_client: &IAudioCaptureClient,
     fmt: ParsedMixFormat,
     target_channels: u16,
@@ -699,19 +975,28 @@ fn run_capture_loop(
     let event_wait_ms = if is_loopback { 5 } else { 50 };
 
     while !stop_flag.load(Ordering::Relaxed) {
-        if let Some(ev) = audio_event {
+        let timed_out = if let Some(ev) = audio_event {
             let handles = [stop_event.raw(), ev.raw()];
             let wait = unsafe { WaitForMultipleObjects(&handles, false, event_wait_ms) };
             if wait == WAIT_OBJECT_0 {
                 break;
             }
+            wait == WAIT_TIMEOUT
         } else {
             let wait = unsafe { WaitForSingleObject(stop_event.raw(), 3) };
             if wait == WAIT_OBJECT_0 {
                 break;
             }
+            true
+        };
+
+        if let Some(ka) = keepalive {
+            unsafe {
+                ka.top_up_silence();
+            }
         }
 
+        let mut read_any_packet = false;
         loop {
             let packet_frames = match unsafe { capture_client.GetNextPacketSize() } {
                 Ok(0) => break,
@@ -739,7 +1024,9 @@ fn run_capture_loop(
                 Err(_) => return,
             }
 
-            let is_silent = (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 || data_ptr.is_null();
+            read_any_packet = true;
+            let is_silent =
+                (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 || data_ptr.is_null();
             let frames = frames_available as usize;
             let available_frames = producer.slots() / tgt_ch;
             let frames_to_write = frames.min(available_frames);
@@ -760,7 +1047,8 @@ fn run_capture_loop(
                             let frame_off = f * fmt.block_align;
                             for c in 0..tgt_ch {
                                 let sample = if tgt_ch == 1 && hw_ch >= 2 {
-                                    let s0 = decode_sample_at(raw_bytes, frame_off, fmt.sample_format);
+                                    let s0 =
+                                        decode_sample_at(raw_bytes, frame_off, fmt.sample_format);
                                     let s1 = decode_sample_at(
                                         raw_bytes,
                                         frame_off + bps,
@@ -797,6 +1085,10 @@ fn run_capture_loop(
                 return;
             }
         }
+
+        if timed_out && !read_any_packet && audio_event.is_some() {
+            peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+        }
     }
 }
 
@@ -832,28 +1124,32 @@ impl WasapiPlaybackStream {
 
         let stop_flag_cl = Arc::clone(&stop_flag);
         let stop_event_cl = Arc::clone(&stop_event);
-        let (init_tx, init_rx) = mpsc::sync_channel::<Result<(String, u32, u16), String>>(1);
+        let (init_tx, init_rx) =
+            mpsc::sync_channel::<Result<(String, u32, u16), WasapiInitError>>(1);
 
         let worker = thread::Builder::new()
             .name("rsrelay-wasapi-playback".to_string())
             .spawn(move || {
                 let _com = match ComGuard::init_mta() {
                     Ok(g) => g,
-                    Err(e) => {
-                        let _ = init_tx.send(Err(e));
+                    Err(detail) => {
+                        let _ = init_tx.send(Err(WasapiInitError::Wasapi {
+                            device: "COM".to_string(),
+                            detail,
+                        }));
                         return;
                     }
                 };
 
                 let init_res = unsafe { init_playback_pipeline(filter_owned.as_deref()) };
-                let (
+                let PlaybackPipeline {
                     device_name,
                     parsed_fmt,
                     max_frames,
                     audio_client,
                     render_client,
                     audio_event,
-                ) = match init_res {
+                } = match init_res {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = init_tx.send(Err(e));
@@ -874,7 +1170,10 @@ impl WasapiPlaybackStream {
                 }
 
                 if let Err(e) = unsafe { audio_client.Start() } {
-                    let _ = init_tx.send(Err(format!("IAudioClient::Start failed: {e}")));
+                    let _ = init_tx.send(Err(WasapiInitError::Wasapi {
+                        device: device_name,
+                        detail: format_wasapi_err("IAudioClient::Start failed", &e),
+                    }));
                     return;
                 }
 
@@ -917,14 +1216,9 @@ impl WasapiPlaybackStream {
                 sample_rate,
                 channels,
             }),
-            Ok(Err(detail)) => {
+            Ok(Err(err)) => {
                 let _ = worker.join();
-                Err(AudioError::Wasapi {
-                    device: device_name_filter
-                        .unwrap_or("Default Windows Output")
-                        .to_string(),
-                    detail,
-                })
+                Err(err.into())
             }
             Err(_) => {
                 let _ = worker.join();
@@ -950,30 +1244,34 @@ impl Drop for WasapiPlaybackStream {
     }
 }
 
+struct PlaybackPipeline {
+    device_name: String,
+    parsed_fmt: ParsedMixFormat,
+    max_frames: u32,
+    audio_client: IAudioClient,
+    render_client: IAudioRenderClient,
+    audio_event: Option<EventHandle>,
+}
+
 unsafe fn init_playback_pipeline(
     filter: Option<&str>,
-) -> Result<
-    (
-        String,
-        ParsedMixFormat,
-        u32,
-        IAudioClient,
-        IAudioRenderClient,
-        Option<EventHandle>,
-    ),
-    String,
-> {
+) -> Result<PlaybackPipeline, WasapiInitError> {
     let (device, device_name) = select_imm_device(Audio::eRender, filter, false)?;
 
-    let client1: IAudioClient = device
-        .Activate(CLSCTX_ALL, None)
-        .map_err(|e| format!("IMMDevice::Activate(IAudioClient) failed on '{device_name}': {e}"))?;
-    let mix_fmt = MixFormatPtr(
-        client1
-            .GetMixFormat()
-            .map_err(|e| format!("IAudioClient::GetMixFormat failed on '{device_name}': {e}"))?,
-    );
-    let parsed_fmt = parse_mix_format(mix_fmt.0)?;
+    let client1: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| {
+        WasapiInitError::Wasapi {
+            device: device_name.clone(),
+            detail: format_wasapi_err("IMMDevice::Activate(IAudioClient) failed", &e),
+        }
+    })?;
+    let mix_fmt = MixFormatPtr(client1.GetMixFormat().map_err(|e| WasapiInitError::Wasapi {
+        device: device_name.clone(),
+        detail: format_wasapi_err("IAudioClient::GetMixFormat failed", &e),
+    })?);
+    let parsed_fmt = parse_mix_format(mix_fmt.0).map_err(|detail| WasapiInitError::Wasapi {
+        device: device_name.clone(),
+        detail,
+    })?;
 
     let init_event_res = client1.Initialize(
         AUDCLNT_SHAREMODE_SHARED,
@@ -985,49 +1283,73 @@ unsafe fn init_playback_pipeline(
     );
 
     let (audio_client, audio_event) = if init_event_res.is_ok() {
-        let ev = EventHandle::new_auto_reset()?;
+        let ev = EventHandle::new_auto_reset().map_err(|detail| WasapiInitError::Wasapi {
+            device: device_name.clone(),
+            detail,
+        })?;
         if client1.SetEventHandle(ev.raw()).is_ok() {
             (client1, Some(ev))
         } else {
-            let client2: IAudioClient = device
-                .Activate(CLSCTX_ALL, None)
-                .map_err(|e| format!("Activate fallback failed: {e}"))?;
+            drop(client1);
+            let client2: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| {
+                WasapiInitError::Wasapi {
+                    device: device_name.clone(),
+                    detail: format_wasapi_err("Activate polling fallback failed", &e),
+                }
+            })?;
             client2
                 .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 200_000, 0, mix_fmt.0, None)
-                .map_err(|e| format!("Initialize polling fallback failed on '{device_name}': {e}"))?;
+                .map_err(|e| WasapiInitError::Wasapi {
+                    device: device_name.clone(),
+                    detail: format_wasapi_err("Initialize polling fallback failed", &e),
+                })?;
             (client2, None)
         }
     } else {
         drop(client1);
-        let client2: IAudioClient = device
-            .Activate(CLSCTX_ALL, None)
-            .map_err(|e| format!("Activate fallback failed on '{device_name}': {e}"))?;
+        let client2: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| {
+            WasapiInitError::Wasapi {
+                device: device_name.clone(),
+                detail: format_wasapi_err("Activate fallback failed", &e),
+            }
+        })?;
         client2
             .Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 200_000, 0, mix_fmt.0, None)
             .map_err(|e| {
-                format!(
-                    "IAudioClient::Initialize failed on '{device_name}' ({}Hz, {}ch, {:?}): {e}",
+                let ctx = format!(
+                    "IAudioClient::Initialize failed ({}Hz, {}ch, {:?})",
                     parsed_fmt.sample_rate, parsed_fmt.channels, parsed_fmt.sample_format
-                )
+                );
+                WasapiInitError::Wasapi {
+                    device: device_name.clone(),
+                    detail: format_wasapi_err(&ctx, &e),
+                }
             })?;
         (client2, None)
     };
 
     let max_frames = audio_client
         .GetBufferSize()
-        .map_err(|e| format!("GetBufferSize failed on '{device_name}': {e}"))?;
-    let render_client: IAudioRenderClient = audio_client
-        .GetService()
-        .map_err(|e| format!("GetService(IAudioRenderClient) failed on '{device_name}': {e}"))?;
+        .map_err(|e| WasapiInitError::Wasapi {
+            device: device_name.clone(),
+            detail: format_wasapi_err("GetBufferSize failed", &e),
+        })?;
+    let render_client: IAudioRenderClient =
+        audio_client
+            .GetService()
+            .map_err(|e| WasapiInitError::Wasapi {
+                device: device_name.clone(),
+                detail: format_wasapi_err("GetService(IAudioRenderClient) failed", &e),
+            })?;
 
-    Ok((
+    Ok(PlaybackPipeline {
         device_name,
         parsed_fmt,
         max_frames,
         audio_client,
         render_client,
         audio_event,
-    ))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1078,7 +1400,8 @@ fn run_playback_loop(
         };
 
         let total_frames = frames_available as usize;
-        let out_bytes = unsafe { slice::from_raw_parts_mut(data_ptr, total_frames * fmt.block_align) };
+        let out_bytes =
+            unsafe { slice::from_raw_parts_mut(data_ptr, total_frames * fmt.block_align) };
         let avail_frames = consumer.slots() / src_ch;
         let frames_to_read = total_frames.min(avail_frames);
         let samples_to_read = frames_to_read * src_ch;
@@ -1141,6 +1464,63 @@ fn run_playback_loop(
 
         if unsafe { render_client.ReleaseBuffer(frames_available, 0) }.is_err() {
             break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_windows_list_audio_devices_native_zero_churn() {
+        for _ in 0..50 {
+            let devs = list_audio_devices_native().expect("list Windows audio devices natively");
+            std::hint::black_box(devs);
+        }
+    }
+
+    #[test]
+    fn test_nonexistent_device_filter_returns_device_not_found() {
+        let (tx, _rx) = rtrb::RingBuffer::<f32>::new(960);
+        let peak = Arc::new(AtomicU32::new(0));
+        let res = WasapiCaptureStream::start(
+            CaptureSource::Microphone,
+            Some("__nonexistent_rsrelay_device_xyz__"),
+            2,
+            tx,
+            peak,
+        );
+        assert!(matches!(res, Err(AudioError::DeviceNotFound(_))));
+    }
+
+    #[test]
+    fn test_native_sample_format_encode_decode_roundtrip() {
+        for fmt in [
+            NativeSampleFormat::F32,
+            NativeSampleFormat::I16,
+            NativeSampleFormat::I24Packed,
+            NativeSampleFormat::I32,
+            NativeSampleFormat::U8,
+        ] {
+            let bps = bytes_per_sample(fmt);
+            let mut buf = vec![0u8; bps * 3];
+            let inputs = [-0.75f32, 0.0f32, 0.625f32];
+            for (i, &val) in inputs.iter().enumerate() {
+                encode_sample_at(&mut buf, i * bps, val, fmt);
+            }
+            let tol = if fmt == NativeSampleFormat::U8 {
+                0.02
+            } else {
+                0.001
+            };
+            for (i, &expected) in inputs.iter().enumerate() {
+                let actual = decode_sample_at(&buf, i * bps, fmt);
+                assert!(
+                    (actual - expected).abs() < tol,
+                    "format {fmt:?} mismatch at {i}: expected {expected}, got {actual}"
+                );
+            }
         }
     }
 }

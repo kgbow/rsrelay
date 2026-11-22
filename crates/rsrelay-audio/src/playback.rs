@@ -1,11 +1,15 @@
+#[cfg(not(target_os = "windows"))]
+use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
-use cpal::traits::{DeviceTrait, StreamTrait};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use cpal::traits::HostTrait;
+#[cfg(not(target_os = "windows"))]
+use cpal::traits::{DeviceTrait, StreamTrait};
+#[cfg(not(target_os = "windows"))]
 use cpal::SampleFormat;
 use rtrb::Consumer;
 
@@ -18,6 +22,7 @@ use crate::windows_virtual_mic::{
 
 /// Active audio playback stream handle.
 pub struct PlaybackStreamHandle {
+    #[cfg(not(target_os = "windows"))]
     _cpal_stream: Option<cpal::Stream>,
     _virtual_mic_stream: Option<VirtualMicPlaybackStream>,
     _null_vmic_stream: Option<NullVirtualMicStream>,
@@ -78,6 +83,7 @@ pub fn start_playback_stream(
                 Arc::clone(&underrun_count),
             );
             return Ok(PlaybackStreamHandle {
+                #[cfg(not(target_os = "windows"))]
                 _cpal_stream: None,
                 _virtual_mic_stream: None,
                 _null_vmic_stream: Some(null_stream),
@@ -103,6 +109,7 @@ pub fn start_playback_stream(
                 Arc::clone(&underrun_count),
             )?;
             return Ok(PlaybackStreamHandle {
+                #[cfg(not(target_os = "windows"))]
                 _cpal_stream: None,
                 _virtual_mic_stream: Some(vmic_stream),
                 _null_vmic_stream: None,
@@ -118,153 +125,102 @@ pub fn start_playback_stream(
         }
     }
 
-    let host = cpal::default_host();
-    let (device, device_name) = resolve_output_device(&host, device_name_filter)?;
-    let supported_cfg = match device.default_output_config() {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            #[cfg(target_os = "windows")]
-            {
-                tracing::warn!(
-                    "cpal default_output_config failed on '{device_name}' ({err}); falling back to native WASAPI GetMixFormat()"
-                );
-                let wasapi = crate::windows_wasapi::WasapiPlaybackStream::start(
-                    device_name_filter,
-                    source_channels,
-                    consumer,
-                    Arc::clone(&volume_bits),
-                    Arc::clone(&peak_bits),
-                    Arc::clone(&underrun_count),
-                )?;
-                let dev_name = wasapi.device_name.clone();
-                let rate = wasapi.sample_rate;
-                let ch = wasapi.channels;
-                return Ok(PlaybackStreamHandle {
-                    _cpal_stream: None,
-                    _virtual_mic_stream: None,
-                    _null_vmic_stream: None,
-                    _wasapi_stream: Some(wasapi),
-                    device_name: dev_name,
-                    sample_rate: rate,
-                    channels: ch,
-                    volume_bits,
-                    peak_bits,
-                    underrun_count,
-                });
-            }
-            #[cfg(not(target_os = "windows"))]
-            return Err(err.into());
-        }
-    };
-    let sample_format = supported_cfg.sample_format();
-    let config: cpal::StreamConfig = supported_cfg.into();
-    let hw_sample_rate = config.sample_rate.0;
-    let hw_channels = config.channels;
-
-    let consumer_slot = Arc::new(Mutex::new(Some(consumer)));
-
-    #[allow(unused_mut)]
-    let mut build_res = try_build_cpal_output_stream(
-        &device,
-        &config,
-        sample_format,
-        hw_channels,
-        source_channels,
-        &consumer_slot,
-        &volume_bits,
-        &peak_bits,
-        &underrun_count,
-    );
-
-    // On non-Windows hosts, retry with `I16` if the default sample format is rejected.
-    // On Windows we fall straight back to native WASAPI `GetMixFormat()` below so we keep the
-    // endpoint's exact native format and `dwChannelMask`.
-    #[cfg(not(target_os = "windows"))]
-    if matches!(
-        build_res,
-        Err(AudioError::BuildStream(
-            cpal::BuildStreamError::StreamConfigNotSupported
-        )) | Err(AudioError::UnsupportedSampleFormat(_))
-    ) && sample_format != SampleFormat::I16
+    // 3. On Windows, always use the direct native WASAPI `GetMixFormat()` playback pipeline:
+    //    - Zero `IsFormatSupported` RPC storms into `audiodg.exe`
+    //    - Works for both OS default and explicitly selected Spatial Sound / 5.1 / 7.1 / 24-bit devices
+    #[cfg(target_os = "windows")]
     {
-        if let Ok(fallback_stream) = try_build_cpal_output_stream(
+        let wasapi = crate::windows_wasapi::WasapiPlaybackStream::start(
+            device_name_filter,
+            source_channels,
+            consumer,
+            Arc::clone(&volume_bits),
+            Arc::clone(&peak_bits),
+            Arc::clone(&underrun_count),
+        )?;
+        let device_name = wasapi.device_name.clone();
+        let sample_rate = wasapi.sample_rate;
+        let channels = wasapi.channels;
+        Ok(PlaybackStreamHandle {
+            _virtual_mic_stream: None,
+            _null_vmic_stream: None,
+            _wasapi_stream: Some(wasapi),
+            device_name,
+            sample_rate,
+            channels,
+            volume_bits,
+            peak_bits,
+            underrun_count,
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let host = cpal::default_host();
+        let (device, device_name) = resolve_output_device(&host, device_name_filter)?;
+        let supported_cfg = device.default_output_config()?;
+        let sample_format = supported_cfg.sample_format();
+        let config: cpal::StreamConfig = supported_cfg.into();
+        let hw_sample_rate = config.sample_rate.0;
+        let hw_channels = config.channels;
+
+        let consumer_slot = Arc::new(Mutex::new(Some(consumer)));
+
+        let mut build_res = try_build_cpal_output_stream(
             &device,
             &config,
-            SampleFormat::I16,
+            sample_format,
             hw_channels,
             source_channels,
             &consumer_slot,
             &volume_bits,
             &peak_bits,
             &underrun_count,
-        ) {
-            tracing::info!(
-                "cpal playback on '{device_name}' succeeded using I16 fallback (default was {sample_format:?})"
-            );
-            build_res = Ok(fallback_stream);
-        }
-    }
+        );
 
-    let stream = match build_res {
-        Ok(s) => s,
-        Err(err) => {
-            #[cfg(target_os = "windows")]
-            if matches!(
-                err,
-                AudioError::BuildStream(_) | AudioError::UnsupportedSampleFormat(_)
+        if matches!(
+            build_res,
+            Err(AudioError::BuildStream(
+                cpal::BuildStreamError::StreamConfigNotSupported
+            )) | Err(AudioError::UnsupportedSampleFormat(_))
+        ) && sample_format != SampleFormat::I16
+        {
+            if let Ok(fallback_stream) = try_build_cpal_output_stream(
+                &device,
+                &config,
+                SampleFormat::I16,
+                hw_channels,
+                source_channels,
+                &consumer_slot,
+                &volume_bits,
+                &peak_bits,
+                &underrun_count,
             ) {
-                if let Some(recovered_consumer) =
-                    consumer_slot.lock().ok().and_then(|mut g| g.take())
-                {
-                    tracing::warn!(
-                        "cpal playback rejected '{device_name}' ({hw_sample_rate}Hz, {hw_channels}ch, {sample_format:?}: {err}); falling back to native WASAPI GetMixFormat()"
-                    );
-                    let wasapi = crate::windows_wasapi::WasapiPlaybackStream::start(
-                        device_name_filter,
-                        source_channels,
-                        recovered_consumer,
-                        Arc::clone(&volume_bits),
-                        Arc::clone(&peak_bits),
-                        Arc::clone(&underrun_count),
-                    )?;
-                    let dev_name = wasapi.device_name.clone();
-                    let rate = wasapi.sample_rate;
-                    let ch = wasapi.channels;
-                    return Ok(PlaybackStreamHandle {
-                        _cpal_stream: None,
-                        _virtual_mic_stream: None,
-                        _null_vmic_stream: None,
-                        _wasapi_stream: Some(wasapi),
-                        device_name: dev_name,
-                        sample_rate: rate,
-                        channels: ch,
-                        volume_bits,
-                        peak_bits,
-                        underrun_count,
-                    });
-                }
+                tracing::info!(
+                    "cpal playback on '{device_name}' succeeded using I16 fallback (default was {sample_format:?})"
+                );
+                build_res = Ok(fallback_stream);
             }
-            return Err(err);
         }
-    };
 
-    stream.play()?;
+        let stream = build_res?;
+        stream.play()?;
 
-    Ok(PlaybackStreamHandle {
-        _cpal_stream: Some(stream),
-        _virtual_mic_stream: None,
-        _null_vmic_stream: None,
-        #[cfg(target_os = "windows")]
-        _wasapi_stream: None,
-        device_name,
-        sample_rate: hw_sample_rate,
-        channels: hw_channels,
-        volume_bits,
-        peak_bits,
-        underrun_count,
-    })
+        Ok(PlaybackStreamHandle {
+            _cpal_stream: Some(stream),
+            _virtual_mic_stream: None,
+            _null_vmic_stream: None,
+            device_name,
+            sample_rate: hw_sample_rate,
+            channels: hw_channels,
+            volume_bits,
+            peak_bits,
+            underrun_count,
+        })
+    }
 }
 
+#[cfg(not(target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
 fn try_build_cpal_output_stream(
     device: &cpal::Device,
@@ -395,6 +351,7 @@ fn try_build_cpal_output_stream(
     Ok(stream)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn resolve_output_device(
     host: &cpal::Host,
     device_name_filter: Option<&str>,
@@ -434,6 +391,7 @@ fn resolve_output_device(
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 #[inline]
 fn read_ring_sample(first: &[f32], second: &[f32], idx: usize) -> f32 {
     if idx < first.len() {
@@ -443,6 +401,7 @@ fn read_ring_sample(first: &[f32], second: &[f32], idx: usize) -> f32 {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 #[inline]
 fn sample_for_hw_channel(
     first: &[f32],
@@ -460,6 +419,7 @@ fn sample_for_hw_channel(
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 #[inline]
 fn pull_samples_f32(
     out: &mut [f32],
@@ -506,6 +466,7 @@ fn pull_samples_f32(
     peak_bits.store(max_abs.to_bits(), Ordering::Relaxed);
 }
 
+#[cfg(not(target_os = "windows"))]
 #[inline]
 fn pull_samples_i16(
     out: &mut [i16],
@@ -550,6 +511,7 @@ fn pull_samples_i16(
     peak_bits.store(max_abs.to_bits(), Ordering::Relaxed);
 }
 
+#[cfg(not(target_os = "windows"))]
 #[inline]
 fn pull_samples_i32(
     out: &mut [i32],
@@ -594,6 +556,7 @@ fn pull_samples_i32(
     peak_bits.store(max_abs.to_bits(), Ordering::Relaxed);
 }
 
+#[cfg(not(target_os = "windows"))]
 #[inline]
 fn pull_samples_u16(
     out: &mut [u16],

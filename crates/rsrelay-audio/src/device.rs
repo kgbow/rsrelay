@@ -1,9 +1,9 @@
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use cpal::traits::{DeviceTrait, HostTrait};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use crate::windows_virtual_mic::is_virtual_mic_driver_available;
 use crate::windows_virtual_mic::VIRTUAL_MIC_OUTPUT_DEVICE_NAME;
 
@@ -90,16 +90,24 @@ pub fn is_virtual_mic_output_sink_name(name: &str) -> bool {
 
 /// Enumerate all available input and output audio devices on the current host.
 ///
-/// On macOS, queries CoreAudio (`AudioObjectGetPropertyData`) directly and strictly `CFRelease`s
-/// every `CFStringRef`, bypassing a severe `CFStringRef` memory leak and redundant `AudioUnit`
-/// instantiation inside `cpal 0.15`'s macOS `Device::name()` / `supported_configs()`.
+/// - **Windows**: Queries `IMMDeviceEnumerator` + MMDevice Property Store (`PKEY_AudioEngine_DeviceFormat`)
+///   directly in-process with zero `audiodg.exe` `IsFormatSupported` RPC churn and full visibility for
+///   Spatial Sound / 5.1 / 7.1 / 24-bit endpoints.
+/// - **macOS**: Queries CoreAudio (`AudioObjectGetPropertyData`) directly and strictly `CFRelease`s
+///   every `CFStringRef`, bypassing a severe `CFStringRef` memory leak and redundant `AudioUnit`
+///   instantiation inside `cpal 0.15`'s macOS `Device::name()` / `supported_configs()`.
 pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, AudioError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "windows")]
     {
-        return macos_coreaudio::list_audio_devices_native();
+        crate::windows_wasapi::list_audio_devices_native()
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_coreaudio::list_audio_devices_native()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let host = cpal::default_host();
         let default_in_name = host.default_input_device().and_then(|d| d.name().ok());

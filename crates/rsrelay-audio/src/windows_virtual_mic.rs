@@ -669,6 +669,14 @@ mod tests {
         );
         assert!(select_default_virtual_mic_output_device().is_some());
 
+        // Skip the WASAPI capture half if the Windows Audio service (`Audiosrv`) is currently stopped
+        if !devices
+            .iter()
+            .any(|d| d.is_input && d.name.to_ascii_lowercase().contains("virtual mic"))
+        {
+            return;
+        }
+
         // 1. Open WASAPI Microphone capture on `Virtual Mic`
         let (cap_tx, mut cap_rx) = RingBuffer::<f32>::new(48_000 * 4);
         let cap_handle = start_capture_stream(

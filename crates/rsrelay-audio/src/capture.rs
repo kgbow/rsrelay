@@ -1,29 +1,32 @@
+#[cfg(not(target_os = "windows"))]
+use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, StreamTrait};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use cpal::traits::HostTrait;
+#[cfg(not(target_os = "windows"))]
+use cpal::traits::{DeviceTrait, StreamTrait};
+#[cfg(not(target_os = "windows"))]
 use cpal::SampleFormat;
 use rtrb::Producer;
 
 use crate::device::{AudioError, CaptureSource};
-use crate::windows_loopback::SilentKeepaliveStream;
 
 /// Active audio capture stream handle.
 ///
 /// Dropping this handle stops the underlying OS audio stream or synthetic generator thread.
 pub struct CaptureStreamHandle {
+    #[cfg(not(target_os = "windows"))]
     _cpal_stream: Option<cpal::Stream>,
     #[cfg(target_os = "macos")]
     _sck_stream: Option<crate::macos_sck::MacosSckStream>,
     #[cfg(target_os = "windows")]
     _wasapi_stream: Option<crate::windows_wasapi::WasapiCaptureStream>,
-    _keepalive: Option<SilentKeepaliveStream>,
     stop_flag: Arc<AtomicBool>,
     tone_thread: Option<JoinHandle<()>>,
     pub device_name: String,
@@ -112,12 +115,12 @@ pub fn start_capture_stream(
             .expect("spawn synthetic tone thread");
 
         return Ok(CaptureStreamHandle {
+            #[cfg(not(target_os = "windows"))]
             _cpal_stream: None,
             #[cfg(target_os = "macos")]
             _sck_stream: None,
             #[cfg(target_os = "windows")]
             _wasapi_stream: None,
-            _keepalive: None,
             stop_flag,
             tone_thread: Some(handle),
             device_name: "Synthetic 440Hz/660Hz Stereo Generator".to_string(),
@@ -125,6 +128,32 @@ pub fn start_capture_stream(
             channels,
             peak_bits,
         });
+    }
+
+    // On Windows, always use the direct native WASAPI `GetMixFormat()` capture pipeline:
+    // - Zero `IsFormatSupported` RPC storms into `audiodg.exe`
+    // - Exact `dwChannelMask` & 24-bit/32-bit/5.1/7.1 compatibility for both default and named devices
+    // - Continuous inline `AUDCLNT_BUFFERFLAGS_SILENT` loopback keepalive with zero extra threads
+    #[cfg(target_os = "windows")]
+    {
+        let wasapi = crate::windows_wasapi::WasapiCaptureStream::start(
+            source,
+            device_name_filter,
+            target_channels,
+            producer,
+            Arc::clone(&peak_bits),
+        )?;
+        let device_name = wasapi.device_name.clone();
+        let sample_rate = wasapi.sample_rate;
+        Ok(CaptureStreamHandle {
+            _wasapi_stream: Some(wasapi),
+            stop_flag,
+            tone_thread: None,
+            device_name,
+            sample_rate,
+            channels: target_channels,
+            peak_bits,
+        })
     }
 
     // On macOS 13+, prefer native driverless ScreenCaptureKit for SystemLoopback when no explicit device filter is set
@@ -144,7 +173,6 @@ pub fn start_capture_stream(
                     return Ok(CaptureStreamHandle {
                         _cpal_stream: None,
                         _sck_stream: Some(sck_stream),
-                        _keepalive: None,
                         stop_flag,
                         tone_thread: None,
                         device_name: "macOS ScreenCaptureKit System Audio".to_string(),
@@ -167,158 +195,70 @@ pub fn start_capture_stream(
         }
     }
 
-    let host = cpal::default_host();
-
-    // Select device based on source and platform.
-    // On Windows, if `default_output_config` / `default_input_config` rejects an unusual native
-    // mix format (e.g. 24-bit packed PCM), fall back straight to native WASAPI `GetMixFormat()`.
-    let (device, device_name, supported_cfg, is_windows_loopback) =
-        match select_capture_device(&host, source, device_name_filter) {
-            Ok(v) => v,
-            Err(err) => {
-                #[cfg(target_os = "windows")]
-                if matches!(err, AudioError::DefaultConfig(_)) {
-                    tracing::warn!(
-                        "cpal default capture config failed ({err}); falling back to native WASAPI GetMixFormat()"
-                    );
-                    let wasapi = crate::windows_wasapi::WasapiCaptureStream::start(
-                        source,
-                        device_name_filter,
-                        target_channels,
-                        producer,
-                        Arc::clone(&peak_bits),
-                    )?;
-                    let dev_name = wasapi.device_name.clone();
-                    let rate = wasapi.sample_rate;
-                    return Ok(CaptureStreamHandle {
-                        _cpal_stream: None,
-                        _wasapi_stream: Some(wasapi),
-                        _keepalive: None,
-                        stop_flag,
-                        tone_thread: None,
-                        device_name: dev_name,
-                        sample_rate: rate,
-                        channels: target_channels,
-                        peak_bits,
-                    });
-                }
-                return Err(err);
-            }
-        };
-
-    let sample_format = supported_cfg.sample_format();
-    let config: cpal::StreamConfig = supported_cfg.into();
-    let hw_sample_rate = config.sample_rate.0;
-    let hw_channels = config.channels;
-
-    // On Windows Loopback, start a silent output keepalive stream so WASAPI never stalls during silence
-    let keepalive = if is_windows_loopback {
-        SilentKeepaliveStream::start(&device).ok()
-    } else {
-        None
-    };
-
-    // Keep `producer` recoverable across format fallbacks; once a stream succeeds, the audio
-    // callback takes ownership on its first invocation and never touches the mutex again.
-    let producer_slot = Arc::new(Mutex::new(Some(producer)));
-
-    #[allow(unused_mut)]
-    let mut build_res = try_build_cpal_input_stream(
-        &device,
-        &config,
-        sample_format,
-        hw_channels,
-        target_channels,
-        &producer_slot,
-        &peak_bits,
-    );
-
-    // On non-Windows hosts, retry with `I16` if the default sample format is rejected.
-    // On Windows we prefer falling straight back to native WASAPI `GetMixFormat()` below so we
-    // keep the endpoint's exact native float/PCM format, channel mask, and silent keepalive.
     #[cfg(not(target_os = "windows"))]
-    if matches!(
-        build_res,
-        Err(AudioError::BuildStream(
-            cpal::BuildStreamError::StreamConfigNotSupported
-        )) | Err(AudioError::UnsupportedSampleFormat(_))
-    ) && sample_format != SampleFormat::I16
     {
-        if let Ok(fallback_stream) = try_build_cpal_input_stream(
+        let host = cpal::default_host();
+        let (device, device_name, supported_cfg) =
+            select_capture_device(&host, source, device_name_filter)?;
+
+        let sample_format = supported_cfg.sample_format();
+        let config: cpal::StreamConfig = supported_cfg.into();
+        let hw_sample_rate = config.sample_rate.0;
+        let hw_channels = config.channels;
+
+        let producer_slot = Arc::new(Mutex::new(Some(producer)));
+
+        let mut build_res = try_build_cpal_input_stream(
             &device,
             &config,
-            SampleFormat::I16,
+            sample_format,
             hw_channels,
             target_channels,
             &producer_slot,
             &peak_bits,
-        ) {
-            tracing::info!(
-                "cpal capture on '{device_name}' succeeded using I16 fallback (default was {sample_format:?})"
-            );
-            build_res = Ok(fallback_stream);
-        }
-    }
+        );
 
-    let stream = match build_res {
-        Ok(s) => s,
-        Err(err) => {
-            #[cfg(target_os = "windows")]
-            if matches!(
-                err,
-                AudioError::BuildStream(_) | AudioError::UnsupportedSampleFormat(_)
+        if matches!(
+            build_res,
+            Err(AudioError::BuildStream(
+                cpal::BuildStreamError::StreamConfigNotSupported
+            )) | Err(AudioError::UnsupportedSampleFormat(_))
+        ) && sample_format != SampleFormat::I16
+        {
+            if let Ok(fallback_stream) = try_build_cpal_input_stream(
+                &device,
+                &config,
+                SampleFormat::I16,
+                hw_channels,
+                target_channels,
+                &producer_slot,
+                &peak_bits,
             ) {
-                drop(keepalive);
-                if let Some(recovered_producer) =
-                    producer_slot.lock().ok().and_then(|mut g| g.take())
-                {
-                    tracing::warn!(
-                        "cpal capture rejected '{device_name}' ({hw_sample_rate}Hz, {hw_channels}ch, {sample_format:?}: {err}); falling back to native WASAPI GetMixFormat()"
-                    );
-                    let wasapi = crate::windows_wasapi::WasapiCaptureStream::start(
-                        source,
-                        device_name_filter,
-                        target_channels,
-                        recovered_producer,
-                        Arc::clone(&peak_bits),
-                    )?;
-                    let dev_name = wasapi.device_name.clone();
-                    let rate = wasapi.sample_rate;
-                    return Ok(CaptureStreamHandle {
-                        _cpal_stream: None,
-                        _wasapi_stream: Some(wasapi),
-                        _keepalive: None,
-                        stop_flag,
-                        tone_thread: None,
-                        device_name: dev_name,
-                        sample_rate: rate,
-                        channels: target_channels,
-                        peak_bits,
-                    });
-                }
+                tracing::info!(
+                    "cpal capture on '{device_name}' succeeded using I16 fallback (default was {sample_format:?})"
+                );
+                build_res = Ok(fallback_stream);
             }
-            return Err(err);
         }
-    };
 
-    stream.play()?;
+        let stream = build_res?;
+        stream.play()?;
 
-    Ok(CaptureStreamHandle {
-        _cpal_stream: Some(stream),
-        #[cfg(target_os = "macos")]
-        _sck_stream: None,
-        #[cfg(target_os = "windows")]
-        _wasapi_stream: None,
-        _keepalive: keepalive,
-        stop_flag,
-        tone_thread: None,
-        device_name,
-        sample_rate: hw_sample_rate,
-        channels: target_channels,
-        peak_bits,
-    })
+        Ok(CaptureStreamHandle {
+            _cpal_stream: Some(stream),
+            #[cfg(target_os = "macos")]
+            _sck_stream: None,
+            stop_flag,
+            tone_thread: None,
+            device_name,
+            sample_rate: hw_sample_rate,
+            channels: target_channels,
+            peak_bits,
+        })
+    }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn try_build_cpal_input_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -344,7 +284,13 @@ fn try_build_cpal_input_stream(
                         local_prod = slot.lock().ok().and_then(|mut g| g.take());
                     }
                     if let Some(ref mut prod) = local_prod {
-                        push_converted_samples(data, hw_channels, target_channels, prod, &peak_clone);
+                        push_converted_samples(
+                            data,
+                            hw_channels,
+                            target_channels,
+                            prod,
+                            &peak_clone,
+                        );
                     }
                 },
                 err_fn,
@@ -404,37 +350,14 @@ fn try_build_cpal_input_stream(
     Ok(stream)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn select_capture_device(
     host: &cpal::Host,
     source: CaptureSource,
     name_filter: Option<&str>,
-) -> Result<(cpal::Device, String, cpal::SupportedStreamConfig, bool), AudioError> {
+) -> Result<(cpal::Device, String, cpal::SupportedStreamConfig), AudioError> {
     match source {
         CaptureSource::SystemLoopback => {
-            #[cfg(target_os = "windows")]
-            {
-                // On Windows WASAPI, building an input stream on an Output Device enables AUDCLNT_STREAMFLAGS_LOOPBACK
-                let device = if let Some(filter) = name_filter {
-                    let filter_lower = filter.to_lowercase();
-                    host.output_devices()?
-                        .find(|d| {
-                            d.name()
-                                .map(|n| n.to_lowercase().contains(&filter_lower))
-                                .unwrap_or(false)
-                        })
-                        .ok_or_else(|| AudioError::DeviceNotFound(filter.to_string()))?
-                } else {
-                    host.default_output_device().ok_or_else(|| {
-                        AudioError::DeviceNotFound("default Windows output device".to_string())
-                    })?
-                };
-                let dev_name = device
-                    .name()
-                    .unwrap_or_else(|_| "Default Windows Output".to_string());
-                let cfg = device.default_output_config()?;
-                return Ok((device, dev_name, cfg, true));
-            }
-
             #[cfg(target_os = "macos")]
             {
                 use crate::device::macos_coreaudio::{
@@ -447,7 +370,7 @@ fn select_capture_device(
                         n.to_lowercase().contains(&filter_lower)
                     }) {
                         let cfg = dev.default_input_config()?;
-                        return Ok((dev, name, cfg, false));
+                        return Ok((dev, name, cfg));
                     }
                 }
 
@@ -457,7 +380,7 @@ fn select_capture_device(
                         lower.contains(keyword) && !lower.contains("rsrelay virtual mic")
                     }) {
                         let cfg = dev.default_input_config()?;
-                        return Ok((dev, name, cfg, false));
+                        return Ok((dev, name, cfg));
                     }
                 }
 
@@ -467,10 +390,10 @@ fn select_capture_device(
                     )
                 })?;
                 let cfg = dev.default_input_config()?;
-                return Ok((dev, name, cfg, false));
+                return Ok((dev, name, cfg));
             }
 
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            #[cfg(not(target_os = "macos"))]
             {
                 if let Some(filter) = name_filter {
                     let filter_lower = filter.to_lowercase();
@@ -481,7 +404,7 @@ fn select_capture_device(
                     }) {
                         let name = dev.name().unwrap_or_else(|_| "Default Device".to_string());
                         let cfg = dev.default_input_config()?;
-                        return Ok((dev, name, cfg, false));
+                        return Ok((dev, name, cfg));
                     }
                 }
 
@@ -496,7 +419,7 @@ fn select_capture_device(
                     }) {
                         let name = dev.name().unwrap_or_else(|_| "Default Device".to_string());
                         let cfg = dev.default_input_config()?;
-                        return Ok((dev, name, cfg, false));
+                        return Ok((dev, name, cfg));
                     }
                 }
 
@@ -505,7 +428,7 @@ fn select_capture_device(
                 })?;
                 let name = dev.name().unwrap_or_else(|_| "Default Device".to_string());
                 let cfg = dev.default_input_config()?;
-                Ok((dev, name, cfg, false))
+                Ok((dev, name, cfg))
             }
         }
         CaptureSource::Microphone => {
@@ -543,7 +466,7 @@ fn select_capture_device(
                     }
                 };
                 let cfg = dev.default_input_config()?;
-                return Ok((dev, dev_name, cfg, false));
+                return Ok((dev, dev_name, cfg));
             }
 
             #[cfg(not(target_os = "macos"))]
@@ -558,9 +481,6 @@ fn select_capture_device(
                         })
                         .ok_or_else(|| AudioError::DeviceNotFound(filter.to_string()))?
                 } else {
-                    // When auto-selecting a physical microphone, avoid virtual microphone loopback
-                    // endpoints (`Virtual Mic`, `CABLE Output`, `rsrelay Virtual Mic`, `BlackHole`)
-                    // if the user previously set a virtual mic as OS Default Input, preventing loops.
                     let default_dev = host.default_input_device();
                     let default_is_virtual = default_dev
                         .as_ref()
@@ -590,14 +510,14 @@ fn select_capture_device(
                 };
                 let dev_name = dev.name().unwrap_or_else(|_| "Default Device".to_string());
                 let cfg = dev.default_input_config()?;
-                Ok((dev, dev_name, cfg, false))
+                Ok((dev, dev_name, cfg))
             }
         }
         CaptureSource::SyntheticTone => unreachable!("handled above"),
     }
 }
 
-/// Wait-free conversion and ringbuffer insertion for `f32` hardware buffers.
+#[cfg(not(target_os = "windows"))]
 #[inline]
 fn push_converted_samples(
     data: &[f32],
@@ -647,6 +567,7 @@ fn push_converted_samples(
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 #[inline]
 fn push_converted_i16(
     data: &[i16],
@@ -694,6 +615,7 @@ fn push_converted_i16(
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 #[inline]
 fn push_converted_i32(
     data: &[i32],
@@ -741,6 +663,7 @@ fn push_converted_i32(
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 #[inline]
 fn push_converted_u16(
     data: &[u16],
